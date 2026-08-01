@@ -19,7 +19,7 @@ public struct CompatibilityResponse: Codable, Sendable {
 
 public enum CompatibilityCommand {
     public static let entries: [CompatibilityEntry] = [
-        .init(command: "read", status: "partial", reason: "Scaffolded but not yet implemented.", alternative: nil),
+        .init(command: "read", status: "partial", reason: "Reference parsing and config lookup implemented. Provider wiring is pending.", alternative: nil),
         .init(command: "run", status: "partial", reason: "Scaffolded but not yet implemented.", alternative: nil),
         .init(command: "inject", status: "partial", reason: "Scaffolded but not yet implemented.", alternative: nil),
         .init(command: "item list", status: "partial", reason: "Scaffolded but not yet implemented.", alternative: nil),
@@ -27,7 +27,7 @@ public enum CompatibilityCommand {
         .init(command: "completion", status: "supported", reason: nil, alternative: nil),
         .init(command: "compatibility", status: "supported", reason: nil, alternative: nil),
         .init(command: "ssh", status: "partial", reason: "Scaffolded but not yet implemented.", alternative: nil),
-        .init(command: "config", status: "partial", reason: "Scaffolded but not yet implemented.", alternative: nil),
+        .init(command: "config", status: "partial", reason: "init and validate are implemented.", alternative: nil),
         .init(command: "doctor", status: "partial", reason: "Scaffolded but not yet implemented.", alternative: nil),
         .init(
             command: "vault",

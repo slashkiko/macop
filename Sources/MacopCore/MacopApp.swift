@@ -6,7 +6,7 @@ public struct MacopApp {
     public func run(argv: [String], env: [String: String]) -> CommandResult {
         do {
             let parsed = try ArgumentParser.parse(argv: argv, env: env)
-            return try self.execute(parsed)
+            return try self.execute(parsed, env: env)
         } catch let error as CLIError {
             let format = extractFormatHint(argv: argv, env: env)
             return ErrorRenderer.render(error: error, format: format)
@@ -18,7 +18,7 @@ public struct MacopApp {
         }
     }
 
-    private func execute(_ parsed: ParsedCommand) throws -> CommandResult {
+    private func execute(_ parsed: ParsedCommand, env: [String: String]) throws -> CommandResult {
         switch parsed.command {
         case .help:
             return CommandResult(exitCode: ExitCode.success.rawValue, stdout: HelpText.main + "\n")
@@ -32,7 +32,11 @@ public struct MacopApp {
                 return CommandResult(exitCode: ExitCode.success.rawValue, stdout: CompletionText.render(shell: shell))
             }
             throw CLIError.invalidArguments(message: "Unsupported shell for completion: \(shell)")
-        case .read, .run, .inject, .item, .ssh, .config, .doctor:
+        case .read:
+            return try ReadCommand.run(args: parsed.commandArgs, options: parsed.options, env: env)
+        case .config:
+            return try ConfigCommand.run(args: parsed.commandArgs, options: parsed.options)
+        case .run, .inject, .item, .ssh, .doctor:
             throw CLIError.unsupportedCommand(
                 command: self.renderedCommandName(parsed),
                 reason: "Command scaffold exists, but implementation has not started yet."
