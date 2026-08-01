@@ -9,6 +9,8 @@ pinact = "4.1.0"
 actionlint = "1.7.12"
 # renovate: datasource=github-releases depName=zizmorcore/zizmor
 zizmor = "1.28.0"
+# renovate: datasource=github-releases depName=betterleaks/betterleaks
+betterleaks = "1.7.0"
 
 [settings]
 minimum_release_age = "7d"

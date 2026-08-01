@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+changed_files="$(git diff --cached --name-only --diff-filter=ACMR)"
+if [[ -z "$changed_files" ]]; then
+  exit 0
+fi
+
+run_swift_checks=false
+run_workflow_checks=false
+run_secret_scan=false
+
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+  run_secret_scan=true
+
+  if [[ "$file" =~ ^(Sources/|Tests/|Package\.swift$|\.swiftformat$|\.swiftlint\.yml$|\.mise\.toml$|Makefile$) ]]; then
+    run_swift_checks=true
+  fi
+
+  if [[ "$file" =~ ^(\.github/workflows/|\.pinact\.yml$|Makefile$) ]]; then
+    run_workflow_checks=true
+  fi
+done <<< "$changed_files"
+
+if [[ "$run_workflow_checks" == true ]]; then
+  make ci-workflows
+fi
+
+if [[ "$run_swift_checks" == true ]]; then
+  make ci-swift
+fi
+
+if [[ "$run_secret_scan" == true ]]; then
+  make ci-secrets
+fi

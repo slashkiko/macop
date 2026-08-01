@@ -1,7 +1,7 @@
 import Foundation
 
 public enum SecretReference: Sendable {
-    case op(namespace: String, item: String, section: String?, field: String)
+    case opReference(namespace: String, item: String, section: String?, field: String)
     case keychainGeneric(service: String, account: String)
     case keychainInternet(server: String, account: String)
     case secureEnclave(label: String)
@@ -15,13 +15,13 @@ public enum ReferenceResolver {
         }
 
         if expanded.hasPrefix("op://") {
-            return try parseOpReference(expanded)
+            return try self.parseOpReference(expanded)
         }
         if expanded.hasPrefix("keychain://") {
-            return try parseKeychainReference(expanded)
+            return try self.parseKeychainReference(expanded)
         }
         if expanded.hasPrefix("secure-enclave://") {
-            return try parseSecureEnclaveReference(expanded)
+            return try self.parseSecureEnclaveReference(expanded)
         }
         if expanded.hasPrefix("apple-passwords://") {
             throw CLIError.unsupportedProvider(
@@ -46,9 +46,9 @@ public enum ReferenceResolver {
         let namespace = segments[0]
         let item = segments[1]
         if segments.count == 3 {
-            return .op(namespace: namespace, item: item, section: nil, field: segments[2])
+            return .opReference(namespace: namespace, item: item, section: nil, field: segments[2])
         }
-        return .op(namespace: namespace, item: item, section: segments[2], field: segments[3])
+        return .opReference(namespace: namespace, item: item, section: segments[2], field: segments[3])
     }
 
     private static func parseKeychainReference(_ value: String) throws -> SecretReference {
@@ -82,7 +82,7 @@ public enum ReferenceResolver {
     }
 
     private static func decodeSegments(_ segments: [String]) throws -> [String] {
-        let decoded = try segments.map { segment -> String in
+        try segments.map { segment -> String in
             guard !segment.isEmpty else {
                 throw CLIError.invalidArguments(message: "Reference path contains an empty segment.")
             }
@@ -91,13 +91,12 @@ public enum ReferenceResolver {
             }
             return value
         }
-        return decoded
     }
 
     private static func expandEnvironmentVariables(in input: String, env: [String: String]) throws -> String {
         let pattern = #"\$[A-Za-z_][A-Za-z0-9_]*"#
         let regex = try NSRegularExpression(pattern: pattern)
-        let range = NSRange(input.startIndex..<input.endIndex, in: input)
+        let range = NSRange(input.startIndex ..< input.endIndex, in: input)
         let matches = regex.matches(in: input, range: range)
         if matches.isEmpty {
             return input

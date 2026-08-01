@@ -102,7 +102,8 @@ public enum ConfigStore {
             throw CLIError.invalidArguments(message: "Unsupported config version: \(document.version)")
         }
 
-        guard let permissions = try fileManager.attributesOfItem(atPath: fileURL.path)[.posixPermissions] as? NSNumber else {
+        guard let permissions = try fileManager.attributesOfItem(atPath: fileURL.path)[.posixPermissions] as? NSNumber
+        else {
             throw CLIError.invalidArguments(message: "Unable to read config permissions.")
         }
 
@@ -114,8 +115,8 @@ public enum ConfigStore {
         }
 
         for (itemKey, item) in document.items {
-            try validateItemKey(itemKey)
-            _ = try validateItem(item)
+            try self.validateItemKey(itemKey)
+            _ = try self.validateItem(item)
         }
 
         return fileURL
@@ -127,12 +128,12 @@ public enum ConfigStore {
         guard let configItem = document.items[key] else {
             throw CLIError.notFound(message: "No config entry for \"\(key)\"")
         }
-        _ = try providerKind(for: configItem)
+        _ = try self.providerKind(for: configItem)
         return configItem
     }
 
     public static func providerKind(for item: ConfigItem) throws -> ConfigProviderKind {
-        try validateItem(item)
+        try self.validateItem(item)
     }
 
     private static func validateItemKey(_ key: String) throws {
@@ -148,21 +149,21 @@ public enum ConfigStore {
     private static func validateItem(_ item: ConfigItem) throws -> ConfigProviderKind {
         switch item.provider {
         case "keychain-generic":
-            guard hasValue(item.service), hasValue(item.account) else {
+            guard self.hasValue(item.service), self.hasValue(item.account) else {
                 throw CLIError.invalidArguments(
                     message: "keychain-generic requires service and account in config item."
                 )
             }
             return .keychainGeneric
         case "keychain-internet":
-            guard hasValue(item.server), hasValue(item.account) else {
+            guard self.hasValue(item.server), self.hasValue(item.account) else {
                 throw CLIError.invalidArguments(
                     message: "keychain-internet requires server and account in config item."
                 )
             }
             return .keychainInternet
         case "secure-enclave":
-            guard hasValue(item.label) else {
+            guard self.hasValue(item.label) else {
                 throw CLIError.invalidArguments(message: "secure-enclave requires label in config item.")
             }
             return .secureEnclave

@@ -12,7 +12,7 @@ public enum ConfigCommand {
                 throw CLIError.invalidArguments(message: "config init does not accept extra arguments.")
             }
             let fileURL = try ConfigStore.initialize(configDirectory: options.configDirectory)
-            return renderSuccess(
+            return self.renderSuccess(
                 message: "Initialized config at \(fileURL.path)",
                 payload: ["path": fileURL.path],
                 format: options.format
@@ -22,7 +22,7 @@ public enum ConfigCommand {
                 throw CLIError.invalidArguments(message: "config validate does not accept extra arguments.")
             }
             let fileURL = try ConfigStore.validate(configDirectory: options.configDirectory)
-            return renderSuccess(
+            return self.renderSuccess(
                 message: "Config is valid: \(fileURL.path)",
                 payload: ["path": fileURL.path, "valid": true],
                 format: options.format

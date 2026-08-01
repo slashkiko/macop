@@ -7,19 +7,19 @@ public enum ReadCommand {
         let reference = try ReferenceResolver.parse(parsed.reference, env: env)
 
         switch reference {
-        case let .op(namespace, item, section, field):
+        case let .opReference(namespace, item, section, field):
             let configItem = try ConfigStore.resolveItem(
                 namespace: namespace,
                 item: item,
                 configDirectory: options.configDirectory
             )
-            try validateFieldAccess(configItem: configItem, section: section, field: field)
+            try self.validateFieldAccess(configItem: configItem, section: section, field: field)
             let providerKind = try ConfigStore.providerKind(for: configItem)
-            throw providerNotImplemented(for: providerKind)
+            throw self.providerNotImplemented(for: providerKind)
         case .keychainGeneric, .keychainInternet:
-            throw providerNotImplemented(for: .keychainGeneric)
+            throw self.providerNotImplemented(for: .keychainGeneric)
         case .secureEnclave:
-            throw providerNotImplemented(for: .secureEnclave)
+            throw self.providerNotImplemented(for: .secureEnclave)
         }
     }
 
@@ -66,12 +66,12 @@ public enum ReadCommand {
     private static func providerNotImplemented(for provider: ConfigProviderKind) -> CLIError {
         switch provider {
         case .keychainGeneric, .keychainInternet:
-            return .providerUnavailable(
+            .providerUnavailable(
                 provider: "keychain",
                 reason: "keychain provider wiring is not implemented yet."
             )
         case .secureEnclave:
-            return .providerUnavailable(
+            .providerUnavailable(
                 provider: "secure-enclave",
                 reason: "secure-enclave read is not implemented yet."
             )
