@@ -6,6 +6,7 @@ SHELL := /bin/bash
 
 TOOLCHAIN_DIR := $(shell xcode-select -p)
 SWIFTPM_GIT_SAFE_BARE := GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.bareRepository GIT_CONFIG_VALUE_0=all
+PINACT_GITHUB_TOKEN ?= $(shell gh auth token 2>/dev/null || true)
 
 bootstrap:
 	mise install
@@ -20,7 +21,7 @@ lint:
 	XCODE_DEFAULT_TOOLCHAIN_OVERRIDE="$(TOOLCHAIN_DIR)" mise exec -- swiftlint lint --strict
 
 test:
-	$(SWIFTPM_GIT_SAFE_BARE) swift test
+	swift run macop-selftest
 
 build:
 	$(SWIFTPM_GIT_SAFE_BARE) swift build
@@ -34,7 +35,7 @@ workflow-security:
 ci: pin-actions-check workflow-lint workflow-security format-check lint build test
 
 pin-actions:
-	mise exec -- pinact run -update -verify-comment
+	PINACT_GITHUB_TOKEN="$(PINACT_GITHUB_TOKEN)" mise exec -- pinact run -update -verify-comment -min-age 7
 
 pin-actions-check:
-	mise exec -- pinact run -check -verify-comment
+	PINACT_GITHUB_TOKEN="$(PINACT_GITHUB_TOKEN)" mise exec -- pinact run -check -verify-comment

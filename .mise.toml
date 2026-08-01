@@ -1,6 +1,14 @@
 [tools]
+# renovate: datasource=github-releases depName=nicklockwood/SwiftFormat
 swiftformat = "0.62.1"
+# renovate: datasource=github-releases depName=realm/SwiftLint
 swiftlint = "0.65.0"
+# renovate: datasource=github-releases depName=suzuki-shunsuke/pinact
 pinact = "4.1.0"
+# renovate: datasource=github-releases depName=rhysd/actionlint
 actionlint = "1.7.12"
+# renovate: datasource=github-releases depName=zizmorcore/zizmor
 zizmor = "1.28.0"
+
+[settings]
+minimum_release_age = "7d"

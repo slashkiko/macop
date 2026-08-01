@@ -39,9 +39,16 @@ make pin-actions-check
 GitHub Actions workflow: `.github/workflows/ci.yml`
 
 - Runs on `macos-latest`
+- Splits checks into independent parallel jobs (`action-pins`, `workflow-lint`, `workflow-security`, `format-check`, `lint`, `build`, `test`)
 - Uses `jdx/mise-action` and `.mise.toml` pinned tool versions
+- Uses `actions/cache` for SwiftPM build artifacts (`.build`, `.swiftpm`) in build/test jobs
 - Verifies all `uses:` lines are SHA-pinned and version-commented (`make pin-actions-check`)
 - Runs `actionlint` and `zizmor`
-- Runs `make ci`
 
 Action pin updates are automated by `.github/workflows/update-action-pins.yml` (weekly + manual dispatch), which runs `pinact` and opens a PR with updated SHAs.
+
+## Supply-chain update delay
+
+- `.pinact.yml` + `make pin-actions` enforce a minimum release age of 7 days when updating action pins.
+- `renovate.json` sets `minimumReleaseAge: 7 days` for GitHub Actions, Swift dependencies, and mise-managed tools.
+- Renovate runs weekly via `.github/workflows/renovate.yml`.
