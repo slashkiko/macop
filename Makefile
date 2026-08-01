@@ -2,22 +2,22 @@ SHELL := /bin/bash
 
 .PHONY: bootstrap format format-check lint test build ci
 .PHONY: pin-actions pin-actions-check
+.PHONY: workflow-lint workflow-security
 
 TOOLCHAIN_DIR := $(shell xcode-select -p)
 SWIFTPM_GIT_SAFE_BARE := GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.bareRepository GIT_CONFIG_VALUE_0=all
 
 bootstrap:
-	brew list --versions swiftformat >/dev/null 2>&1 || brew install swiftformat
-	brew list --versions swiftlint >/dev/null 2>&1 || brew install swiftlint
+	mise install
 
 format:
-	swiftformat .
+	mise exec -- swiftformat .
 
 format-check:
-	swiftformat --lint .
+	mise exec -- swiftformat --lint .
 
 lint:
-	XCODE_DEFAULT_TOOLCHAIN_OVERRIDE="$(TOOLCHAIN_DIR)" swiftlint lint --strict
+	XCODE_DEFAULT_TOOLCHAIN_OVERRIDE="$(TOOLCHAIN_DIR)" mise exec -- swiftlint lint --strict
 
 test:
 	$(SWIFTPM_GIT_SAFE_BARE) swift test
@@ -25,10 +25,16 @@ test:
 build:
 	$(SWIFTPM_GIT_SAFE_BARE) swift build
 
-ci: format-check lint build test
+workflow-lint:
+	mise exec -- actionlint
+
+workflow-security:
+	mise exec -- zizmor --persona regular .
+
+ci: pin-actions-check workflow-lint workflow-security format-check lint build test
 
 pin-actions:
-	pinact run -update -verify-comment
+	mise exec -- pinact run -update -verify-comment
 
 pin-actions-check:
-	pinact run -check -verify-comment
+	mise exec -- pinact run -check -verify-comment

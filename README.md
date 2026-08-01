@@ -12,6 +12,9 @@ make bootstrap
 
 - `swiftformat`
 - `swiftlint`
+- `pinact`
+- `actionlint`
+- `zizmor`
 
 ## Local quality commands
 
@@ -22,11 +25,13 @@ make lint
 make test
 make build
 make ci
+make workflow-lint
+make workflow-security
 make pin-actions
 make pin-actions-check
 ```
 
-`make ci` runs the same checks as CI (`format-check`, `lint`, `build`, `test`).
+`make ci` runs the same checks as CI (`pin-actions-check`, `workflow-lint`, `workflow-security`, `format-check`, `lint`, `build`, `test`).
 `make lint` sets `XCODE_DEFAULT_TOOLCHAIN_OVERRIDE=$(xcode-select -p)` automatically so SwiftLint can resolve SourceKit in Command Line Tools-only environments.
 
 ## CI
@@ -34,10 +39,9 @@ make pin-actions-check
 GitHub Actions workflow: `.github/workflows/ci.yml`
 
 - Runs on `macos-latest`
-- Uses `swift-actions/setup-swift` with Swift `6.2`
-- Installs `swiftformat` / `swiftlint`
-- Installs `pinact`
+- Uses `jdx/mise-action` and `.mise.toml` pinned tool versions
 - Verifies all `uses:` lines are SHA-pinned and version-commented (`make pin-actions-check`)
+- Runs `actionlint` and `zizmor`
 - Runs `make ci`
 
 Action pin updates are automated by `.github/workflows/update-action-pins.yml` (weekly + manual dispatch), which runs `pinact` and opens a PR with updated SHAs.
