@@ -22,6 +22,8 @@ make lint
 make test
 make build
 make ci
+make pin-actions
+make pin-actions-check
 ```
 
 `make ci` runs the same checks as CI (`format-check`, `lint`, `build`, `test`).
@@ -32,6 +34,10 @@ make ci
 GitHub Actions workflow: `.github/workflows/ci.yml`
 
 - Runs on `macos-latest`
-- Uses `swiftlang/setup-swift@v2` with Swift `6.2`
+- Uses `swift-actions/setup-swift` with Swift `6.2`
 - Installs `swiftformat` / `swiftlint`
+- Installs `pinact`
+- Verifies all `uses:` lines are SHA-pinned and version-commented (`make pin-actions-check`)
 - Runs `make ci`
+
+Action pin updates are automated by `.github/workflows/update-action-pins.yml` (weekly + manual dispatch), which runs `pinact` and opens a PR with updated SHAs.

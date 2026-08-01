@@ -1,6 +1,7 @@
 SHELL := /bin/bash
 
 .PHONY: bootstrap format format-check lint test build ci
+.PHONY: pin-actions pin-actions-check
 
 TOOLCHAIN_DIR := $(shell xcode-select -p)
 SWIFTPM_GIT_SAFE_BARE := GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.bareRepository GIT_CONFIG_VALUE_0=all
@@ -25,3 +26,9 @@ build:
 	$(SWIFTPM_GIT_SAFE_BARE) swift build
 
 ci: format-check lint build test
+
+pin-actions:
+	pinact run -update -verify-comment
+
+pin-actions-check:
+	pinact run -check -verify-comment
