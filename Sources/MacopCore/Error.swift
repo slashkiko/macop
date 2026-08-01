@@ -15,19 +15,19 @@ public enum ErrorRenderer {
         let flag: String?
 
         switch error {
-        case .invalidArguments(let detail):
+        case let .invalidArguments(detail):
             exitCode = ExitCode.invalidArguments.rawValue
             message = detail
             code = "invalid_arguments"
             command = nil
             flag = nil
-        case .unsupportedCommand(let unsupportedCommand, let reason):
+        case let .unsupportedCommand(unsupportedCommand, reason):
             exitCode = ExitCode.unsupported.rawValue
             message = reason
             code = "unsupported_command"
             command = unsupportedCommand
             flag = nil
-        case .unsupportedFlag(let unsupportedFlag, let reason):
+        case let .unsupportedFlag(unsupportedFlag, reason):
             exitCode = ExitCode.unsupported.rawValue
             message = reason
             code = "unsupported_flag"
@@ -51,7 +51,7 @@ public enum ErrorRenderer {
             var payload: [String: Any] = [
                 "error": [
                     "code": code,
-                    "message": message,
+                    "message": message
                 ]
             ]
 
@@ -65,9 +65,11 @@ public enum ErrorRenderer {
             }
 
             let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
-            let text = data.flatMap { String(data: $0, encoding: .utf8) } ?? "{\"error\":{\"code\":\"runtime_error\",\"message\":\"failed to render error\"}}"
+            let text = data.flatMap { String(
+                data: $0,
+                encoding: .utf8
+            ) } ?? "{\"error\":{\"code\":\"runtime_error\",\"message\":\"failed to render error\"}}"
             return CommandResult(exitCode: exitCode, stderr: text + "\n")
         }
     }
 }
-

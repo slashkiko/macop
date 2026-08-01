@@ -32,14 +32,13 @@ public enum CompletionText {
     public static func render(shell: String) -> String {
         switch shell {
         case "zsh":
-            return "#compdef macop op\n_arguments '*: :->args'\n"
+            "#compdef macop op\n_arguments '*: :->args'\n"
         case "bash":
-            return "_macop_complete(){ :; }\ncomplete -F _macop_complete macop op\n"
+            "_macop_complete(){ :; }\ncomplete -F _macop_complete macop op\n"
         case "fish":
-            return "complete -c macop -f\ncomplete -c op -f\n"
+            "complete -c macop -f\ncomplete -c op -f\n"
         default:
-            return "macop: unsupported shell for completion: \(shell)\n"
+            "macop: unsupported shell for completion: \(shell)\n"
         }
     }
 }
-

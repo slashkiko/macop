@@ -87,9 +87,9 @@ public enum ArgumentParser {
     private static func isTruthy(_ value: String) -> Bool {
         switch value.lowercased() {
         case "1", "true", "yes", "on":
-            return true
+            true
         default:
-            return false
+            false
         }
     }
 }

@@ -15,8 +15,9 @@ let result = app.run(
 if !result.stdout.isEmpty {
     write(result.stdout, to: .standardOutput)
 }
+
 if !result.stderr.isEmpty {
     write(result.stderr, to: .standardError)
 }
-exit(result.exitCode)
 
+exit(result.exitCode)

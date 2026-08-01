@@ -6,7 +6,7 @@ public struct MacopApp {
     public func run(argv: [String], env: [String: String]) -> CommandResult {
         do {
             let parsed = try ArgumentParser.parse(argv: argv, env: env)
-            return try execute(parsed)
+            return try self.execute(parsed)
         } catch let error as CLIError {
             let format = extractFormatHint(argv: argv, env: env)
             return ErrorRenderer.render(error: error, format: format)
@@ -34,7 +34,7 @@ public struct MacopApp {
             throw CLIError.invalidArguments(message: "Unsupported shell for completion: \(shell)")
         case .read, .run, .inject, .item, .ssh, .config, .doctor:
             throw CLIError.unsupportedCommand(
-                command: renderedCommandName(parsed),
+                command: self.renderedCommandName(parsed),
                 reason: "Command scaffold exists, but implementation has not started yet."
             )
         }
@@ -57,4 +57,3 @@ public struct MacopApp {
         return .humanReadable
     }
 }
-

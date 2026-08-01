@@ -71,4 +71,3 @@ public struct ParsedCommand {
     public let commandArgs: [String]
     public let options: GlobalOptions
 }
-

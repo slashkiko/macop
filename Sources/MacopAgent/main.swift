@@ -6,4 +6,3 @@ exit(ExitCode.unsupported.rawValue)
 private enum ExitCode: Int32 {
     case unsupported = 3
 }
-

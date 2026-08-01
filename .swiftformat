@@ -1,0 +1,8 @@
+--swiftversion 6.2
+--indent 4
+--maxwidth 120
+--stripunusedargs closure-only
+--self insert
+--commas inline
+--trimwhitespace always
+--exclude .build
