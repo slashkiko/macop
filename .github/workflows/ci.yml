@@ -10,10 +10,12 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # v4.2.2
+        uses: actions/checkout@d4537ff835c9778c934e48f78639e270edd5839e
 
       - name: Setup Swift
-        uses: swiftlang/setup-swift@v2
+        # v2.2.0
+        uses: swift-actions/setup-swift@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           swift-version: "6.2"
 
