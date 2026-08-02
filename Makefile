@@ -10,6 +10,7 @@ SHELL := /bin/bash
 TOOLCHAIN_DIR := $(shell xcode-select -p)
 SWIFTPM_GIT_SAFE_BARE := GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.bareRepository GIT_CONFIG_VALUE_0=all
 PINACT_GITHUB_TOKEN ?= $(shell gh auth token 2>/dev/null || true)
+GH_TOKEN ?= $(shell gh auth token 2>/dev/null || true)
 
 setup: bootstrap hooks-install
 
@@ -38,7 +39,7 @@ workflow-lint:
 	mise exec -- actionlint
 
 workflow-security:
-	mise exec -- zizmor --persona regular .
+	GH_TOKEN="$(GH_TOKEN)" mise exec -- zizmor --persona regular .
 
 secret-scan:
 	mise exec -- betterleaks dir .
