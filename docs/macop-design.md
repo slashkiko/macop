@@ -1,0 +1,592 @@
+# macop Design Document
+
+Status: Draft
+Last updated: 2026-08-01
+
+## 1. 概要
+
+`macop`は、macOSのApple純正セキュリティ機能を、1Password CLI (`op`) に近い操作感で利用するためのCLIである。
+
+利用者が`macop`を`op`にエイリアスすると、対応済みの`op`コマンドを同じ構文で実行できる。対応していない1Password固有機能は暗黙に無視せず、未対応理由を含むエラーを返す。
+
+```zsh
+alias op=macop
+
+op read 'op://Local/GitHub/token'
+op run --env-file=.env -- gh api user
+op inject -i config.tpl
+op item list
+```
+
+## 2. 背景と目的
+
+### 2.1 背景
+
+- CLIで利用するパスワード、API token、SSH秘密鍵を通常ファイルへ保存したくない。
+- 1Password CLIの`read`、`run`、`inject`、SSH Agent相当の使用感が必要。
+- 独自vaultや独自の暗号化ストレージは作らない。
+- Apple純正のKeychain、CryptoTokenKit、Secure Enclaveを優先して利用する。
+
+### 2.2 目的
+
+- secretを`~/.ssh`、`.env`、設定ファイル、自前DB、一時ファイルへ永続化しない。
+- secretを必要な瞬間だけ取得し、対象プロセスまたは署名処理へ渡す。
+- SSH秘密鍵をファイルへ出さず、Secure Enclave内で署名する。
+- 既存の`op`向けスクリプトを、可能な範囲で変更せず実行できるようにする。
+- 未対応操作を明確かつ機械判定可能なエラーとして返す。
+
+## 3. 用語上の「端末に置かない」
+
+本設計における「端末にセキュアな情報を置かない」は、secretを通常ファイルシステムや`macop`独自ストレージへ保存しないことを意味する。
+
+以下は利用を許可する。
+
+- macOS Keychain
+- Data Protection Keychainのうち`macop`にアクセス権がある項目
+- CryptoTokenKit
+- Secure Enclave
+- 子プロセスの実行中メモリ
+- owner-only directory配下のSSH agent socketと、LaunchAgent plist
+
+以下は禁止する。
+
+- `~/.ssh`にある秘密鍵ファイル
+- secretを含む`.env`や設定ファイル
+- secretを含む一時ファイル
+- `macop`独自vault・DB
+- secretの永続キャッシュ
+- secretをプロセス引数へ埋め込む実行方法
+
+ラベル、公開鍵、公開鍵ハッシュ、provider名、secret参照URIなどの非機密メタデータは設定ファイルへ保存できる。
+
+## 4. スコープ
+
+### 4.1 MVP
+
+- `macop`と`op`互換エントリポイント
+- secret referenceの解析
+- `read`
+- `run`
+- `inject`
+- `item list`
+- `item get`
+- `run`のstdout/stderrに対するデフォルトsecretマスクと`--no-masking`
+- 通常Keychainのgeneric password / internet password参照
+- Secure Enclave SSH鍵の作成、一覧、公開鍵取得、利用、削除
+- `macop-agent`による常駐SSH agent、鍵ごと・要求元アプリごとのTouch ID認可
+- JSON出力
+- shell completion
+- `--help`、`--version`、`--format`、`--config`、`--no-color`、secretを出さない`--debug`
+- 環境診断 (`doctor`)
+- `macop`固有の`ssh`、`config`、`compatibility` command
+- 未対応コマンドの構造化エラー
+- UTF-8 text secretだけを扱う（binary secretとNULを含む値は拒否する）
+- `op run`の対話実行と、login session中に常駐する標準SSH agent
+
+### 4.2 MVP対象外
+
+- Apple Passwordsアプリ内のpassword、OTP、passkeyの取得
+- `op read`によるOTP取得、SSH秘密鍵のOpenSSH形式export
+- Keychain itemの作成、編集、削除
+- 独自vault
+- cloud backend
+- 複数端末でのSecure Enclave秘密鍵同期
+- service account / CI
+- user / group / vault権限管理
+- Document保管
+- secret共有リンク
+- Secure Enclave秘密鍵のexport
+- 任意の対話プロンプトへの自動入力
+
+## 5. Apple Passwordsの扱い
+
+Apple Passwordsアプリの項目には、第三者CLIが継続的に参照できる公開APIがない。Keychain Servicesはaccess groupでアクセスが制限されるため、`macop`からApple Passwords固有のaccess groupを読むことはできない。
+
+本プロジェクトでは`apw`を利用しない。また、`apw`相当のheadless browser・ブラウザ拡張ブリッジもMVPには実装しない。
+
+そのため、Apple Passwordsを参照しようとした場合は明示的な未対応エラーを返す。
+
+```console
+$ macop read 'apple-passwords://github.com/me/password'
+macop: unsupported provider "apple-passwords"
+Apple Passwords does not expose a public CLI/API for live credential access.
+This build does not use apw or a browser-extension bridge.
+exit status: 3
+```
+
+Appleが将来公式APIを公開した場合は、providerとして追加する。
+
+## 6. `op`互換モード
+
+### 6.1 起動方法
+
+推奨方法はshell aliasとする。
+
+```zsh
+alias op=macop
+eval "$(macop completion zsh)"
+```
+
+生成したZsh completionは`macop`と`op`の両方へ登録する。`macop`は自身が`macop`または`op`のどちらとして起動された場合も同じコマンドツリーを提供する。実体が既存1Password CLIかどうかに依存するfallbackは行わない。
+
+shell aliasは対話shellだけに適用され、通常のshell scriptでは展開されない。既存scriptを無変更で動かす導入では、`macop` binaryへの`op` symlinkを`$PATH`上に置く。aliasは日常利用向け、symlinkはscript互換向けとする。
+
+### 6.2 互換性方針
+
+- 対応コマンドは可能な限り`op`と同じ引数・flagを受け付ける。
+- secret referenceは`op://<namespace>/<item>/[<section>/]<field>`形式を受け付ける。
+- `--format=json`、`--no-color`、`--config`など、既存スクリプトで使われるflagを優先する。
+- 完全互換を装わない。
+- 未対応コマンド、flag、providerは必ず非ゼロで終了する。
+- 未対応操作を成功扱いにしたり、入力を無視したりしない。
+- 意味が異なるcommandやflagを互換と見なさない。たとえば1Password accountを返す`whoami`はローカルmacOS user情報で代用しない。
+- 本物の`op`へ暗黙に処理を転送しない。
+
+`ssh`、`config`、`doctor`、`compatibility`は`macop`固有のextensionであり、1Password CLI互換とは主張しない。alias経由で`op ssh`などと起動された場合も、`macop` extensionとして同じ動作をする。
+
+### 6.3 互換対象
+
+| 1Password CLI | macop | MVP |
+| --- | --- | --- |
+| `op --help`, `--version`, `--format`, `--no-color`, `--debug`, `--config` | 同名 | 対応。`--debug`でもsecretはredactする |
+| `op read` | `macop read` | 対応: text field、`--no-newline`。`--out-file`、OTP、SSH private key exportは未対応 |
+| `op run` | `macop run` | 対応: shell/env-file、複数`--env-file`、デフォルトmask、`--no-masking`。1Password Environmentsは未対応 |
+| `op inject` | `macop inject` | 対応: stdin / `--in-file`、reference置換、stdout出力。`--out-file`は未対応 |
+| `op item list` | `macop item list` | 部分対応: config登録済みitemのみ、`--long`と`--format=json` |
+| `op item get` | `macop item get` | 部分対応: item名、`--fields label=…`、`--reveal`、`--format=json`。ID、stdin、OTP、share linkは未対応 |
+| `op completion` | `macop completion` | 対応: bash / zsh / fish。PowerShellはmacOS MVP外 |
+| `op whoami` | 同名 | 未対応。1Password accountという概念がないため |
+| `op signin`, `op signout`, `op update` | 同名 | 未対応。account backend・自動updateを持たないため |
+| `op item create/edit/delete/move/share/template` | 同名 | 未対応。Keychain item CRUDとshare/vault機能をMVP外とするため |
+| `op vault/account/user/group/service-account/connect/events-api/document/environment/plugin` | 同名 | 未対応。vault/cloud backendを持たないため |
+| `--account`, `--session`, `--cache`, `--iso-timestamps`、UTF-8以外の`--encoding` | 同名 | 未対応。無視やno-opにはしない |
+| — | `macop ssh`, `config`, `doctor`, `compatibility` | macop extensionとして対応。1Password CLI互換の機能ではない |
+
+### 6.4 互換性の境界
+
+`item list/get --format=json`はJSONを返すが、1Password item JSONの完全なschema互換ではない。`id`、`vault`、category、tag、archive、share linkのデータモデルが存在しないため、出力は`macop` schema versionを持つmetadataに限る。1Password JSONを前提に`jq`で`.vault.id`などを読むscriptは未対応として扱う。
+
+`run --env-file`は標準的なdotenvの`KEY=VALUE`、comment、quoteを扱う。1Password Environments、vault/accountを伴う優先順位、dotenv固有の未定義variable展開は未対応エラーにする。global flagはcommandの前後どちらに置いても解析する。`OP_FORMAT`と`OP_DEBUG`は対応する`--format`と`--debug`の環境変数として扱う。
+
+## 7. Secret reference
+
+### 7.1 `op://`互換形式
+
+```text
+op://<namespace>/<item>/[<section>/]<field>
+```
+
+例:
+
+```text
+op://Local/GitHub/token
+op://Local/Database/credentials/password
+op://$APP_ENV/GitHub/token
+```
+
+`namespace`と`item`は非機密のローカル設定からproviderの検索条件へ解決する。MVPの設定形式は、外部依存を増やさずSwift標準の`JSONDecoder`で検証できるJSONとする。
+
+```json
+{
+  "version": 1,
+  "items": {
+    "Local/GitHub": {
+      "provider": "keychain-generic",
+      "service": "github-token",
+      "account": "me@example.com",
+      "fields": ["token", "credentials/password"]
+    }
+  }
+}
+```
+
+設定ファイルは`~/Library/Application Support/macop/config.json`に置き、所有者だけが読めるpermissionにする。設定ファイルにはsecretそのものを保存しない。`macop config init`と`macop config validate`はこの非機密設定だけを作成・検証し、Keychain itemの作成はしない。
+
+referenceの各path segmentはpercent decodeする。`$NAME`はreference解決前に現在の環境変数から展開できる。未定義変数、循環参照、query parameter（`?attribute=otp`、`?ssh-format=openssh`など）は構文または未対応エラーにする。
+
+### 7.2 provider固有形式
+
+```text
+keychain://generic/<service>/<account>
+keychain://internet/<server>/<account>
+secure-enclave://<identity-label>
+```
+
+## 8. CLI設計
+
+### 8.1 read
+
+```bash
+macop read 'op://Local/GitHub/token'
+macop read --no-newline 'keychain://generic/github-token/me@example.com'
+```
+
+`op read`互換として`--no-newline`を受け付ける。`--out-file`、`--file-mode`、`--force`は、secretをファイルへ残さない要件に反するためMVPでは拒否する。OTP属性と`ssh-format=openssh` query parameterも、Apple Passwords/SSH private key exportを必要とするため拒否する。
+
+```console
+$ op read --out-file token.txt 'op://Local/GitHub/token'
+macop: unsupported flag "--out-file"
+Writing secrets to persistent files is disabled by the macop security policy.
+exit status: 3
+```
+
+### 8.2 run
+
+shell環境変数または`--env-file`内の`op://`参照を解決し、直接起動する子プロセスにだけ実値を渡す。`--env-file`には通常の非機密値を置けるが、secret値を置く場合は必ずreferenceにする。`macop`はliteral valueがsecretかを判定できないため、この境界は利用者とreviewで守る。
+
+```bash
+export GH_TOKEN='op://Local/GitHub/token'
+op run -- gh api user
+
+op run --env-file=.env -- ./server
+```
+
+拡張として、secretをstdinへ直接渡す。
+
+```bash
+macop run \
+  --stdin 'op://Local/Registry/password' \
+  -- docker login registry.example.com --username me --password-stdin
+```
+
+`run`は複数の`--env-file`、shell環境変数、reference内の環境変数展開を扱う。値の優先順は、最後に指定したenv file、先に指定したenv file、shell環境変数とする。1Password Environments由来の`--environment`は未対応とする。
+
+子プロセスのstdout/stderrは、解決済みsecretを跨ぎchunkでも検出するstreaming redactorを通す。該当する値はデフォルトで`<concealed by macop>`へ置換する。`--no-masking`を指定した場合だけ中継・マスクを外す。これは1Password CLIのデフォルトmaskと同じ利用モデルであり、明示的な解除として扱う。
+
+マスクは「secretそのものが出力された」事故を減らす機能であり、secretを変換・分割・送信する不正または誤動作した子プロセスを封じるものではない。secretを標準入力へ渡せるプログラムでは`--stdin`を優先する。
+
+### 8.3 inject
+
+```bash
+op inject -i config.tpl
+```
+
+1Password CLIと同じく、templateはstdinから読むか`-i`/`--in-file`で指定する。reference内の環境変数展開と複数referenceの連結を扱い、解決結果はstdoutだけへ出す。`--out-file`、`--file-mode`、`--force`はMVPでは拒否する。
+
+### 8.4 item
+
+```bash
+op item list --format=json
+op item get GitHub --format=json
+op item get GitHub --fields label=token
+```
+
+MVPでは設定済みのKeychain itemのみを対象にする。`item list`は`--long`と`--format=json`を受け付ける。`item get`はitem名、`--fields label=<field>`、`--reveal`、`--format=json`を受け付け、`--reveal`がないsecret fieldはマスクする。
+
+1Password固有のitem ID、stdin入力、`--vault`、`--categories`、`--tags`、`--favorite`、`--include-archive`、`--otp`、`--share-link`は、vault/category/archive/share/OTPという対応するデータモデルがないため未対応エラーにする。
+
+### 8.5 global flag
+
+`--help`、`--version`、`--format human-readable|json`、`--no-color`、`--debug`を受け付ける。`OP_FORMAT`と`OP_DEBUG`も同じ意味で受け付ける。`--config <directory>`は、そのdirectory内の`config.json`を使用する。`--debug`はquery・provider・exit codeだけを出し、secret値や子プロセス環境を出さない。
+
+`--account`、`--session`、`--cache`、`--iso-timestamps`、UTF-8以外の`--encoding`は明示的な未対応エラーにする。
+
+### 8.6 macop extension
+
+`macop compatibility [--format human-readable|json]`は、command・subcommand・flagごとの`supported`、`partial`、`unsupported`、理由、代替commandを返す。JSON出力は`schema_version`を含む`macop`固有schemaとする。
+
+`macop config init|validate`は非機密の`config.json`だけを作成・検証する。`macop doctor`はOS、Keychain、CryptoTokenKit、`ssh-keychain.dylib`、設定permissionを診断する。`macop ssh …`はSection 9のSecure Enclave SSH wrapperを提供する。
+
+## 9. SSH設計
+
+SSH秘密鍵はKeychainから取得して渡すのではなく、Secure Enclave内で署名する。
+
+```mermaid
+flowchart LR
+    A["git / ssh / IDE"] -->|OpenSSH agent protocol| B["macop-agent"]
+    B -->|PID / code signature検証| C["要求元process"]
+    B -->|Touch ID approval| D["LocalAuthentication"]
+    B -->|SecKeyCreateSignature| E["Security / CryptoTokenKit"]
+    E --> F["Secure Enclave"]
+```
+
+### 9.1 純正コマンド
+
+```bash
+sc_auth create-ctk-identity -l github -k p-256-ne -t bio
+sc_auth list-ctk-identities -t sha1 -e hex
+ssh-keygen -D /usr/lib/ssh-keychain.dylib
+sc_auth delete-ctk-identity -h '<public-key-hash>'
+```
+
+`ssh-keychain.dylib`はidentityの公開鍵を照合するためだけに使う。署名には使わない。`ssh-add`と標準`ssh-agent`はMVPの実装・利用対象外とする。
+
+### 9.2 ラッパーコマンド
+
+```bash
+macop ssh create github --touch-id
+macop ssh list
+macop ssh public-key github
+macop ssh test github
+macop ssh agent status
+macop ssh agent install
+macop ssh agent enable github
+macop ssh agent disable github
+macop ssh agent disable --all
+macop ssh agent lock
+macop ssh agent uninstall
+macop ssh run github -- git clone git@github.com:owner/repo.git
+macop ssh delete github
+```
+
+`macop-agent`はOpenSSH agent protocolを`~/Library/Application Support/macop/ssh-agent.sock`で提供する。`install`はmenu bar appを`~/Applications/macop-agent.app`へ配置し、login時に起動するuser LaunchAgentを登録する。SSH clientは、このstable socketを`IdentityAgent`または`SSH_AUTH_SOCK`で参照する。`macop`が設定へ保存するのはidentity label、公開鍵、公開鍵ハッシュ、agentのenabled状態、認可policyだけであり、secret値やprivate keyは保存しない。
+
+agentはenabled identityの公開鍵だけをclientへ返す。署名要求時にはsocket peerのUID、`LOCAL_PEERPID`、親process chainを調べ、Code Signing Servicesで動的code validityとcode hashを検証する。未承認のidentity × requester applicationの組み合わせはmenu bar UIで表示し、Touch IDを求める。host名は署名要求のwire protocolに含まれないため、MVPの承認境界には使わない。承認cacheはメモリだけに置き、defaultのrequester process tree scope（root PIDとstart timeを含む）と15分TTLで有効にする。`lock`、agent再起動、user sessionのinactive化、screen sleepでは即時に消去する。TTLとscopeは非機密設定で変更できるが、全applicationを無条件に許可する設定はMVPで提供しない。
+
+agent socketはkey materialを含まないが、署名要求のcapabilityである。parent directoryは`0700`で作成・検証し、permissionが広い場合はagentが起動しない。`macop ssh delete <identity>`は、enabled setとmemory cacheからidentityを外してからSecure Enclave identityを削除する。agentに削除済みidentityのhandleや設定上のorphanを残さないためである。`macop ssh run`、`test`は直接PKCS#11 providerを指定せず、必ず`macop-agent` socketを利用する。
+
+## 10. Apple純正コマンドとの対応
+
+| 操作 | Apple純正 | macop / op互換 |
+| --- | --- | --- |
+| generic password取得 | `security find-generic-password -s SERVICE -a ACCOUNT -w` | `op read op://Local/Item/field` |
+| internet password取得 | `security find-internet-password -s SERVER -a ACCOUNT -w` | `op read op://Local/Item/field` |
+| Keychain metadata検索 | Security.framework `SecItemCopyMatching` | `op item list` |
+| Secure Enclave鍵生成 | `sc_auth create-ctk-identity` | `macop ssh create` |
+| CTK identity一覧 | `sc_auth list-ctk-identities` | `macop ssh list` |
+| SSH公開鍵取得 | `ssh-keygen -D /usr/lib/ssh-keychain.dylib` | `macop ssh public-key` |
+| Secure Enclave署名 | Security.framework `SecKeyCreateSignature` | `macop-agent`（`macop ssh run` / 通常の`ssh`・`git`） |
+| SSH agentの常駐・認可 | Apple単独の同等機能なし | `macop ssh agent install|lock|uninstall` |
+
+通常Keychainのsecret取得は`security -w`を子プロセスとして呼ばず、Security.frameworkを直接利用する。これにより不要なstdout出力を避ける。
+
+## 11. 未対応エラー
+
+### 11.1 人間向け
+
+```console
+$ op vault list
+macop: unsupported op command "vault list"
+Reason: macop does not provide a vault or cloud account backend.
+Supported op-compatible commands: read, run, inject, item list, item get, completion
+macop extensions: ssh, config, doctor, compatibility
+Run "macop compatibility" for the complete support matrix.
+```
+
+### 11.2 JSON
+
+```bash
+op vault list --format=json
+```
+
+```json
+{
+  "error": {
+    "code": "unsupported_command",
+    "command": "vault list",
+    "message": "macop does not provide a vault or cloud account backend",
+    "documentation": "https://github.com/<owner>/macop#op-compatibility"
+  }
+}
+```
+
+JSONエラーもstderrへ出力する。stdoutには成功時のデータだけを出す。
+
+### 11.3 終了コード
+
+| Code | 意味 |
+| --- | --- |
+| `0` | 成功 |
+| `1` | 実行時エラー |
+| `2` | 引数・構文エラー |
+| `3` | 未対応コマンド・flag・provider |
+| `4` | provider利用不可 |
+| `5` | 認証拒否・キャンセル |
+| `6` | item / identityが見つからない |
+
+secret値、accountのpassword、内部tokenをエラーメッセージやdebug logへ含めない。
+
+## 12. アーキテクチャ
+
+```mermaid
+flowchart TD
+    CLI["macop / op alias"] --> Parser["op互換Command Parser"]
+    Parser --> Resolver["Secret Reference Resolver"]
+    Resolver --> Keychain["Keychain Provider<br>Security.framework"]
+    Parser --> Runner["Process Runner"]
+    Runner --> Redactor["Secret Output Redactor<br>Pipe / PTY relay"]
+    Parser --> Injector["Template Injector"]
+    Parser --> SSH["Secure Enclave SSH Controller"]
+    SSH --> CTK["sc_auth / CryptoTokenKit"]
+    SSH --> Agent["macop-agent.app<br>OpenSSH Agent Server / Menu Bar"]
+    Agent --> Auth["Requester identity / Touch ID authorization"]
+    Agent --> Key["Security.framework<br>SecKeyCreateSignature"]
+    Parser --> Unsupported["Unsupported Command Reporter"]
+```
+
+### 12.1 言語・package構成
+
+- Swift 6 language mode、Swift Package Manager、macOS専用とする。
+- package dependencyは持たない。使用するplatform frameworkはFoundation、Security、CryptoTokenKit、LocalAuthentication、AppKit、Darwinだけとする。
+- argument parserは自前実装し、`swift-argument-parser`などの外部packageは追加しない。
+- executable targetは`MacopCLI`と`MacopAgent`、library targetは`MacopCore`、test targetは`MacopCoreTests`とする。`MacopAgent`はbuild scriptで`macop-agent.app`（menu bar専用、Dockに表示しない）へbundleする。
+
+### 12.2 モジュール
+
+- `CLI`: 引数解析、`op`互換構文、help、completion、global flagの前後配置
+- `Compatibility`: 対応command/flagの静的matrixと`macop compatibility` schema
+- `ReferenceResolver`: `op://`、provider URI、optional section、percent decode、環境変数展開
+- `ConfigStore`: owner-onlyの`config.json`読み書き・schema validation。secret値は保持しない
+- `KeychainProvider`: Security.frameworkによるgeneric/internet password参照
+- `Runner`: `posix_spawnp`でのshellなし起動、子プロセス環境とstdinへの注入
+- `TerminalRelay`: 非対話時のPipe、対話時の`openpty`、SIGINT/SIGTERM/terminal sizeのrelay
+- `OutputRedactor`: secret byte列を跨ぎchunkで検出しstdout/stderrをmaskする。`--no-masking`時は迂回
+- `Injector`: メモリ上でのtemplate置換
+- `SSHProvider`: `sc_auth`、CryptoTokenKit、public key照合。OpenSSHへprivate key / PKCS#11 providerを渡さない
+- `AgentProtocol`: OpenSSH agent protocolのidentity list / sign request / failure responseをparse・serializeする
+- `RequesterVerifier`: Unix socketのpeer UID / `LOCAL_PEERPID`、親process chain、Code Signing Servicesのdynamic validityとcode hashを検証する
+- `AuthorizationStore`: identity × requester applicationのin-memory承認cache。TTL、manual lock、session inactive、sleepで消去する
+- `AgentApp`: menu bar UI、Touch ID prompt、owner-onlyのagent socket、user LaunchAgentによるlogin時起動
+- `ErrorRenderer`: text / JSON形式の構造化エラー
+- `Doctor`: OS、純正バイナリ、provider、code signature、設定permissionの診断
+
+### 12.3 secretの型とプロセス境界
+
+MVPで扱うsecretはvalid UTF-8 textに限定する。Keychainから取得した`Data`は、実行時だけ保持し、`read`、`run`、`inject`の境界でUTF-8へdecodeする。invalid UTF-8またはNULを含む値はprovider error（終了コード`1`）にし、値そのものを出力しない。
+
+`run`はshellを起動せず`posix_spawnp`で`argv`をそのまま実行する。非対話実行はstdout/stderrを別々のPipeで中継する。TTYが必要な実行は`openpty`を使い、入力、window size、SIGINT、終了コードをrelayする。`--no-masking`でも同じ実行経路を使い、redactorだけを迂回する。
+
+Swiftの通常メモリを完全にzeroizeできるとは主張しない。secretの参照寿命を短くし、ログ・error・argv・永続storageへ出さないことを保証境界とする。
+
+### 12.4 code signingと導入
+
+MVPは本人のMacでのsource buildを対象とし、`swift build -c release`後に`~/.local/bin/macop`へ配置する。script互換用の`op`は同directoryのsymlinkとする。`MacopAgent`は`~/Applications/macop-agent.app`へbundleして配置する。local buildはCLIとapp bundleの両方にad-hoc signature（`codesign --sign -`）を使い、Developer ID signing、notarization、installerは配布時の後続スコープとする。
+
+Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain設定に依存するため、MVPの実機integration testで確認する。agentのrequester allowはcode hashを含むため、requester binaryの更新後には再承認が必要になる。`doctor`はinstall path、code signature、agent socket、Keychain access結果を表示し、認可に失敗した場合はprovider errorを返す。`doctor`自身はsecret値を表示しない。
+
+### 12.5 常駐SSH agent
+
+常駐するのは`macop-agent.app`であり、標準`ssh-agent`ではない。agentはuser LaunchAgentでlogin時に起動し、menu barにlocked / unlocked、enabled identity数、保留中の許可要求を表示する。agentが提供するsocketはOpenSSHの標準agent protocolなので、SSH clientの側は`IdentityAgent`または`SSH_AUTH_SOCK`だけを設定すればよい。
+
+identity list要求にはenabled identityの公開鍵だけを返す。sign要求には、socket peerのUIDがcurrent userであること、PIDと親process chainが取得できること、requesterのdynamic code signatureが有効であることを確認する。識別・検証できないrequestは拒否する。確認できた組み合わせだけに、`<application> が <identity> を使用`する旨をmenu bar UIで表示し、Touch IDを要求する。`SecKeyCreateSignature`を呼ぶのはこの承認済みagentだけであり、private keyはSecure Enclaveから出ない。
+
+MVPが許可するのはvalidなcode signatureを持つOpenSSH clientだけである。macOS付属の`/usr/bin/ssh`を基準実装とし、未署名のcustom clientはsecurity boundaryを作れないため拒否する。ad-hoc signatureを付けたlocal buildはcode hashとして識別できるが、binary更新後は再承認が必要になる。`doctor`はagent socketとともに実際に選ばれるSSH clientの署名検証結果を表示する。
+
+承認cacheはidentity fingerprint、requester applicationのcode hash、root process PIDとstart time、期限をkeyにしたin-memory dataだけである。初期値はrequester process tree scope・15分TTLとし、`macop ssh agent lock`、agent restart、user session inactive、screen sleep時に消去する。許可されたidentityの設定、TTL、scopeは編集できるが、全application許可、無期限許可、未検証process許可はMVPの対象外とする。`macop ssh agent disable <identity>`はidentityをagentの公開対象から外してcacheを消去する。`disable --all`は全identityを外すがagent自体はmenu barから停止できる。`uninstall`だけがLaunchAgentとapp bundleを削除する。
+
+agent forwardingはMVPで常に`ForwardAgent=no`とする。forwardingを許可するにはremote processまで含めた別の認可modelが必要であり、1Password同様の安全なUXを後続スコープとして扱う。
+
+## 13. セキュリティ要件
+
+- secretを永続保存しない。
+- secretをコマンドライン引数へ載せない。
+- secretをログへ出さない。
+- `run`の子プロセス終了後にsecret参照を保持しない。
+- `run`のstdout/stderrでは解決済みsecretをデフォルトでmaskする。`--no-masking`は利用者が明示的に選ぶ例外とする。
+- 出力maskは変換・分割・外部送信による漏洩を防ぐ境界ではない。secretを受け取る子プロセスは信頼する。
+- 独自の復号鍵・master passwordを持たない。
+- SSH秘密鍵を取得・exportしない。
+- Secure Enclave鍵はnon-exportable variantを標準とする。
+- 常駐agent socketを含むdirectoryは`0700`とし、permissionが緩い状態では利用しない。
+- Secure Enclave署名を実行できるprocessは`macop-agent`だけとし、未検証のsocket peerには署名させない。
+- 未署名またはdynamic code validityを確認できないSSH clientは拒否する。
+- agentの承認cacheはmemoryだけに置き、manual lock、session inactive、screen sleep、TTL、agent restartで消去する。
+- agent forwardingはMVPで常に`ForwardAgent=no`とする。
+- `--out-file`は標準で禁止する。
+- 未対応操作を別処理へfallbackしない。
+- identity selectionは公開鍵ハッシュなど非機密情報で行う。
+- debug modeでもsecret値をredactする。
+
+## 14. 実装フェーズ
+
+### Phase 0: agent実現可能性spike
+
+- `p-256-ne` identityをSecurity.frameworkから取得し、`SecKeyCreateSignature`でOpenSSH互換のECDSA signature responseを生成できること
+- Unix socketの`LOCAL_PEERPID`からpeer PIDと親process chainを取得し、Code Signing Servicesでdynamic validityとcode hashを検証できること
+- menu bar appのLaunchAgent起動中に`LAContext`でTouch ID promptを表示できること
+- OpenSSH agent protocolの最小identity list / sign requestで`ssh -T git@github.com`を通せること
+- いずれかが公開APIだけで満たせなければ、CLI本体の実装へ進まず設計を再評価すること
+
+### Phase 1: CLI・package基盤
+
+- Swift 6 / Swift Package Managerの`MacopCLI`、`MacopAgent`、`MacopCore`、`MacopCoreTests`作成
+- `MacopAgent`をDockに出さないmenu bar app bundleへ組み立てるbuild script
+- 外部依存なしの自前argument parser
+- `macop` / `op`互換command tree
+- global flagと全top-level commandのsupport/unsupported matrix
+- global flagの前後配置、`OP_FORMAT` / `OP_DEBUG`、aliasとsymlink双方の起動fixture
+- text / JSON error model
+- compatibility matrix
+- completion生成
+
+### Phase 2: 非機密設定とreference解決
+
+- owner-onlyの`config.json`作成・validation
+- `op://`と`keychain://`のreference解析
+- optional section、percent decode、reference内の環境変数展開
+- secretを受け付けない設定schemaとconfig command
+
+### Phase 3: Keychain secret利用
+
+- Keychain metadata検索
+- `read`
+- secret reference resolver
+- `run`
+- `inject`
+- UTF-8/NUL validation、stdout/stderr redactor（chunk境界を含む）、対話時のPTY relay
+- shellなしの`posix_spawnp`実行
+- `--no-masking`の明示的解除
+
+### Phase 4: Secure Enclave SSH
+
+- identity作成・一覧・削除
+- 公開鍵取得
+- GitHub接続test
+- providerを直接使わないSSH/Git実行
+- OpenSSH agent protocolのidentity list / sign request / error response
+- requester PID・親process chain・code signature検証
+- menu barの許可prompt、Touch ID、memory-only authorization cache
+- LaunchAgentによる`macop-agent.app`のlogin時起動、stable socket、owner-only permission
+- `ForwardAgent=no`の固定
+
+### Phase 5: 安全性と互換性
+
+- secret leak test
+- デフォルトmask、`--no-masking`、複数secret、chunk境界、TTYの互換テスト
+- unsupported command contract test
+- `op`互換fixture test
+- 1Password JSON schemaを完全互換と誤認しない`item` metadata contract test
+- OS/version診断
+- UTF-8拒否、agent socket permission、未検証process拒否、authorization TTL / lock / sleep時cache消去のintegration test
+- ad-hoc code signing、`~/.local/bin`と`~/Applications/macop-agent.app`へのinstall、binary更新後のKeychain認可とrequester再承認を含むREADMEとsource build手順
+
+## 15. MVP完了条件
+
+- `alias op=macop`後、対応済み`op`コマンドが同じ構文で動く。
+- `op read`でアクセス可能な通常Keychain itemを取得できる。
+- `op run`でsecretを子プロセスのみに渡せる。
+- `op run`がstdout/stderrへ出たsecretをデフォルトでmaskし、`--no-masking`でだけ解除できる。
+- `op inject`でディスクへsecretを書かずstdoutへ展開できる。
+- Secure Enclave鍵で`git@github.com`へ認証できる。
+- `macop ssh agent install`後、login session中の`macop-agent`がstable socketで利用でき、次のloginでも鍵をexportせずに起動する。
+- 素の`ssh`、`git`、IDEからの署名要求で、identityと要求元applicationを示すTouch ID許可が必要になる。
+- 許可はmemoryだけに保存され、TTL、manual lock、session inactive、screen sleep、agent restartで失効する。
+- `~/.ssh`に秘密鍵ファイルが存在しない。
+- `macop`独自ストレージにsecretが存在しない。
+- 未対応`op`コマンドが理由付きの終了コード`3`を返す。
+- text / JSON双方でエラー形式が安定している。
+- Apple Passwordsアクセスは未対応として明示される。
+- `macop compatibility --format=json`がsupport matrixをstableなmacop schemaで返す。
+
+## 16. 将来候補
+
+- Keychain itemの作成、編集、削除
+- `kSecAttrSynchronizable`を使ったgeneric secret同期
+- shell plugin
+- Git SSH署名
+- Appleが公式APIを公開した場合のApple Passwords provider
+
+## 17. 参考資料
+
+- [1Password CLI reference](https://www.1password.dev/cli/reference)
+- [1Password item command](https://www.1password.dev/cli/reference/management-commands/item)
+- [1Password read](https://www.1password.dev/cli/reference/commands/read)
+- [1Password run](https://www.1password.dev/cli/reference/commands/run)
+- [1Password inject](https://www.1password.dev/cli/reference/commands/inject)
+- [Apple Keychain Services](https://developer.apple.com/documentation/security/keychain-services)
+- [Apple LocalAuthentication](https://developer.apple.com/documentation/localauthentication)
+- [Apple SecKeyCreateSignature](https://developer.apple.com/documentation/security/seckeycreatesignature%28_%3A_%3A_%3A_%3A%29)
+- [Apple SecCodeCopyGuestWithAttributes](https://developer.apple.com/documentation/security/seccodecopyguestwithattributes%28_%3A_%3A_%3A_%3A%29)
+- [1Password SSH agent security model](https://www.1password.dev/ssh/agent/security)
+- [Sharing access to Keychain items](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps)
+- [Apple Passwords](https://support.apple.com/en-euro/120758)
