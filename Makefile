@@ -39,7 +39,7 @@ workflow-lint:
 	mise exec -- actionlint
 
 workflow-security:
-	GH_TOKEN="$(GH_TOKEN)" mise exec -- zizmor --persona regular .
+	@GH_TOKEN="$(GH_TOKEN)" mise exec -- zizmor --persona regular .
 
 secret-scan:
 	mise exec -- betterleaks dir .
@@ -56,7 +56,7 @@ pre-commit:
 	.githooks/pre-commit
 
 pin-actions:
-	PINACT_GITHUB_TOKEN="$(PINACT_GITHUB_TOKEN)" mise exec -- pinact run -update -verify-comment -min-age 7
+	@PINACT_GITHUB_TOKEN="$(PINACT_GITHUB_TOKEN)" mise exec -- pinact run -update -verify-comment -min-age 7
 
 pin-actions-check:
-	PINACT_GITHUB_TOKEN="$(PINACT_GITHUB_TOKEN)" mise exec -- pinact run -check -verify-comment
+	@PINACT_GITHUB_TOKEN="$(PINACT_GITHUB_TOKEN)" mise exec -- pinact run -check -verify-comment

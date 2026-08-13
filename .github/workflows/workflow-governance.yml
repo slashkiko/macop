@@ -27,6 +27,8 @@ jobs:
       - name: Setup mise
         uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
       - name: Verify action pins
+        env:
+          PINACT_GITHUB_TOKEN: ${{ github.token }}
         run: make pin-actions-check
 
   workflow-lint:
