@@ -7,16 +7,27 @@ public enum ItemCommand {
         switch subcommand {
         case "list": return try self.list(Array(args.dropFirst()), options: options)
         case "get": return try self.get(Array(args.dropFirst()), options: options, client: client)
-        default: throw CLIError.unsupportedCommand(
-                command: "item \(subcommand)",
-                reason: "This item operation is not supported."
-            )
+        default:
+            if let reason = self.unsupportedSubcommandReason(subcommand) {
+                throw CLIError.unsupportedCommand(command: "item \(subcommand)", reason: reason)
+            }
+            throw CLIError.invalidArguments(message: "Unknown item subcommand: \(subcommand)")
         }
     }
 
     private static func list(_ args: [String], options: GlobalOptions) throws -> CommandResult {
-        guard args.allSatisfy({ $0 == "--long" })
-        else { throw CLIError.invalidArguments(message: "Unsupported item list arguments.") }
+        for arg in args {
+            if arg == "--long" {
+                continue
+            }
+            if let unsupportedFlag = self.unsupportedListFlag(arg) {
+                throw CLIError.unsupportedFlag(
+                    flag: unsupportedFlag,
+                    reason: "This item list flag is not supported by macop."
+                )
+            }
+            throw CLIError.invalidArguments(message: "Unknown item list argument: \(arg)")
+        }
         let includeLongMetadata = args.contains("--long")
         let items = try ConfigStore.items(configDirectory: options.configDirectory).filter(self.supported)
         let payload = items.keys.sorted().compactMap { key -> [String: String]? in
@@ -125,6 +136,17 @@ public enum ItemCommand {
     }
 
     private static func unsupportedGetFlag(_ arg: String) -> String? {
+        self.unsupportedItemFlag(arg, including: [
+            "--id",
+            "--stdin"
+        ])
+    }
+
+    private static func unsupportedListFlag(_ arg: String) -> String? {
+        self.unsupportedItemFlag(arg, including: [])
+    }
+
+    private static func unsupportedItemFlag(_ arg: String, including additional: [String]) -> String? {
         let flags = [
             "--vault",
             "--categories",
@@ -132,11 +154,15 @@ public enum ItemCommand {
             "--favorite",
             "--include-archive",
             "--otp",
-            "--share-link",
-            "--id",
-            "--stdin"
-        ]
+            "--share-link"
+        ] + additional
         return flags.first { arg == $0 || arg.hasPrefix("\($0)=") }
+    }
+
+    private static func unsupportedSubcommandReason(_ subcommand: String) -> String? {
+        CompatibilityCommand.entries.first {
+            $0.kind == "subcommand" && $0.status == "unsupported" && $0.command == "item \(subcommand)"
+        }?.reason
     }
 
     private static func render(_ payload: Any, options: GlobalOptions) -> CommandResult {

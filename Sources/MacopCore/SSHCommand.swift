@@ -260,17 +260,7 @@ private extension SSHCommand {
     private static func resolveAgentExecutable() throws -> String {
         // CommandLine.arguments[0] is caller-controlled and can be merely
         // "macop" when invoked through PATH. Resolve the running image instead.
-        var byteCount: UInt32 = 0
-        _ = _NSGetExecutablePath(nil, &byteCount)
-        guard byteCount > 0 else {
-            throw CLIError.notFound(message: "Could not resolve the running macop executable.")
-        }
-        let path = UnsafeMutablePointer<CChar>.allocate(capacity: Int(byteCount))
-        defer { path.deallocate() }
-        guard _NSGetExecutablePath(path, &byteCount) == 0 else {
-            throw CLIError.notFound(message: "Could not resolve the running macop executable.")
-        }
-        let executable = URL(fileURLWithPath: String(cString: path)).resolvingSymlinksInPath()
+        let executable = try URL(fileURLWithPath: RunningExecutable.path())
             .deletingLastPathComponent().appendingPathComponent("macop-agent").path
         var details = stat()
         guard lstat(executable, &details) == 0,

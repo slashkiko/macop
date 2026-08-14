@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 .PHONY: help setup bootstrap hooks-install
-.PHONY: format format-check lint test test-agent-helper test-keychain-integration test-pty test-ssh-manual build
+.PHONY: format format-check lint test test-agent-helper test-invocation test-no-persistence test-keychain-integration test-pty test-ssh-manual build
 .PHONY: ci ci-swift ci-workflows ci-secrets
 .PHONY: pin-actions pin-actions-check
 .PHONY: workflow-lint workflow-security
@@ -15,7 +15,7 @@ GH_TOKEN ?= $(shell gh auth token 2>/dev/null || true)
 help:
 	@printf '%s\n' \
 	  'Setup:       make setup | bootstrap | hooks-install' \
-	  'Development: make format | format-check | lint | build | test | test-agent-helper' \
+	  'Development: make format | format-check | lint | build | test | test-agent-helper | test-invocation | test-no-persistence' \
 	  'Manual:      make test-keychain-integration | test-pty | test-ssh-manual' \
 	  'CI groups:   make ci-swift | ci-workflows | ci-secrets | ci' \
 	  'Governance:  make workflow-lint | workflow-security | secret-scan | pin-actions-check'
@@ -43,6 +43,12 @@ test:
 test-agent-helper: build
 	@bash scripts/test-agent-helper.sh
 
+test-invocation: build
+	@bash scripts/test-invocation.sh
+
+test-no-persistence: build
+	@python3 scripts/test-no-persistence.py
+
 test-keychain-integration:
 	MACOP_RUN_KEYCHAIN_INTEGRATION=1 swift run macop-selftest
 
@@ -67,13 +73,13 @@ workflow-security:
 secret-scan:
 	mise exec -- betterleaks dir .
 
-ci-swift: format-check lint build test test-agent-helper
+ci-swift: format-check lint build test test-agent-helper test-invocation test-no-persistence
 
 ci-workflows: pin-actions-check workflow-lint workflow-security
 
 ci-secrets: secret-scan
 
-ci: ci-workflows ci-swift ci-secrets
+ci: ci-workflows ci-swift test-pty ci-secrets
 
 pre-commit:
 	.githooks/pre-commit

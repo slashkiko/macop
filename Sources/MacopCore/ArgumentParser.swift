@@ -16,8 +16,6 @@ public enum ArgumentParser {
         let args = Array(argv.dropFirst())
         var command: TopLevelCommand?
         var commandArgs: [String] = []
-        var unsupportedCommandParts: [String] = []
-
         var index = 0
         while index < args.count {
             let token = args[index]
@@ -104,26 +102,11 @@ public enum ArgumentParser {
                     commandArgs.append(token)
                 } else if command == nil {
                     guard let parsedCommand = TopLevelCommand(rawValue: token) else {
-                        unsupportedCommandParts.append(token)
-                        index += 1
-                        while index < args.count {
-                            let next = args[index]
-                            if next == "--format" || next == "--config" {
-                                break
-                            }
-                            if next.hasPrefix("--format=") || next.hasPrefix("--config=") {
-                                break
-                            }
-                            if next.hasPrefix("-") {
-                                break
-                            }
-                            unsupportedCommandParts.append(next)
-                            index += 1
+                        let next = index + 1 < args.count ? args[index + 1] : nil
+                        if let unsupported = CompatibilityCommand.unsupportedCommand(root: token, next: next) {
+                            throw CLIError.unsupportedCommand(command: unsupported.command, reason: unsupported.reason)
                         }
-                        throw CLIError.unsupportedCommand(
-                            command: unsupportedCommandParts.joined(separator: " "),
-                            reason: "macop does not provide this 1Password command or cloud backend."
-                        )
+                        throw CLIError.invalidArguments(message: "Unknown command: \(token)")
                     }
                     command = parsedCommand
                 } else {

@@ -101,6 +101,9 @@ public enum ErrorRenderer {
                 lines.append("macop: \(message)")
             }
             lines.append("Reason: \(message)")
+            if exitCode == ExitCode.unsupported.rawValue {
+                lines.append(contentsOf: CompatibilityCommand.humanSupportGuidance())
+            }
             return CommandResult(exitCode: exitCode, stderr: lines.joined(separator: "\n") + "\n")
         case .json:
             var payload: [String: Any] = [
@@ -112,7 +115,6 @@ public enum ErrorRenderer {
 
             if let command, var errorInfo = payload["error"] as? [String: Any] {
                 errorInfo["command"] = command
-                errorInfo["documentation"] = "https://github.com/slashkiko/macop#op-compatibility"
                 payload["error"] = errorInfo
             }
             if let flag, var errorInfo = payload["error"] as? [String: Any] {
@@ -121,6 +123,11 @@ public enum ErrorRenderer {
             }
             if let provider, var errorInfo = payload["error"] as? [String: Any] {
                 errorInfo["provider"] = provider
+                payload["error"] = errorInfo
+            }
+            if exitCode == ExitCode.unsupported.rawValue, var errorInfo = payload["error"] as? [String: Any] {
+                errorInfo["documentation"] = "https://github.com/slashkiko/macop#op-compatibility"
+                errorInfo["guidance"] = "Run macop compatibility for the support matrix."
                 payload["error"] = errorInfo
             }
 

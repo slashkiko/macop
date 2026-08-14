@@ -167,6 +167,8 @@ make format-check
 make lint
 make test
 make test-agent-helper
+make test-invocation
+make test-no-persistence
 make build
 make ci-swift
 make ci-workflows
@@ -181,7 +183,10 @@ make pin-actions-check
 make help
 ```
 
-`make ci` runs all local checks (`ci-workflows` + `ci-swift` + `ci-secrets`).
+`make ci` runs all local checks (`ci-workflows` + `ci-swift` + `test-pty` +
+`ci-secrets`). `ci-swift` includes the signed-agent helper, alias/symlink, and
+fake-Keychain no-persistence fixtures; the deterministic PTY relay runs both in
+the macOS workflow and in the broader local `ci` target.
 `make pre-commit` runs only the relevant check groups for staged files:
 
 - Workflow-related changes: `ci-workflows`
@@ -217,11 +222,18 @@ same metadata inside their single error object. Successful agent sessions relay
 the launched program's stream unchanged, so they intentionally do not append a
 JSON debug record that could corrupt that program's output protocol.
 
-The three focused/manual checks are intentionally separate from `make ci`:
+Focused/manual checks:
 
 - `make test-keychain-integration` creates and removes a dedicated local test
   Keychain item; it may prompt for Keychain access.
 - `make test-pty` verifies interactive relay and signal behavior.
+- `make test-invocation` exercises the documented `alias op=macop` and sibling
+  `op -> macop` symlink installation modes in a temporary PATH.
+- `make test-no-persistence` uses the self-test's fake Keychain client to check
+  a runtime-generated secret through a real config mapping. It checks child
+  argv and safe debug output, then scans dedicated HOME/config/tmp/log roots;
+  `inject` output is verified and discarded in memory. The fake-provider seam
+  receives the secret over an inherited test-only pipe, outside argv and env.
 - `make test-ssh-manual` is non-mutating and reports Apple SSH/CTK prerequisites;
   it does not create or delete an identity.
 
@@ -230,8 +242,8 @@ The three focused/manual checks are intentionally separate from `make ci`:
 CI is split into path-scoped workflows:
 
 - `.github/workflows/swift-quality.yml`
-  - Triggered only when Swift/package/tooling files change
-  - Runs `format-check`, `lint`, `build`, `test`
+  - Triggered only when Swift/package/tooling or `scripts/**` files change
+  - Runs `make ci-swift` and the deterministic `make test-pty` fixture
 - `.github/workflows/workflow-governance.yml`
   - Triggered only when workflow/governance files change
   - Runs `pin-actions-check`, `workflow-lint`, `workflow-security`

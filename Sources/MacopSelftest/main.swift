@@ -11,6 +11,12 @@ struct SelftestFailure: Error {
     let message: String
 }
 
+private struct ConfigSelectorFixture {
+    let name: String
+    let itemKey: String
+    let fields: String
+}
+
 let appleTableHeader = "Key Type  Public Key Hash                            Prot  Label                 Common Name  Email Address  Valid To  Valid\n"
 func appleTableRow(_ hash: String, _ label: String, commonName: String = "") -> String {
     let keyType = "p-256-ne"
@@ -1043,15 +1049,29 @@ private func write(_ text: String, to handle: FileHandle) {
 private func runHarnessIfRequested() -> Never? {
     let arguments = Array(CommandLine.arguments.dropFirst())
     guard let mode = arguments.first else { return nil }
+    let processEnvironment = ProcessInfo.processInfo.environment
+    let pipedSecret: String? = {
+        guard let descriptorText = processEnvironment["MACOP_SELFTEST_FAKE_SECRET_FD"],
+              let descriptor = Int32(descriptorText)
+        else { return nil }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        let data = handle.readDataToEndOfFile()
+        try? handle.close()
+        return String(data: data, encoding: .utf8)
+    }()
     let secret = mode == "--pty-run-large-stdin" ? String(repeating: "large-stdin-secret-", count: 32768)
-        : "test-secret"
+        : pipedSecret ?? "test-secret"
     let app = MacopApp(keychainClient: FakeKeychainClient(response: .success(Data(secret.utf8))))
+    var harnessEnvironment = processEnvironment
+    harnessEnvironment.removeValue(forKey: "MACOP_SELFTEST_FAKE_SECRET_FD")
+    let runReference = harnessEnvironment.removeValue(forKey: "MACOP_SELFTEST_RUN_REFERENCE")
+        ?? "keychain://generic/service/account"
 
     switch mode {
     case "--pty-run", "--pty-run-large-stdin":
         let argv = ["macop"] + Array(arguments.dropFirst())
-        let environment = ProcessInfo.processInfo.environment.merging(
-            ["GH_TOKEN": "keychain://generic/service/account"]
+        let environment = harnessEnvironment.merging(
+            ["GH_TOKEN": runReference]
         ) { _, supplied in supplied }
         let result = app.runInteractivelyIfNeeded(argv: argv, env: environment)
             ?? app.runStreamingIfNeeded(
@@ -1066,7 +1086,13 @@ private func runHarnessIfRequested() -> Never? {
         exit(result.exitCode)
     case "--inject-stdin":
         let input = FileHandle.standardInput.readDataToEndOfFile()
-        let result = app.run(argv: ["macop", "inject"], env: [:], input: input)
+        let argv = ["macop"] + Array(arguments.dropFirst()) + ["inject"]
+        let result = app.run(argv: argv, env: harnessEnvironment, input: input)
+        write(result.stdout, to: .standardOutput)
+        write(result.stderr, to: .standardError)
+        exit(result.exitCode)
+    case "--doctor-probe":
+        let result = app.run(argv: ["macop", "doctor", "--format=json"], env: [:])
         write(result.stdout, to: .standardOutput)
         write(result.stderr, to: .standardError)
         exit(result.exitCode)
@@ -1158,19 +1184,33 @@ func run() throws {
         "compatibility entries should declare kind and ID"
     )
     let expectedCompatibilityIDs: Set = [
-        "read", "read --no-newline", "read --out-file", "read --file-mode", "read --force", "run", "run --env-file",
+        "read", "read --no-newline", "read --otp", "read --ssh-format", "read --out-file", "read --file-mode",
+        "read --force",
+        "run", "run --env-file",
         "run --stdin",
         "run --no-masking", "run --environment", "inject", "inject -i", "inject --in-file", "inject --out-file",
         "inject --file-mode",
-        "inject --force", "item list", "item list --long", "item list --format", "item get", "item get --fields",
+        "inject --force", "item list", "item list --long", "item list --format", "item list --vault",
+        "item list --categories", "item list --tags", "item list --favorite", "item list --include-archive",
+        "item list --otp", "item list --share-link", "item get", "item get --fields",
         "item get --reveal",
-        "item get --format", "item get --vault", "item get --categories", "item get --tags", "item get --favorite",
+        "item get --format", "item get --id", "item get --stdin", "item get --vault", "item get --categories",
+        "item get --tags",
+        "item get --favorite",
         "item get --include-archive", "item get --otp", "item get --share-link", "item create", "item edit",
         "item delete",
-        "item move", "item share", "item template", "completion", "help", "version", "whoami", "signin", "signout",
-        "update", "vault", "account", "user", "group", "service-account", "connect", "events-api", "document",
+        "item move", "item share", "item template", "completion", "completion bash", "completion zsh",
+        "completion fish",
+        "completion powershell", "help", "version", "whoami",
+        "signin", "signout",
+        "update", "vault", "vault list", "account", "user", "group", "service-account", "connect", "events-api",
+        "document",
         "environment",
-        "plugin", "compatibility", "config init", "config validate", "doctor", "ssh", "--help", "--version",
+        "plugin", "compatibility", "config init", "config validate", "doctor", "ssh", "ssh create",
+        "ssh create --touch-id",
+        "ssh list", "ssh public-key", "ssh test", "ssh run", "ssh delete", "ssh agent", "ssh agent shell",
+        "ssh agent application",
+        "reference ?attribute=otp", "reference ?ssh-format=openssh", "--help", "--version",
         "--format",
         "--config", "--no-color", "--debug", "--encoding=utf-8", "--account", "--session", "--cache",
         "--iso-timestamps",
@@ -1196,6 +1236,10 @@ func run() throws {
         "human matrix should label extensions"
     )
     try expect(compatibilityHuman.stdout.contains("Flags:"), "human matrix should label flags separately")
+    try expect(
+        compatibilityHuman.stdout.contains("Reference query modes:"),
+        "human matrix should group documented reference query modes separately"
+    )
 
     let sshExecutor = RecordingSSHExecutor()
     let sshApp = MacopApp(keychainClient: FakeKeychainClient(response: .success(Data())), commandExecutor: sshExecutor)
@@ -1408,6 +1452,26 @@ func run() throws {
     try expect(doctorJSON?["schema_version"] as? Int == 1 && doctorJSON?["status"] is String
         && doctorJSON?["checks"] is [[String: Any]] && !doctor.stdout.contains("test-secret"),
         "doctor JSON must be typed and secret-free")
+    let resolvedSelftestExecutable = try RunningExecutable.path()
+    let doctorLink = tempRoot.appendingPathComponent("doctor-via-symlink")
+    try fileManager.createSymbolicLink(atPath: doctorLink.path, withDestinationPath: resolvedSelftestExecutable)
+    let doctorProbe = Process()
+    let doctorProbeOutput = Pipe()
+    doctorProbe.executableURL = doctorLink
+    doctorProbe.arguments = ["--doctor-probe"]
+    doctorProbe.standardOutput = doctorProbeOutput
+    doctorProbe.standardError = Pipe()
+    try doctorProbe.run()
+    doctorProbe.waitUntilExit()
+    let doctorProbeData = try doctorProbeOutput.fileHandleForReading.readToEnd() ?? Data()
+    guard let doctorProbeJSON = try JSONSerialization.jsonObject(with: doctorProbeData) as? [String: Any],
+          let doctorChecks = doctorProbeJSON["checks"] as? [[String: Any]],
+          let executableCheck = doctorChecks.first(where: { $0["name"] as? String == "current_executable" })
+    else { throw SelftestFailure(message: "doctor symlink probe must emit typed JSON") }
+    try expect(
+        executableCheck["detail"] as? String == resolvedSelftestExecutable,
+        "doctor must resolve the running image rather than argv[0] or its symlink"
+    )
     let brokenCTKExecutor = SequencedSSHExecutor(lists: ["Error: Failed to get TKTokenDriver configuration\n"])
     let brokenDoctor = MacopApp(
         keychainClient: FakeKeychainClient(response: .success(Data())), commandExecutor: brokenCTKExecutor
@@ -1825,9 +1889,19 @@ func run() throws {
     let unsupportedProvider = app.run(argv: ["macop", "read", "apple-passwords://example.com/me/password"], env: [:])
     try expect(unsupportedProvider.exitCode == 3, "apple-passwords should be unsupported")
 
-    let unsupportedPath = app.run(argv: ["macop", "vault", "list", "--format=json"], env: [:])
+    let unsupportedPath = app.run(
+        argv: ["macop", "vault", "list", "potential-secret", "--format=json"],
+        env: [:]
+    )
     try expect(unsupportedPath.exitCode == 3, "unsupported command should exit 3")
-    try expect(unsupportedPath.stderr.contains("\"command\" : \"vault list\""), "unsupported path should be preserved")
+    try expect(
+        unsupportedPath.stderr.contains("\"command\" : \"vault list\""),
+        "recognized unsupported path should be typed"
+    )
+    try expect(
+        !unsupportedPath.stderr.contains("potential-secret"),
+        "unsupported errors must not echo arbitrary arguments"
+    )
     try expect(unsupportedPath.stderr.contains("documentation"), "unsupported JSON errors should include guidance")
     let debugJSONError = app.run(argv: ["macop", "vault", "list", "--format=json", "--debug"], env: [:])
     guard let debugObject = try JSONSerialization.jsonObject(with: Data(debugJSONError.stderr.utf8)) as? [String: Any],
@@ -1841,6 +1915,56 @@ func run() throws {
         "error debug should include a sanitized command category"
     )
     try expect(!debugJSONError.stderr.contains("op://"), "debug errors must not include secret references")
+
+    let unknownRoot = app.run(argv: ["macop", "frobnicate", "potential-secret", "--format=json"], env: [:])
+    try expect(unknownRoot.exitCode == 2, "an arbitrary root command must be syntax, not unsupported")
+    try expect(
+        !unknownRoot.stderr.contains("potential-secret"),
+        "syntax errors must not echo unknown command arguments"
+    )
+    let unknownItem = app.run(argv: ["macop", "item", "frobnicate", "potential-secret"], env: [:])
+    try expect(unknownItem.exitCode == 2, "an arbitrary item subcommand must be syntax, not unsupported")
+    let unsupportedItem = app.run(argv: ["macop", "item", "create", "potential-secret"], env: [:])
+    try expect(unsupportedItem.exitCode == 3, "a documented unsupported item subcommand must exit 3")
+    try expect(
+        unsupportedItem.stderr.contains("macop compatibility") && !unsupportedItem.stderr.contains("potential-secret"),
+        "human unsupported errors must provide safe support-matrix guidance"
+    )
+    try expect(
+        unsupportedItem.stderr.contains("Supported op-compatible commands:")
+            && unsupportedItem.stderr.contains("macop extensions:"),
+        "human unsupported errors must derive command and extension guidance from the matrix"
+    )
+    let unsupportedItemListFlags = [
+        "--vault", "--categories=login", "--tags", "--favorite", "--include-archive", "--otp", "--share-link"
+    ]
+    for flag in unsupportedItemListFlags {
+        let result = app.run(argv: ["macop", "item", "list", flag, "potential-value"], env: [:])
+        try expect(result.exitCode == 3, "documented unsupported item list flag \(flag) must exit 3")
+        try expect(
+            result.stderr.contains("macop compatibility"),
+            "unsupported item list flags need compatibility guidance"
+        )
+    }
+    try expect(
+        app.run(argv: ["macop", "item", "list", "--not-a-flag"], env: [:]).exitCode == 2,
+        "unknown item list flags must be syntax errors"
+    )
+    let powershell = app.run(argv: ["macop", "completion", "powershell", "--format=json"], env: [:])
+    try expect(powershell.exitCode == 3, "documented unsupported completion target must exit 3")
+    guard let powershellJSON = try JSONSerialization.jsonObject(with: Data(powershell.stderr.utf8)) as? [String: Any],
+          let powershellError = powershellJSON["error"] as? [String: Any]
+    else { throw SelftestFailure(message: "unsupported completion JSON must be one typed object") }
+    try expect(
+        powershellError["code"] as? String == "unsupported_command"
+            && powershellError["command"] as? String == "completion powershell"
+            && powershellError["guidance"] is String,
+        "unsupported completion JSON must retain typed support guidance"
+    )
+    try expect(
+        app.run(argv: ["macop", "completion", "elvish"], env: [:]).exitCode == 2,
+        "unknown completion targets must be syntax errors"
+    )
     let rawDebugError = app.run(
         argv: ["macop", "--debug", "--format=not-a-format"],
         env: ["OP_DEBUG": "0"]
@@ -1848,6 +1972,33 @@ func run() throws {
     try expect(
         rawDebugError.stderr.contains("debug exit_code=2"),
         "explicit debug should override false OP_DEBUG during parse errors"
+    )
+    let childFlagsAreOpaque = app.run(
+        argv: ["macop", "run", "nope", "--", "/bin/echo", "--format", "json", "--debug"], env: [:]
+    )
+    try expect(
+        childFlagsAreOpaque.exitCode == 2 && !childFlagsAreOpaque.stderr.contains("\"error\"")
+            && !childFlagsAreOpaque.stderr.contains("debug exit_code"),
+        "run child flags after -- must not change error format or enable debug"
+    )
+    let prefixGlobalFlags = app.run(
+        argv: ["macop", "run", "--format=json", "--debug", "nope", "--", "/bin/echo"], env: [:]
+    )
+    guard let prefixGlobalJSON = try JSONSerialization
+        .jsonObject(with: Data(prefixGlobalFlags.stderr.utf8)) as? [String: Any],
+        let prefixGlobalError = prefixGlobalJSON["error"] as? [String: Any]
+    else { throw SelftestFailure(message: "global prefix flags should retain JSON debug errors") }
+    try expect(
+        prefixGlobalFlags.exitCode == 2 && prefixGlobalError["debug"] != nil,
+        "global flags before a child boundary must still affect parse errors"
+    )
+    let agentChildFlagsAreOpaque = app.run(
+        argv: ["macop", "ssh", "agent", "shell", "--", "/bin/echo", "--format=json", "--debug"], env: [:]
+    )
+    try expect(
+        agentChildFlagsAreOpaque.exitCode == 2 && !agentChildFlagsAreOpaque.stderr.contains("\"error\"")
+            && !agentChildFlagsAreOpaque.stderr.contains("debug exit_code"),
+        "ssh agent shell child flags after -- must remain opaque on usage errors"
     )
 
     let unsupportedGlobal = app.run(argv: ["macop", "read", "--account=team", "op://Local/GitHub/token"], env: [:])
@@ -1875,6 +2026,115 @@ func run() throws {
     try duplicateFieldsConfig.data(using: .utf8)!.write(to: configPath, options: [.atomic])
     let duplicateFields = app.run(argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:])
     try expect(duplicateFields.exitCode == 2, "duplicate fields should fail schema validation")
+
+    // Config selectors are decoded, static counterparts of op:// path
+    // segments. Exercise both explicit validation and ordinary config loading
+    // so malformed mappings cannot reach a provider query through another
+    // command path.
+    let invalidSelectorFixtures = [
+        ConfigSelectorFixture(
+            name: "double slash key", itemKey: "Local//GitHub", fields: "[\"token\"]"
+        ),
+        ConfigSelectorFixture(
+            name: "leading slash key", itemKey: "/Local/GitHub", fields: "[\"token\"]"
+        ),
+        ConfigSelectorFixture(
+            name: "trailing slash key", itemKey: "Local/GitHub/", fields: "[\"token\"]"
+        ),
+        ConfigSelectorFixture(
+            name: "empty namespace component", itemKey: "a//b", fields: "[\"token\"]"
+        ),
+        ConfigSelectorFixture(
+            name: "three component field", itemKey: "Local/GitHub", fields: "[\"a/b/c\"]"
+        ),
+        ConfigSelectorFixture(
+            name: "empty field component", itemKey: "Local/GitHub", fields: "[\"credentials//password\"]"
+        )
+    ]
+    for fixture in invalidSelectorFixtures {
+        let invalidSelectorConfig = """
+        { "version": 1, "items": {
+          "\(fixture.itemKey)": {
+            "provider": "keychain-generic", "service": "github", "account": "me", "fields": \(fixture.fields)
+          }
+        } }
+        """
+        try invalidSelectorConfig.data(using: .utf8)!.write(to: configPath, options: [.atomic])
+        let validateResult = app.run(argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:])
+        try expect(validateResult.exitCode == 2, "\(fixture.name) must fail config validate")
+
+        let noQueryClient = RecordingKeychainClient(.success(Data("unexpected".utf8)))
+        let loadResult = MacopApp(keychainClient: noQueryClient).run(
+            argv: ["macop", "--config", configDirectory, "read", "op://Local/GitHub/token"], env: [:]
+        )
+        try expect(loadResult.exitCode == 2, "\(fixture.name) must fail normal config loading")
+        try expect(noQueryClient.queries.isEmpty, "\(fixture.name) must not issue a Keychain query")
+    }
+    let invalidSelectorJSON = app.run(
+        argv: ["macop", "--config", configDirectory, "config", "validate", "--format=json"], env: [:]
+    )
+    guard let invalidSelectorObject = try JSONSerialization
+        .jsonObject(with: Data(invalidSelectorJSON.stderr.utf8)) as? [String: Any],
+        let invalidSelectorError = invalidSelectorObject["error"] as? [String: Any]
+    else { throw SelftestFailure(message: "invalid selector JSON error must remain typed") }
+    try expect(
+        invalidSelectorError["code"] as? String == "invalid_arguments",
+        "invalid selector JSON error must classify as invalid arguments"
+    )
+
+    let validSectionFieldConfig = """
+    { "version": 1, "items": {
+      "Local/GitHub": {
+        "provider": "keychain-generic", "service": "github", "account": "me", "fields": ["credentials/password"]
+      }
+    } }
+    """
+    try validSectionFieldConfig.data(using: .utf8)!.write(to: configPath, options: [.atomic])
+    let validSectionFieldValidate = app.run(
+        argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:]
+    )
+    try expect(validSectionFieldValidate.exitCode == 0, "section/field config selectors must validate")
+    let validSectionFieldClient = RecordingKeychainClient(.success(Data("test-secret".utf8)))
+    let validSectionFieldLoad = MacopApp(keychainClient: validSectionFieldClient).run(
+        argv: ["macop", "--config", configDirectory, "read", "op://Local/GitHub/credentials/password"],
+        env: [:]
+    )
+    try expect(validSectionFieldLoad.exitCode == 0, "section/field config selectors must load normally")
+    try expect(
+        validSectionFieldClient.queries.count == 1,
+        "valid section/field selector must resolve its Keychain mapping"
+    )
+
+    let literalSelectorConfig = """
+    { "version": 1, "items": {
+      "Local/100%": {
+        "provider": "keychain-generic", "service": "github", "account": "me", "fields": ["$HOME"]
+      }
+    } }
+    """
+    try literalSelectorConfig.data(using: .utf8)!.write(to: configPath, options: [.atomic])
+    let literalSelectorValidate = app.run(
+        argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:]
+    )
+    try expect(literalSelectorValidate.exitCode == 0, "decoded literal percent and dollar config names must validate")
+    let literalSelectorClient = RecordingKeychainClient(.success(Data("test-secret".utf8)))
+    let literalSelectorApp = MacopApp(keychainClient: literalSelectorClient)
+    let encodedLiteralReference = literalSelectorApp.run(
+        argv: ["macop", "--config", configDirectory, "read", "op://Local/100%25/%24HOME"], env: [:]
+    )
+    try expect(encodedLiteralReference.exitCode == 0, "encoded reference selectors must resolve literal config names")
+    try expect(
+        literalSelectorClient.queries == [.generic(service: "github", account: "me")],
+        "encoded selectors must resolve the exact configured Keychain mapping"
+    )
+    let expandedLiteralReference = literalSelectorApp.run(
+        argv: ["macop", "--config", configDirectory, "read", "op://Local/$ITEM/$FIELD"],
+        env: ["ITEM": "100%25", "FIELD": "%24HOME"]
+    )
+    try expect(
+        expandedLiteralReference.exitCode == 0 && literalSelectorClient.queries.count == 2,
+        "raw environment forms must expand before percent-decoded reference matching"
+    )
 
     let secretConfig = """
     { "version": 1, "items": { "Local/GitHub": { "provider": "keychain-generic", "service": "github", "account": "me", "secret": "do-not-store" } } }

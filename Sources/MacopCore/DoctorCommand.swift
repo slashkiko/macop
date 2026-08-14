@@ -21,8 +21,18 @@ public enum DoctorCommand {
             "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
         )
 
-        let executable = CommandLine.arguments.first ?? "macop"
-        add("current_executable", FileManager.default.isExecutableFile(atPath: executable) ? .pass : .warn, executable)
+        let executable: String
+        do {
+            executable = try RunningExecutable.path()
+            add(
+                "current_executable",
+                FileManager.default.isExecutableFile(atPath: executable) ? .pass : .warn,
+                executable
+            )
+        } catch {
+            executable = ""
+            add("current_executable", .warn, "Unable to resolve the running executable")
+        }
         for (name, path) in [
             ("sc_auth", SSHCommand.scAuth),
             ("ssh", SSHCommand.ssh),
@@ -95,12 +105,16 @@ public enum DoctorCommand {
             sshVersion?.exitCode == 0 ? .pass : .warn,
             sshVersion?.exitCode == 0 ? "Apple SSH selected" : "Unable to query selected SSH client"
         )
-        let signature = diagnostic("/usr/bin/codesign", ["-dv", "--verbose=1", executable])
-        add(
-            "code_signature",
-            signature?.exitCode == 0 ? .pass : .warn,
-            signature?.exitCode == 0 ? "codesign metadata available" : "codesign metadata unavailable"
-        )
+        if executable.isEmpty {
+            add("code_signature", .warn, "Skipped because the running executable could not be resolved")
+        } else {
+            let signature = diagnostic("/usr/bin/codesign", ["-dv", "--verbose=1", executable])
+            add(
+                "code_signature",
+                signature?.exitCode == 0 ? .pass : .warn,
+                signature?.exitCode == 0 ? "codesign metadata available" : "codesign metadata unavailable"
+            )
+        }
 
         let status: DoctorStatus = checks
             .contains { $0.status == .fail } ? .fail : (checks.contains { $0.status == .warn } ? .warn : .pass)

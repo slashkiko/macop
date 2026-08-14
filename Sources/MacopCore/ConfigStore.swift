@@ -124,13 +124,14 @@ public enum ConfigStore {
     }
 
     private static func validateItemKey(_ key: String) throws {
-        let parts = key.split(separator: "/")
+        // Keep empty components: String.split's default would turn `Local//GitHub`
+        // into a seemingly-valid two component selector.
+        let parts = key.split(separator: "/", omittingEmptySubsequences: false)
         guard parts.count == 2 else {
             throw CLIError.invalidArguments(message: "Config item key must be \"<namespace>/<item>\": \(key)")
         }
-        if parts[0].isEmpty || parts[1].isEmpty {
-            throw CLIError.invalidArguments(message: "Config item key has empty namespace/item: \(key)")
-        }
+        try self.validateMappingSegment(String(parts[0]), role: "namespace")
+        try self.validateMappingSegment(String(parts[1]), role: "item")
     }
 
     private static func validateItem(_ item: ConfigItem) throws -> ConfigProviderKind {
@@ -193,14 +194,28 @@ public enum ConfigStore {
         guard let fields else { return }
         var seen = Set<String>()
         for field in fields {
-            guard self.hasValue(field),
-                  !field.split(separator: "/", omittingEmptySubsequences: false).contains(where: \.isEmpty)
-            else {
-                throw CLIError.invalidArguments(message: "Config fields must contain non-empty path segments.")
+            let segments = field.split(separator: "/", omittingEmptySubsequences: false)
+            guard segments.count == 1 || segments.count == 2 else {
+                throw CLIError.invalidArguments(
+                    message: "Config fields must be \"<field>\" or \"<section>/<field>\"."
+                )
+            }
+            for segment in segments {
+                try self.validateMappingSegment(String(segment), role: "field")
             }
             guard seen.insert(field).inserted else {
                 throw CLIError.invalidArguments(message: "Config fields must not contain duplicates: \(field)")
             }
+        }
+    }
+
+    /// Config keys are the decoded, static counterparts of `op://` path
+    /// segments. Literal `%` and `$` are valid decoded selector characters;
+    /// percent-decoding and `$NAME` expansion happen only in ReferenceResolver
+    /// while it processes the reference input.
+    private static func validateMappingSegment(_ value: String, role: String) throws {
+        guard self.hasValue(value) else {
+            throw CLIError.invalidArguments(message: "Config \(role) must be a non-empty path segment.")
         }
     }
 
