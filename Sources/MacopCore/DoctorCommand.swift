@@ -1,0 +1,147 @@
+import Foundation
+import Security
+
+public enum DoctorCommand {
+    public static func run(options: GlobalOptions, context: DoctorContext) throws -> CommandResult {
+        var checks = [DoctorCheck]()
+        func add(_ name: String, _ status: DoctorStatus, _ detail: String) {
+            checks.append(DoctorCheck(name: name, status: status, detail: detail))
+        }
+        func diagnostic(_ path: String, _ arguments: [String]) -> CommandResult? {
+            do {
+                return try context.executor.execute(path: path, arguments: arguments, environment: context.env)
+            } catch {
+                return nil
+            }
+        }
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        add(
+            "macos",
+            version.majorVersion >= 14 ? .pass : .fail,
+            "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
+        )
+
+        let executable = CommandLine.arguments.first ?? "macop"
+        add("current_executable", FileManager.default.isExecutableFile(atPath: executable) ? .pass : .warn, executable)
+        for (name, path) in [
+            ("sc_auth", SSHCommand.scAuth),
+            ("ssh", SSHCommand.ssh),
+            ("ssh-keygen", SSHCommand.sshKeygen),
+            ("ssh-keychain", SSHCommand.provider)
+        ] {
+            add(name, FileManager.default.fileExists(atPath: path) ? .pass : .fail, path)
+        }
+        var defaultKeychain: SecKeychain?
+        let keychainStatus = SecKeychainCopyDefault(&defaultKeychain)
+        add(
+            "keychain_api",
+            keychainStatus == errSecSuccess ? .pass : .warn,
+            keychainStatus == errSecSuccess ? "Keychain API available" : "Keychain API unavailable (status \(keychainStatus))"
+        )
+
+        if FileManager.default.fileExists(atPath: SSHCommand.scAuth) {
+            let ctk = diagnostic(SSHCommand.scAuth, ["list-ctk-identities", "-t", "sha1", "-e", "hex"])
+            do {
+                guard let ctk, ctk.exitCode == 0 else {
+                    throw CLIError.providerUnavailable(
+                        provider: "CryptoTokenKit",
+                        reason: "identity enumeration failed"
+                    )
+                }
+                try SSHCommand.validateIdentityTable(ctk.stdout)
+                add("cryptotokenkit", .pass, "CTK identity enumeration available")
+            } catch {
+                add("cryptotokenkit", .fail, "CTK identity enumeration returned an invalid table")
+            }
+        } else {
+            add("cryptotokenkit", .warn, "Skipped because sc_auth is unavailable")
+        }
+        do {
+            let url = try ConfigStore.validate(configDirectory: options.configDirectory)
+            add("config", .pass, "validated \(url.path)")
+        } catch let error as CLIError { add("config", .warn, "\(error)")
+        } catch { add("config", .warn, "configuration validation unavailable") }
+
+        let sshG = diagnostic(
+            SSHCommand.ssh,
+            [
+                "-G",
+                "-o",
+                "ForwardAgent=no",
+                "-o",
+                "PKCS11Provider=\(SSHCommand.provider)",
+                "-o",
+                "IdentitiesOnly=yes",
+                "example.invalid"
+            ]
+        )
+        let effective = Set((sshG?.stdout ?? "").split(whereSeparator: \.isNewline).map { $0.lowercased() })
+        let forward = effective.contains("forwardagent no")
+        let provider = effective.contains("pkcs11provider \(SSHCommand.provider)")
+        let identities = effective.contains("identitiesonly yes")
+        add(
+            "forward_agent",
+            forward ? .pass : .fail,
+            forward ? "effective ForwardAgent=no" : "unable to verify ForwardAgent=no"
+        )
+        add(
+            "ssh_identity_selection",
+            provider && identities ? .pass : .fail,
+            provider && identities ? "effective PKCS11Provider and IdentitiesOnly=yes" : "unable to verify SSH identity selection"
+        )
+        let sshVersion = diagnostic(SSHCommand.ssh, ["-V"])
+        add(
+            "ssh_client",
+            sshVersion?.exitCode == 0 ? .pass : .warn,
+            sshVersion?.exitCode == 0 ? "Apple SSH selected" : "Unable to query selected SSH client"
+        )
+        let signature = diagnostic("/usr/bin/codesign", ["-dv", "--verbose=1", executable])
+        add(
+            "code_signature",
+            signature?.exitCode == 0 ? .pass : .warn,
+            signature?.exitCode == 0 ? "codesign metadata available" : "codesign metadata unavailable"
+        )
+
+        let status: DoctorStatus = checks
+            .contains { $0.status == .fail } ? .fail : (checks.contains { $0.status == .warn } ? .warn : .pass)
+        let exitCode: Int32 = status == .fail ? ExitCode.providerUnavailable.rawValue : 0
+        if options.format == .json {
+            do {
+                let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                return try CommandResult(
+                    exitCode: exitCode,
+                    stdout: (String(
+                        bytes: encoder.encode(DoctorResponse(status: status, checks: checks)),
+                        encoding: .utf8
+                    ) ?? "") + "\n"
+                )
+            } catch { throw CLIError.runtimeError(message: "Unable to encode doctor response.") }
+        }
+        return CommandResult(
+            exitCode: exitCode,
+            stdout: checks.map { "[\($0.status.rawValue)] \($0.name): \($0.detail)" }.joined(separator: "\n") + "\n"
+        )
+    }
+}
+
+public struct DoctorContext: Sendable {
+    public let env: CommandEnvironment
+    public let executor: CommandExecutor
+    public init(env: CommandEnvironment, executor: CommandExecutor) {
+        self.env = env; self.executor = executor
+    }
+}
+
+private enum DoctorStatus: String, Encodable { case pass, warn, fail }
+private struct DoctorCheck: Encodable { let name: String; let status: DoctorStatus; let detail: String }
+private struct DoctorResponse: Encodable {
+    let schemaVersion = 1
+    let status: DoctorStatus
+    let checks: [DoctorCheck]
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case status
+        case checks
+    }
+}

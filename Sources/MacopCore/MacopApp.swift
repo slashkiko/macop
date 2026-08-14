@@ -2,9 +2,14 @@ import Foundation
 
 public struct MacopApp {
     private let keychainClient: any KeychainClient
+    private let commandExecutor: CommandExecutor
 
-    public init(keychainClient: any KeychainClient = SystemKeychainClient()) {
+    public init(
+        keychainClient: any KeychainClient = SystemKeychainClient(),
+        commandExecutor: CommandExecutor = SystemCommandExecutor()
+    ) {
         self.keychainClient = keychainClient
+        self.commandExecutor = commandExecutor
     }
 
     public func run(argv: [String], env: [String: String], input: Data = Data()) -> CommandResult {
@@ -40,6 +45,20 @@ public struct MacopApp {
         guard RunCommand.isInteractiveTerminal() else { return nil }
         do {
             let parsed = try ArgumentParser.parse(argv: argv, env: env)
+            if parsed.command == .ssh {
+                if parsed.options.format == .json, parsed.commandArgs.first == "test" {
+                    return nil
+                }
+                if let code = try SSHCommand.runInteractively(
+                    args: parsed.commandArgs, env: env, executor: self.commandExecutor
+                ) {
+                    return self.withSafeDebug(
+                        CommandResult(exitCode: code),
+                        enabled: parsed.options.debug,
+                        context: "command=ssh"
+                    )
+                }
+            }
             guard parsed.command == .run else { return nil }
             guard try !RunCommand.requestsInjectedStdin(parsed.commandArgs) else { return nil }
             let code = try RunCommand.runInteractively(
@@ -63,6 +82,20 @@ public struct MacopApp {
     ) -> CommandResult? {
         do {
             let parsed = try ArgumentParser.parse(argv: argv, env: env)
+            if parsed.command == .ssh {
+                if parsed.options.format == .json, parsed.commandArgs.first == "test" {
+                    return nil
+                }
+                if let code = try SSHCommand.runStreaming(
+                    args: parsed.commandArgs, env: env, executor: self.commandExecutor, stdout: stdout, stderr: stderr
+                ) {
+                    return self.withSafeDebug(
+                        CommandResult(exitCode: code),
+                        enabled: parsed.options.debug,
+                        context: "command=ssh"
+                    )
+                }
+            }
             guard parsed.command == .run else { return nil }
             guard try !RunCommand.isInteractiveTerminal()
                 || (RunCommand.requestsInjectedStdin(parsed.commandArgs))
@@ -131,10 +164,19 @@ public struct MacopApp {
                 input: input,
                 client: self.keychainClient
             )
-        case .ssh, .doctor:
-            throw CLIError.unsupportedCommand(
-                command: self.renderedCommandName(parsed),
-                reason: "Command scaffold exists, but implementation has not started yet."
+        case .ssh:
+            return try SSHCommand.run(
+                args: parsed.commandArgs,
+                options: parsed.options,
+                env: env,
+                executor: self.commandExecutor
+            )
+        case .doctor:
+            guard parsed.commandArgs.isEmpty
+            else { throw CLIError.invalidArguments(message: "doctor does not accept arguments.") }
+            return try DoctorCommand.run(
+                options: parsed.options,
+                context: DoctorContext(env: env, executor: self.commandExecutor)
             )
         }
     }

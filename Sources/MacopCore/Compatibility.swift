@@ -36,7 +36,6 @@ public struct CompatibilityResponse: Codable, Sendable {
 }
 
 public enum CompatibilityCommand {
-    private static let pending = "Implementation has not started yet."
     private static let cloudUnavailable = "macop has no cloud account backend."
     private static let filePolicy = "Writing secrets to persistent files is disabled by policy."
 
@@ -182,8 +181,13 @@ public enum CompatibilityCommand {
         .init(command: "compatibility", kind: "extension", status: "supported"),
         .init(command: "config init", kind: "extension", status: "supported"),
         .init(command: "config validate", kind: "extension", status: "supported"),
-        .init(command: "doctor", kind: "extension", status: "unsupported", reason: pending),
-        .init(command: "ssh", kind: "extension", status: "unsupported", reason: pending),
+        .init(command: "doctor", kind: "extension", status: "supported"),
+        .init(
+            command: "ssh",
+            kind: "extension",
+            status: "partial",
+            reason: "Apple Secure Enclave provider wrapper; verified-session agent is not implemented."
+        ),
         .init(command: "--help", kind: "flag", status: "supported"),
         .init(command: "--version", kind: "flag", status: "supported"),
         .init(command: "--format", kind: "flag", status: "supported"),

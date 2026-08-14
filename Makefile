@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 .PHONY: setup bootstrap hooks-install
-.PHONY: format format-check lint test test-keychain-integration test-pty build
+.PHONY: format format-check lint test test-keychain-integration test-pty test-ssh-manual build
 .PHONY: ci ci-swift ci-workflows ci-secrets
 .PHONY: pin-actions pin-actions-check
 .PHONY: workflow-lint workflow-security
@@ -39,6 +39,10 @@ test-pty: build
 	@python3 scripts/test-pty.py
 	@.build/debug/macop run --debug -- /usr/bin/true 2>&1 | grep -Fx 'macop: debug exit_code=0 command=run'
 	@.build/debug/macop run -- /bin/sh -c 'kill -TERM $$$$'; status=$$?; test $$status -eq 143
+
+# Deliberately non-mutating: no CTK identity is created or deleted.
+test-ssh-manual: build
+	@python3 scripts/test-ssh-manual.py
 
 build:
 	$(SWIFTPM_GIT_SAFE_BARE) swift build

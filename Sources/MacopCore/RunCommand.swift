@@ -5,6 +5,35 @@ import Foundation
 import MacopPTY
 
 public enum RunCommand {
+    /// Shared bounded pipe relay for wrappers which must preserve argv and the
+    /// exact child environment without accumulating unbounded output in memory.
+    public static func relay(
+        argv: [String], environment: [String: String],
+        stdout: @escaping @Sendable (Data) -> Void, stderr: @escaping @Sendable (Data) -> Void
+    ) throws -> Int32 {
+        try ProcessRunner.executeStreaming(
+            argv: argv, environment: environment, stdin: nil,
+            stdoutRedactor: nil, stderrRedactor: nil, stdout: stdout, stderr: stderr
+        )
+    }
+
+    public static func capture(
+        argv: [String], environment: [String: String], limit: Int
+    ) throws -> CommandResult {
+        try ProcessRunner.execute(
+            argv: argv, environment: environment, stdin: nil,
+            stdoutRedactor: nil, stderrRedactor: nil, captureLimit: limit
+        )
+    }
+
+    public static func relayInteractively(
+        argv: [String], environment: [String: String], observer: (@Sendable (Data) -> Void)? = nil
+    ) throws -> Int32 {
+        try TerminalRelay.execute(
+            argv: argv, environment: environment, initialInput: nil, redactor: nil, observer: observer
+        )
+    }
+
     /// The terminal relay owns the pty master and deliberately keeps child output
     /// separate from the CLI's normal buffered-command contract.
     public static func isInteractiveTerminal() -> Bool {
@@ -65,7 +94,8 @@ public enum RunCommand {
             argv: context.command,
             environment: context.environment,
             initialInput: context.stdin,
-            redactor: context.noMasking ? nil : SecretRedactor(secrets: context.secrets)
+            redactor: context.noMasking ? nil : SecretRedactor(secrets: context.secrets),
+            observer: nil
         )
     }
 
@@ -552,7 +582,8 @@ private struct PreparedRun {
 /// secret-handling boundary identical for all executable entry points.
 private enum TerminalRelay {
     static func execute(
-        argv: [String], environment: [String: String], initialInput: Data?, redactor: SecretRedactor?
+        argv: [String], environment: [String: String], initialInput: Data?, redactor: SecretRedactor?,
+        observer: (@Sendable (Data) -> Void)?
     ) throws -> Int32 {
         var size = winsize()
         guard ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 else {
@@ -632,7 +663,10 @@ private enum TerminalRelay {
                 try self.relayInput(from: STDIN_FILENO, to: ptyController)
             }
             if descriptors[1].revents & Int16(POLLIN) != 0 || descriptors[1].revents & Int16(POLLHUP) != 0 {
-                if !self.relayOutput(from: ptyController, redactor: redactor, final: false), exited {
+                let relayed = self.relayOutput(
+                    from: ptyController, redactor: redactor, final: false, observer: observer
+                )
+                if !relayed, exited {
                     break
                 }
             }
@@ -641,7 +675,7 @@ private enum TerminalRelay {
                 childReaped = true
             }
             if exited {
-                while self.relayOutput(from: ptyController, redactor: redactor, final: false) {}
+                while self.relayOutput(from: ptyController, redactor: redactor, final: false, observer: observer) {}
                 let tail = redactor?.process(Data(), final: true) ?? Data()
                 try self.writeAll(tail, to: STDOUT_FILENO)
                 break
@@ -677,12 +711,14 @@ private enum TerminalRelay {
     }
 
     @discardableResult private static func relayOutput(
-        from descriptor: Int32, redactor: SecretRedactor?, final: Bool
+        from descriptor: Int32, redactor: SecretRedactor?, final: Bool,
+        observer: (@Sendable (Data) -> Void)?
     ) -> Bool {
         var buffer = [UInt8](repeating: 0, count: 4096)
         let count = read(descriptor, &buffer, buffer.count)
         guard count > 0 else { return false }
         let output = redactor?.process(Data(buffer.prefix(Int(count))), final: final) ?? Data(buffer.prefix(Int(count)))
+        observer?(output)
         try? self.writeAll(output, to: STDOUT_FILENO)
         return true
     }
