@@ -15,9 +15,10 @@ public struct MacopApp {
     public func run(argv: [String], env: [String: String], input: Data = Data()) -> CommandResult {
         do {
             let parsed = try ArgumentParser.parse(argv: argv, env: env)
-            return try self.withSafeDebug(
-                self.execute(parsed, env: env, input: input),
-                enabled: parsed.options.debug,
+            let result = try self.execute(parsed, env: env, input: input)
+            return self.withSafeDebug(
+                result,
+                enabled: parsed.options.debug && !(parsed.command == .ssh && parsed.commandArgs.first == "agent"),
                 context: "command=\(parsed.command.rawValue)"
             )
         } catch let error as CLIError {
@@ -50,11 +51,12 @@ public struct MacopApp {
                     return nil
                 }
                 if let code = try SSHCommand.runInteractively(
-                    args: parsed.commandArgs, env: env, executor: self.commandExecutor
+                    args: parsed.commandArgs, env: self.agentHelperEnvironment(env, options: parsed.options),
+                    executor: self.commandExecutor
                 ) {
                     return self.withSafeDebug(
                         CommandResult(exitCode: code),
-                        enabled: parsed.options.debug,
+                        enabled: parsed.options.debug && parsed.commandArgs.first != "agent",
                         context: "command=ssh"
                     )
                 }
@@ -87,11 +89,12 @@ public struct MacopApp {
                     return nil
                 }
                 if let code = try SSHCommand.runStreaming(
-                    args: parsed.commandArgs, env: env, executor: self.commandExecutor, stdout: stdout, stderr: stderr
+                    args: parsed.commandArgs, env: self.agentHelperEnvironment(env, options: parsed.options),
+                    executor: self.commandExecutor, stdout: stdout, stderr: stderr
                 ) {
                     return self.withSafeDebug(
                         CommandResult(exitCode: code),
-                        enabled: parsed.options.debug,
+                        enabled: parsed.options.debug && parsed.commandArgs.first != "agent",
                         context: "command=ssh"
                     )
                 }
@@ -168,9 +171,11 @@ public struct MacopApp {
             return try SSHCommand.run(
                 args: parsed.commandArgs,
                 options: parsed.options,
-                env: env,
+                env: self.agentHelperEnvironment(env, options: parsed.options),
                 executor: self.commandExecutor
             )
+        // macop-agent owns debug rendering so its JSON error stream stays
+        // one object even when this command is relayed by macop.
         case .doctor:
             guard parsed.commandArgs.isEmpty
             else { throw CLIError.invalidArguments(message: "doctor does not accept arguments.") }
@@ -179,6 +184,13 @@ public struct MacopApp {
                 context: DoctorContext(env: env, executor: self.commandExecutor)
             )
         }
+    }
+
+    private func agentHelperEnvironment(_ environment: [String: String], options: GlobalOptions) -> [String: String] {
+        var value = environment
+        value["MACOP_AGENT_FORMAT"] = options.format == .json ? "json" : "human"
+        value["MACOP_AGENT_DEBUG"] = options.debug ? "1" : "0"
+        return value
     }
 
     private func renderedCommandName(_ parsed: ParsedCommand) -> String {

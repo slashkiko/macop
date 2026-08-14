@@ -186,7 +186,8 @@ public enum CompatibilityCommand {
             command: "ssh",
             kind: "extension",
             status: "partial",
-            reason: "Apple Secure Enclave provider wrapper; verified-session agent is not implemented."
+            reason: "Apple Secure Enclave provider wrapper; verified sessions require `ssh agent shell` or "
+                + "`ssh agent application` and a newly launched cooperative root."
         ),
         .init(command: "--help", kind: "flag", status: "supported"),
         .init(command: "--version", kind: "flag", status: "supported"),

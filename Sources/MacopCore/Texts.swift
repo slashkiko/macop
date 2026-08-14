@@ -40,7 +40,7 @@ public enum CompletionText {
               _arguments '1:command:(${commands})' '*::argument:->args'
               case $words[2] in
                 config) _values 'config command' init validate ;;
-                ssh) _values 'ssh command' create list public-key delete test run ;;
+                ssh) _values 'ssh command' create list public-key delete test run agent ;;
                 completion) _values 'shell' bash zsh fish ;;
               esac
             }
@@ -54,7 +54,7 @@ public enum CompletionText {
               local flags="--help --version --format --config --no-color --debug --encoding"
               case "${COMP_WORDS[1]}" in
                 config) COMPREPLY=( $(compgen -W "init validate ${flags}" -- "$cur") ) ;;
-                ssh) COMPREPLY=( $(compgen -W "create list public-key delete test run ${flags}" -- "$cur") ) ;;
+                ssh) COMPREPLY=( $(compgen -W "create list public-key delete test run agent ${flags}" -- "$cur") ) ;;
                 completion) COMPREPLY=( $(compgen -W "bash zsh fish ${flags}" -- "$cur") ) ;;
                 *) COMPREPLY=( $(compgen -W "${commands} ${flags}" -- "$cur") ) ;;
               esac
@@ -69,8 +69,8 @@ public enum CompletionText {
             complete -c op -l format -a 'human-readable json'
             complete -c macop -n '__fish_seen_subcommand_from config' -a 'init validate'
             complete -c op -n '__fish_seen_subcommand_from config' -a 'init validate'
-            complete -c macop -n '__fish_seen_subcommand_from ssh' -a 'create list public-key delete test run'
-            complete -c op -n '__fish_seen_subcommand_from ssh' -a 'create list public-key delete test run'
+            complete -c macop -n '__fish_seen_subcommand_from ssh' -a 'create list public-key delete test run agent'
+            complete -c op -n '__fish_seen_subcommand_from ssh' -a 'create list public-key delete test run agent'
             """
         default:
             "macop: unsupported shell for completion: \(shell)\n"

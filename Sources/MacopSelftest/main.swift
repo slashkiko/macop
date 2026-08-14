@@ -1,8 +1,11 @@
 import Darwin
 
 // swiftlint:disable file_length
+import CryptoKit
 import Foundation
+import LocalAuthentication
 import MacopCore
+import Security
 
 struct SelftestFailure: Error {
     let message: String
@@ -28,6 +31,21 @@ final class StreamCollector: @unchecked Sendable {
     func read() -> Data {
         self.lock.lock(); defer { self.lock.unlock() }; return self.value
     }
+}
+
+final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock(); private var value = 0
+    func increment() {
+        self.lock.lock(); self.value += 1; self.lock.unlock()
+    }
+
+    func read() -> Int {
+        self.lock.lock(); defer { lock.unlock() }; return self.value
+    }
+}
+
+private func openFileDescriptorCount() throws -> Int {
+    try FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
 }
 
 final class RecordingSSHExecutor: SSHStreamingExecuting, @unchecked Sendable {
@@ -64,6 +82,911 @@ final class RecordingSSHExecutor: SSHStreamingExecuting, @unchecked Sendable {
         stdout(Data("streamed-child-output\n".utf8))
         return 23
     }
+}
+
+private struct AgentTestInspector: RequesterInspecting {
+    func snapshot(of pid: Int32) -> ProcessSnapshot? {
+        pid == 42 ? ProcessSnapshot(pid: 42, parentPID: 1, startTime: 7) : ProcessSnapshot(
+            pid: pid,
+            parentPID: 42,
+            startTime: 8
+        )
+    }
+
+    func validatedCodeIdentity(pid _: Int32, requirement: String) throws -> String {
+        guard requirement == "anchor test" else { throw AgentProtocolError.denied }
+        return "test.agent"
+    }
+}
+
+private struct SnapshotInspector: RequesterInspecting {
+    let snapshots: [Int32: ProcessSnapshot]
+    let valid: Bool
+    let identity: String
+    init(snapshots: [Int32: ProcessSnapshot], valid: Bool, identity: String = "test.agent") {
+        self.snapshots = snapshots; self.valid = valid; self.identity = identity
+    }
+
+    func snapshot(of pid: Int32) -> ProcessSnapshot? {
+        self.snapshots[pid]
+    }
+
+    func validatedCodeIdentity(pid _: Int32, requirement: String) throws -> String {
+        guard self.valid, requirement == "anchor test" else { throw AgentProtocolError.denied }
+        return self.identity
+    }
+}
+
+private let agentTestKey = Data([0, 0, 0, 4, 116, 101, 115, 116]) // string("test")
+private struct AgentTestSigner: AgentKeySigning {
+    let publicKeyBlob: Data
+    let fingerprint: String
+    init(publicKeyBlob: Data = agentTestKey, fingerprint: String? = nil) {
+        self.publicKeyBlob = publicKeyBlob
+        self.fingerprint = fingerprint ?? sshFingerprint(for: publicKeyBlob)
+    }
+
+    func sign(data: Data, flags: UInt32) throws -> Data {
+        guard flags == 0 else { throw AgentProtocolError.denied }
+        return Data("signature:".utf8) + data
+    }
+}
+
+private struct AgentTestBindingVerifier: SessionBindingVerifying {
+    func verify(hostKey: Data, sessionID: Data, signature: Data) throws {
+        guard hostKey == Data("host".utf8), sessionID == Data("session".utf8), signature == Data("proof".utf8) else {
+            throw AgentProtocolError.denied
+        }
+    }
+}
+
+private final class RuntimeState: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var presentation: SessionAuthorizationPresentation?
+    private(set) var cancelled = false
+    private(set) var reservationID: UUID?
+    func record(_ presentation: SessionAuthorizationPresentation) {
+        self.lock.lock(); self.presentation = presentation; self.lock.unlock()
+    }
+
+    func cancel() {
+        self.lock.lock(); self.cancelled = true; self.lock.unlock()
+    }
+
+    func recordReservation(_ id: UUID) {
+        self.lock.lock(); self.reservationID = id; self.lock.unlock()
+    }
+
+    func snapshot() -> (SessionAuthorizationPresentation?, Bool) {
+        self.lock.lock(); defer { lock.unlock() }; return (
+            self.presentation,
+            self.cancelled
+        )
+    }
+
+    func recordedReservation() -> UUID? {
+        self.lock.lock(); defer { self.lock.unlock() }
+        return self.reservationID
+    }
+}
+
+private struct RuntimePrompt: SessionAuthorizationResultPrompting {
+    let approved: Bool; let state: RuntimeState
+    typealias Completion = @Sendable (SessionAuthorizationResult) -> Void
+    func authorizeResult(_ presentation: SessionAuthorizationPresentation, completion: @escaping Completion) {
+        self.state.record(presentation)
+        completion(SessionAuthorizationResult(
+            approved: self.approved,
+            authenticationContext: self.approved ? LAContext() : nil
+        ))
+    }
+}
+
+private struct RuntimeAgent: VerifiedSessionRunning {
+    func serve() throws {}
+    func stop() {}
+    func waitUntilListening(timeout _: TimeInterval) -> Bool {
+        true
+    }
+}
+
+// swiftlint:disable large_tuple opening_brace statement_position
+private func runtimeSelftests() throws {
+    func runRuntime(approved: Bool, signer: AgentTestSigner,
+                    exit: Int32, cancelAfterLaunch: Bool = false) throws -> (Int32?, RuntimeState, SessionRegistry)
+    {
+        let root = URL(fileURLWithPath: "/tmp/macop-runtime-\(UUID().uuidString)", isDirectory: true)
+        let registry = try SessionRegistry(root: root)
+        let state = RuntimeState()
+        let inspector = AgentTestInspector()
+        let dependencies = VerifiedSessionRuntimeDependencies(
+            selectIdentity: { _ in SSHCommand.VerifiedSessionIdentity(
+                fingerprint: sshFingerprint(for: agentTestKey), label: "test", publicKeyBlob: agentTestKey
+            ) },
+            launch: { reservation in
+                state.recordReservation(reservation.id)
+                if cancelAfterLaunch {
+                    state.cancel()
+                }
+                return VerifiedSessionRuntimeLaunch(
+                    request: VerifiedSessionLaunchRequest(
+                        rootPID: 42,
+                        rootStartTime: 7,
+                        bundleID: "test.agent",
+                        codeRequirement: "anchor test"
+                    ),
+                    waitForExit: { exit }, cancel: { state.cancel() }
+                )
+            },
+            activate: { reservation, request in
+                state.recordReservation(reservation.id)
+                return try registry.activate(
+                    reservation: reservation, rootPID: request.rootPID, rootStartTime: request.rootStartTime,
+                    bundleID: request.bundleID, codeRequirement: request.codeRequirement, inspector: inspector
+                )
+            },
+            prompt: RuntimePrompt(approved: approved, state: state),
+            makeSigner: { _, _ in signer },
+            makeAgent: { _, _, _ in RuntimeAgent() },
+            isCancellationRequested: { state.snapshot().1 }
+        )
+        let result: Int32?
+        do { result = try VerifiedSessionRuntime(registry: registry, dependencies: dependencies).run(label: "test") }
+        catch { result = nil }
+        return (result, state, registry)
+    }
+    let (success, state, _) = try runRuntime(approved: true, signer: AgentTestSigner(), exit: 143)
+    try expect(success == 143, "runtime must preserve conventional signal exit status")
+    let presentation = state.snapshot().0
+    try expect(presentation?.identityLabel == "test" && presentation?.application == "test.agent"
+        && presentation?.fingerprint == sshFingerprint(for: agentTestKey)
+        && presentation?.verification == "verified (code requirement matched)",
+        "runtime presentation must be derived from the activated registry session")
+    let mismatched = AgentTestSigner(publicKeyBlob: agentTestKey, fingerprint: "SHA256:other")
+    let (failed, mismatchState, _) = try runRuntime(approved: true, signer: mismatched, exit: 0)
+    try expect(failed == nil && mismatchState.snapshot().1, "fingerprint mismatch must deny and cancel launched root")
+    let (denied, deniedState, _) = try runRuntime(approved: false, signer: AgentTestSigner(), exit: 0)
+    try expect(denied == nil && deniedState.snapshot().1, "prompt denial must cancel launched root")
+    let (cancelled, cancellationState, cancellationRegistry) = try runRuntime(
+        approved: true, signer: AgentTestSigner(), exit: 0, cancelAfterLaunch: true
+    )
+    try expect(cancelled == nil && cancellationState.snapshot().1,
+               "cancellation after launch must cancel the owned root")
+    guard let reservationID = cancellationState.recordedReservation() else {
+        throw SelftestFailure(message: "cancellation test must record its reservation")
+    }
+    try expect(cancellationRegistry.reservation(reservationID) == nil,
+               "cancellation after launch must revoke the pending session")
+}
+
+// swiftlint:enable large_tuple opening_brace statement_position
+
+private func agentSelftests() throws {
+    var selfCode: SecCode?
+    guard SecCodeCopySelf([], &selfCode) == errSecSuccess, let selfCode else {
+        throw SelftestFailure(message: "self code identity test requires a live SecCode")
+    }
+    var selfStaticCode: SecStaticCode?
+    guard SecCodeCopyStaticCode(selfCode, [], &selfStaticCode) == errSecSuccess, let selfStaticCode else {
+        throw SelftestFailure(message: "self code identity test requires static signing information")
+    }
+    var selfRequirementRef: SecRequirement?
+    var selfRequirementText: CFString?
+    guard SecCodeCopyDesignatedRequirement(selfStaticCode, [], &selfRequirementRef) == errSecSuccess,
+          let selfRequirementRef,
+          SecRequirementCopyString(selfRequirementRef, [], &selfRequirementText) == errSecSuccess,
+          let selfRequirement = selfRequirementText as String?
+    else {
+        throw SelftestFailure(message: "self code identity test requires a designated requirement")
+    }
+    let selfIdentifier = try SystemRequesterInspector().validatedCodeIdentity(
+        pid: getpid(),
+        requirement: selfRequirement
+    )
+    try expect(!selfIdentifier.isEmpty, "self process must pass its own designated requirement")
+
+    var peerSockets = [Int32](repeating: -1, count: 2)
+    guard socketpair(AF_UNIX, SOCK_STREAM, 0, &peerSockets) == 0 else {
+        throw SelftestFailure(message: "socketpair must be available for peer evidence test")
+    }
+    defer { _ = close(peerSockets[0]); _ = close(peerSockets[1]) }
+    let peerEvidence = try SocketPeerEvidence.read(from: peerSockets[0])
+    try expect(peerEvidence.pid == getpid(), "LOCAL_PEERPID must identify the connected local process")
+    try expect(peerEvidence.uid == Int32(getuid()), "LOCAL_PEERCRED must identify the connected local user")
+    var peerCredentials = xucred(); peerCredentials.cr_version = UInt32(XUCRED_VERSION); peerCredentials
+        .cr_uid = uid_t(getuid())
+    let peerLength = socklen_t(MemoryLayout<pid_t>.size)
+    let credentialLength = socklen_t(MemoryLayout.offset(of: \xucred.cr_uid)! + MemoryLayout<uid_t>.size)
+    let validatedPeer = try SocketPeerEvidence.validate(
+        pid: getpid(),
+        pidLength: peerLength,
+        credentials: peerCredentials,
+        credentialLength: credentialLength
+    )
+    try expect(validatedPeer == peerEvidence,
+               "validated peer evidence must accept complete socket credentials")
+    func expectPeerEvidenceFailure(_ action: () throws -> Void, _ message: String) throws {
+        do { try action(); throw SelftestFailure(message: message) } catch AgentProtocolError.denied {}
+    }
+    try expectPeerEvidenceFailure({ _ = try SocketPeerEvidence.validate(
+                                      pid: getpid(),
+                                      pidLength: peerLength - 1,
+                                      credentials: peerCredentials,
+                                      credentialLength: credentialLength
+                                  ) },
+                                  "short peer PID evidence must fail")
+    try expectPeerEvidenceFailure({ _ = try SocketPeerEvidence.validate(
+                                      pid: getpid(),
+                                      pidLength: peerLength,
+                                      credentials: peerCredentials,
+                                      credentialLength: credentialLength - 1
+                                  ) },
+                                  "short peer credential evidence must fail")
+    peerCredentials.cr_version = UInt32.max
+    try expectPeerEvidenceFailure({ _ = try SocketPeerEvidence.validate(
+                                      pid: getpid(),
+                                      pidLength: peerLength,
+                                      credentials: peerCredentials,
+                                      credentialLength: credentialLength
+                                  ) },
+                                  "unknown peer credential versions must fail")
+    peerCredentials.cr_version = UInt32(XUCRED_VERSION); peerCredentials.cr_uid = uid_t.max
+    try expectPeerEvidenceFailure({ _ = try SocketPeerEvidence.validate(
+                                      pid: getpid(),
+                                      pidLength: peerLength,
+                                      credentials: peerCredentials,
+                                      credentialLength: credentialLength
+                                  ) },
+                                  "invalid peer credential UID must fail")
+
+    let payload = Data(repeating: 0xAB, count: 6)
+    var fragmented = try SSHWire.frame(payload)
+    let original = fragmented
+    fragmented.removeLast()
+    let partial = try SSHWire.takeFrame(from: &fragmented)
+    try expect(partial == nil, "agent frame must wait for complete payload")
+    fragmented.append(original.last!)
+    let completed = try SSHWire.takeFrame(from: &fragmented)
+    try expect(
+        completed == payload && fragmented.isEmpty,
+        "agent frame must consume exactly one frame"
+    )
+    var oversized = try SSHWire.u32(UInt32(SSHWire.maxFrameLength + 1))
+    do { _ = try SSHWire.takeFrame(from: &oversized); throw SelftestFailure(message: "agent oversize frame must fail")
+    } catch AgentProtocolError.tooLarge {}
+
+    let registryRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("macop-agent-selftest-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: registryRoot) }
+    let symlinkRoot = registryRoot.appendingPathComponent("symlink-root")
+    try FileManager.default.createDirectory(
+        at: registryRoot,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    guard symlink(registryRoot.path, symlinkRoot.path) == 0 else {
+        throw SelftestFailure(message: "symlink root test requires a local symbolic link")
+    }
+    do {
+        _ = try SessionRegistry(root: symlinkRoot)
+        throw SelftestFailure(message: "a symlink registry root must be rejected")
+    } catch AgentProtocolError.denied {}
+    let descriptorsBeforeRegistryDeinit = try openFileDescriptorCount()
+    do {
+        let deinitRegistry = try SessionRegistry(root: registryRoot.appendingPathComponent("deinit"))
+        _ = try deinitRegistry.create(
+            rootPID: 42,
+            rootStartTime: 7,
+            bundleID: "test.agent",
+            codeRequirement: "anchor test",
+            keyFingerprint: sshFingerprint(for: agentTestKey),
+            expiresAt: .now.addingTimeInterval(60), inspector: AgentTestInspector()
+        )
+        let descriptorsWithRegistry = try openFileDescriptorCount()
+        try expect(
+            descriptorsWithRegistry >= descriptorsBeforeRegistryDeinit + 2,
+            "a live registry must retain its root and session directory descriptors"
+        )
+    }
+    let descriptorsAfterRegistryDeinit = try openFileDescriptorCount()
+    try expect(
+        descriptorsAfterRegistryDeinit == descriptorsBeforeRegistryDeinit,
+        "registry deinitialization must close retained directory descriptors"
+    )
+    let registry = try SessionRegistry(root: registryRoot)
+    let reservation = try registry.reserve(
+        keyFingerprint: sshFingerprint(for: agentTestKey),
+        expiresAt: .now.addingTimeInterval(60)
+    )
+    let reservationEnvironment = VerifiedSessionLauncher.environment(for: reservation)
+    try expect(reservationEnvironment["SSH_AUTH_SOCK"] == reservation.socketPath.path,
+               "a reservation must provide only its short-lived socket path to the launcher")
+    try expect(reservationEnvironment["MACOP_SESSION_NONCE"] == nil,
+               "the opaque reservation nonce must not be exposed to the launched root")
+    try expect(registry.session(reservation.id) == nil && !registry.authorize(reservation.id)
+        && registry.verifySign(sessionID: reservation.id, signerFingerprint: sshFingerprint(for: agentTestKey)) == nil,
+        "a pending reservation must reject lookup, authorization, and signing")
+    let activatedReservation = try registry.activate(
+        reservation: reservation,
+        rootPID: 42,
+        rootStartTime: 7,
+        bundleID: "test.agent",
+        codeRequirement: "anchor test",
+        inspector: AgentTestInspector()
+    )
+    try expect(activatedReservation.id == reservation.id && activatedReservation.nonce == reservation.nonce,
+               "activation must retain the reserved nonce and immutable session identity")
+
+    // Exercise the real Darwin AF_UNIX listener, rather than only its protocol
+    // state machine. A client may connect before the root is activated, but no
+    // bytes are interpreted until a signer has been installed and granted.
+    let liveSuffix = String(UUID().uuidString.prefix(8))
+    let liveRoot = URL(fileURLWithPath: "/tmp/ma-\(liveSuffix)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: liveRoot) }
+    let liveRegistry = try SessionRegistry(root: liveRoot)
+    let liveReservation = try liveRegistry.reserve(
+        keyFingerprint: sshFingerprint(for: agentTestKey), expiresAt: .now.addingTimeInterval(60)
+    )
+    try expect(
+        liveReservation.socketPath.path.utf8.count < MemoryLayout<sockaddr_un>.size,
+        "live AF_UNIX fixture path must fit Darwin sun_path"
+    )
+    let liveInspector = SnapshotInspector(
+        snapshots: [getpid(): ProcessSnapshot(pid: getpid(), parentPID: 1, startTime: 9)], valid: true
+    )
+    let deferredConnections = DeferredAgentConnectionBuilder(
+        requester: RequesterVerifier(inspector: liveInspector, currentUID: Int32(getuid()))
+    )
+    let liveAgent = VerifiedSessionAgent(
+        registry: liveRegistry, sessionID: liveReservation.id, connections: deferredConnections,
+        inspector: liveInspector, frameReadTimeout: 0.15, maximumClients: 1
+    )
+    DispatchQueue.global().async { try? liveAgent.serve() }
+    try expect(liveAgent.waitUntilListening(timeout: 2), "reserved listener must bind before child launch")
+    func connectLiveAgent() throws -> Int32 {
+        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw SelftestFailure(message: "AF_UNIX socket must be available") }
+        var address = sockaddr_un(); address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size); address
+            .sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &address.sun_path) {
+            $0.copyBytes(from: Array(liveReservation.socketPath.path.utf8) + [0])
+        }
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connected == 0
+        else { close(descriptor); throw SelftestFailure(message: "absolute reserved socket path must connect") }
+        return descriptor
+    }
+    let pendingClient = try connectLiveAgent()
+    defer { _ = close(pendingClient) }
+    let identitiesRequest = try SSHWire.frame(Data([AgentMessage.requestIdentities]))
+    let pendingSent = identitiesRequest.withUnsafeBytes {
+        send(pendingClient, $0.baseAddress!, identitiesRequest.count, Int32(MSG_NOSIGNAL))
+    }
+    try expect(pendingSent == identitiesRequest.count, "pending client must send an identities request")
+    var pendingPoll = pollfd(fd: pendingClient, events: Int16(POLLIN), revents: 0)
+    try expect(
+        poll(&pendingPoll, 1, 100) == 0,
+        "pending client must receive no response before activation and signer install"
+    )
+    let cappedClient = try connectLiveAgent()
+    defer { _ = close(cappedClient) }
+    var cappedPoll = pollfd(fd: cappedClient, events: Int16(POLLIN | POLLHUP), revents: 0)
+    try expect(poll(&cappedPoll, 1, 1000) > 0, "client above configured cap must be rejected promptly")
+    _ = try liveRegistry.activate(
+        reservation: liveReservation, rootPID: getpid(), rootStartTime: 9, bundleID: "test.agent",
+        codeRequirement: "anchor test", inspector: liveInspector
+    )
+    deferredConnections.install(AgentTestSigner(), registry: liveRegistry)
+    try expect(liveRegistry.authorize(liveReservation.id), "live session must grant only after signer installation")
+    var replyPoll = pollfd(fd: pendingClient, events: Int16(POLLIN), revents: 0)
+    try expect(poll(&replyPoll, 1, 2000) > 0, "activated client must receive identities response")
+    var response = [UInt8](repeating: 0, count: 64)
+    let received = recv(pendingClient, &response, response.count, 0)
+    try expect(received >= 5 && response[4] == AgentMessage.identitiesAnswer,
+               "real listener must bind peer evidence and reply with exact identities message")
+    let partialHeader = Data([0, 0, 0, 1])
+    let partialSent = partialHeader.prefix(1).withUnsafeBytes {
+        send(pendingClient, $0.baseAddress!, 1, Int32(MSG_NOSIGNAL))
+    }
+    try expect(partialSent == 1, "dribbling client must send its partial header")
+    var timeoutPoll = pollfd(fd: pendingClient, events: Int16(POLLIN | POLLHUP), revents: 0)
+    try expect(poll(&timeoutPoll, 1, 1000) > 0, "absolute frame deadline must close a dribbling client")
+    usleep(50000)
+    let freshClient = try connectLiveAgent(); defer { _ = close(freshClient) }
+    let freshSent = identitiesRequest.withUnsafeBytes {
+        send(freshClient, $0.baseAddress!, identitiesRequest.count, Int32(MSG_NOSIGNAL))
+    }
+    try expect(freshSent == identitiesRequest.count, "fresh client must send an identities request")
+    var freshPoll = pollfd(fd: freshClient, events: Int16(POLLIN), revents: 0)
+    try expect(poll(&freshPoll, 1, 2000) > 0, "each fresh socket must receive its own connection binding")
+    // A same-UID process can replace a filesystem socket name. The listener
+    // must notice the changed object before it processes another request.
+    _ = shutdown(freshClient, SHUT_RDWR)
+    var freshClosedPoll = pollfd(fd: freshClient, events: Int16(POLLIN | POLLHUP), revents: 0)
+    try expect(poll(&freshClosedPoll, 1, 1000) > 0, "fresh connection must close before substitution fixture")
+    let substitutionClient = try connectLiveAgent()
+    defer { _ = close(substitutionClient) }
+    var originalSocketStat = stat()
+    try expect(lstat(liveReservation.socketPath.path, &originalSocketStat) == 0,
+               "fixture must capture the original pathname object")
+    let attackerSocket = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard attackerSocket >= 0 else { throw SelftestFailure(message: "attacker socket fixture must be available") }
+    defer { _ = close(attackerSocket) }
+    let attackerPath = liveReservation.directory.appendingPathComponent("attacker.sock").path
+    var attackerAddress = sockaddr_un()
+    attackerAddress.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+    attackerAddress.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &attackerAddress.sun_path) {
+        $0.copyBytes(from: Array(attackerPath.utf8) + [0])
+    }
+    let attackerBound = withUnsafePointer(to: &attackerAddress) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.bind(attackerSocket, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    try expect(attackerBound == 0
+        && Darwin.rename(attackerPath, liveReservation.socketPath.path) == 0,
+        "fixture must atomically replace the reserved pathname with a different socket")
+    var replacementSocketStat = stat()
+    try expect(
+        lstat(liveReservation.socketPath.path, &replacementSocketStat) == 0
+            && (replacementSocketStat.st_dev != originalSocketStat.st_dev
+                || replacementSocketStat.st_ino != originalSocketStat.st_ino
+                || replacementSocketStat.st_ctimespec.tv_sec != originalSocketStat.st_ctimespec.tv_sec
+                || replacementSocketStat.st_ctimespec.tv_nsec != originalSocketStat.st_ctimespec.tv_nsec),
+        "attacker fixture must replace the original socket object"
+    )
+    // The listener may already have observed the substituted pathname and
+    // closed this connection. MSG_NOSIGNAL keeps that expected race local.
+    _ = identitiesRequest.withUnsafeBytes {
+        send(substitutionClient, $0.baseAddress!, identitiesRequest.count, Int32(MSG_NOSIGNAL))
+    }
+    var substitutionPoll = pollfd(fd: substitutionClient, events: Int16(POLLIN | POLLHUP), revents: 0)
+    var substitutionRevoked = false
+    for _ in 0 ..< 20 {
+        _ = poll(&substitutionPoll, 1, 50)
+        if liveRegistry.reservation(liveReservation.id) == nil {
+            substitutionRevoked = true
+            break
+        }
+        usleep(50000)
+    }
+    try expect(substitutionRevoked,
+               "socket substitution must revoke the session before a request can be processed")
+    liveAgent.stop()
+    usleep(100_000)
+    try expect(liveRegistry.reservation(liveReservation.id) == nil
+        && !FileManager.default.fileExists(atPath: liveReservation.socketPath.path),
+        "stopping listener must revoke session and remove its socket immediately")
+
+    // A non-reading peer must not pin a listener worker in a blocking send.
+    // The identities reply is deliberately larger than the Darwin socket send
+    // buffer, so the test exercises the POLLOUT deadline rather than a write.
+    let saturatedRoot = URL(fileURLWithPath: "/tmp/ma-saturated-\(liveSuffix)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: saturatedRoot) }
+    let saturatedRegistry = try SessionRegistry(root: saturatedRoot)
+    // Agent identity blobs are capped below SSHWire.maxStringLength, while
+    // repeated replies still exceed the socket queue without client reads.
+    let largeKey = Data(repeating: 0x61, count: 120 * 1024)
+    let saturatedSession = try saturatedRegistry.create(
+        rootPID: getpid(), rootStartTime: 9, bundleID: "test.agent", codeRequirement: "anchor test",
+        keyFingerprint: sshFingerprint(for: largeKey), expiresAt: .now.addingTimeInterval(60),
+        inspector: liveInspector
+    )
+    try expect(saturatedRegistry.authorize(saturatedSession.id), "saturated fixture must authorize its session")
+    let saturatedAgent = VerifiedSessionAgent(
+        registry: saturatedRegistry, sessionID: saturatedSession.id,
+        connections: DefaultAgentConnectionBuilder(
+            requester: RequesterVerifier(inspector: liveInspector, currentUID: Int32(getuid())),
+            registry: saturatedRegistry, signer: AgentTestSigner(publicKeyBlob: largeKey)
+        ), inspector: liveInspector, frameWriteTimeout: 0.15, clientSendBuffer: 1024,
+        maximumClientOutput: 256 * 1024
+    )
+    DispatchQueue.global().async { try? saturatedAgent.serve() }
+    try expect(saturatedAgent.waitUntilListening(timeout: 2), "saturated listener must bind")
+    let saturatedClient = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard saturatedClient >= 0 else { throw SelftestFailure(message: "saturated client socket must be available") }
+    defer { _ = close(saturatedClient) }
+    var receiveBuffer: Int32 = 1024
+    try expect(
+        setsockopt(
+            saturatedClient,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &receiveBuffer,
+            socklen_t(MemoryLayout.size(ofValue: receiveBuffer))
+        ) == 0,
+        "saturated client must constrain its receive buffer"
+    )
+    var saturatedAddress = sockaddr_un()
+    saturatedAddress.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+    saturatedAddress.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &saturatedAddress.sun_path) {
+        $0.copyBytes(from: Array(saturatedSession.socketPath.path.utf8) + [0])
+    }
+    let saturatedConnected = withUnsafePointer(to: &saturatedAddress) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(saturatedClient, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    try expect(saturatedConnected == 0, "saturated client must connect")
+    let saturatedSent = identitiesRequest.withUnsafeBytes {
+        send(saturatedClient, $0.baseAddress!, identitiesRequest.count, Int32(MSG_NOSIGNAL))
+    }
+    try expect(saturatedSent == identitiesRequest.count, "saturated client must send an identities request")
+    for _ in 0 ..< 8 {
+        let sent = identitiesRequest.withUnsafeBytes {
+            send(saturatedClient, $0.baseAddress!, identitiesRequest.count, Int32(MSG_NOSIGNAL))
+        }
+        try expect(sent == identitiesRequest.count,
+                   "non-reading client must queue repeated large-response requests")
+    }
+    // Darwin does not report POLLHUP while unread bytes remain queued. Do not
+    // read until after the write deadline, then drain non-blockingly to EOF.
+    usleep(1_000_000)
+    let saturatedFlags = fcntl(saturatedClient, F_GETFL)
+    try expect(saturatedFlags >= 0 && fcntl(saturatedClient, F_SETFL, saturatedFlags | O_NONBLOCK) == 0,
+               "saturated client must become nonblocking for EOF verification")
+    let drainDeadline = DispatchTime.now().uptimeNanoseconds + 1_500_000_000
+    var drain = [UInt8](repeating: 0, count: 64 * 1024)
+    var saturatedClosed = false
+    var drainedBytes = 0
+    while DispatchTime.now().uptimeNanoseconds < drainDeadline {
+        let received = recv(saturatedClient, &drain, drain.count, 0)
+        if received == 0 {
+            saturatedClosed = true
+            break
+        }
+        if received < 0 {
+            if errno == EINTR {
+                continue
+            }
+            guard errno == EAGAIN || errno == EWOULDBLOCK else { break }
+            var drainPoll = pollfd(fd: saturatedClient, events: Int16(POLLIN | POLLHUP), revents: 0)
+            _ = poll(&drainPoll, 1, 50)
+            continue
+        }
+        drainedBytes += received
+    }
+    try expect(
+        saturatedClosed && drainedBytes > 0 && drainedBytes <= 256 * 1024,
+        "non-reading client must close within its 256 KiB output budget (drained \(drainedBytes) bytes)"
+    )
+    saturatedAgent.stop()
+    // Keep the long-path case isolated from prior runs: the root itself must
+    // remain a valid private directory before the socket name overflows.
+    let longRoot = URL(
+        fileURLWithPath: "/tmp/ma-long-\(liveSuffix)-" + String(repeating: "x", count: 80),
+        isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: longRoot) }
+    let longRegistry = try SessionRegistry(root: longRoot)
+    let longReservation = try longRegistry.reserve(
+        keyFingerprint: sshFingerprint(for: agentTestKey), expiresAt: .now.addingTimeInterval(60)
+    )
+    let longAgent = VerifiedSessionAgent(
+        registry: longRegistry, sessionID: longReservation.id, connections: DeferredAgentConnectionBuilder()
+    )
+    DispatchQueue.global().async { try? longAgent.serve() }
+    try expect(!longAgent.waitUntilListening(timeout: 1), "too-long AF_UNIX paths must fail closed before launch")
+    do {
+        _ = try registry.activate(
+            reservation: reservation,
+            rootPID: 42,
+            rootStartTime: 7,
+            bundleID: "test.agent",
+            codeRequirement: "anchor test",
+            inspector: AgentTestInspector()
+        )
+        throw SelftestFailure(message: "a reservation must activate exactly once")
+    } catch AgentProtocolError.denied {}
+    do {
+        _ = try registry.create(
+            rootPID: 42, rootStartTime: 7, bundleID: "test.agent", codeRequirement: "anchor test",
+            keyFingerprint: sshFingerprint(for: agentTestKey), expiresAt: .now.addingTimeInterval(60),
+            inspector: SnapshotInspector(
+                snapshots: [42: ProcessSnapshot(pid: 42, parentPID: 1, startTime: 7)],
+                valid: false
+            )
+        )
+        throw SelftestFailure(message: "create must validate the root with its injected inspector")
+    } catch AgentProtocolError.denied {}
+    let session = try registry.create(
+        rootPID: 42,
+        rootStartTime: 7,
+        bundleID: "test.agent",
+        codeRequirement: "anchor test",
+        keyFingerprint: sshFingerprint(for: agentTestKey),
+        expiresAt: .now.addingTimeInterval(60), inspector: AgentTestInspector()
+    )
+    try expect(registry.authorize(session.id), "registry must issue an explicit session grant")
+    let permissions = try FileManager.default
+        .attributesOfItem(atPath: session.directory.path)[.posixPermissions] as? NSNumber
+    try expect(permissions?.intValue == 0o700, "registry directories must be mode 0700")
+    let chain = SnapshotInspector(snapshots: [
+        42: ProcessSnapshot(pid: 42, parentPID: 1, startTime: 7),
+        100: ProcessSnapshot(pid: 100, parentPID: 42, startTime: 8),
+        101: ProcessSnapshot(pid: 101, parentPID: 999, startTime: 8)
+    ], valid: true)
+    let verifier = RequesterVerifier(inspector: chain, currentUID: Int32(getuid()))
+    try expect(verifier.verify(peer: RequesterPeer(pid: 100, uid: Int32(getuid())), session: session),
+               "a differently signed descendant must be accepted by ancestry")
+    try expect(!verifier.verify(peer: RequesterPeer(pid: 101, uid: Int32(getuid())), session: session),
+               "an external process must be rejected")
+    try expect(!RequesterVerifier(inspector: SnapshotInspector(
+        snapshots: [42: ProcessSnapshot(pid: 42, parentPID: 1, startTime: 7)], valid: false
+    ), currentUID: Int32(getuid())).verify(peer: RequesterPeer(pid: 42, uid: Int32(getuid())), session: session),
+    "a root whose code validity check fails must be rejected")
+    try expect(!RequesterVerifier(inspector: SnapshotInspector(
+        snapshots: [42: ProcessSnapshot(pid: 42, parentPID: 1, startTime: 7)], valid: true, identity: "other.agent"
+    ), currentUID: Int32(getuid())).verify(peer: RequesterPeer(pid: 42, uid: Int32(getuid())), session: session),
+    "a root whose validated identity changes must be rejected")
+    try expect(
+        !RequesterVerifier(inspector: SnapshotInspector(
+            snapshots: [42: ProcessSnapshot(pid: 42, parentPID: 1, startTime: 9)],
+            valid: true
+        ), currentUID: Int32(getuid())).verify(peer: RequesterPeer(pid: 42, uid: Int32(getuid())), session: session),
+        "PID reuse/root exit must be rejected"
+    )
+    let connection = AgentConnection(
+        requester: RequesterVerifier(inspector: AgentTestInspector(), currentUID: Int32(getuid())),
+        registry: registry,
+        sessionID: session.id,
+        signer: AgentTestSigner(),
+        bindingVerifier: AgentTestBindingVerifier()
+    )
+    let peer = RequesterPeer(pid: 100, uid: Int32(getuid()))
+    try expect(
+        connection.reply(peer: peer, payload: Data([AgentMessage.signRequest])) == Data([AgentMessage.failure]),
+        "agent must reject a sign before session binding"
+    )
+    let unknownExtension = try Data([AgentMessage.extensionRequest]) + (SSHWire.string("other")) +
+        (SSHWire.string(Data()))
+    try expect(
+        connection.reply(peer: peer, payload: unknownExtension) == Data([AgentMessage.extensionFailure]),
+        "unknown extension must use extension failure"
+    )
+    let forwardingState = SessionBindingState()
+    let forwardingBind = try SSHWire.string("session-bind@openssh.com") + SSHWire.string(Data("host".utf8)) + SSHWire
+        .string(Data("session".utf8)) + SSHWire.string(Data("proof".utf8)) + SSHWire.boolean(true)
+    do { try forwardingState.accept(payload: forwardingBind, verifier: AgentTestBindingVerifier())
+        throw SelftestFailure(message: "forwarded bindings must fail closed")
+    } catch AgentProtocolError.denied {}
+    let bind = try Data([AgentMessage.extensionRequest]) + (SSHWire.string("session-bind@openssh.com")) + SSHWire
+        .string(Data("host".utf8)) + SSHWire.string(Data("session".utf8)) + SSHWire.string(Data("proof".utf8)) + SSHWire
+        .boolean(false)
+    try expect(
+        connection.reply(peer: peer, payload: bind) == Data([AgentMessage.success]),
+        "valid binding must acknowledge success"
+    )
+    try expect(
+        connection.reply(peer: peer, payload: bind) == Data([AgentMessage.extensionFailure]),
+        "duplicate binding must fail closed"
+    )
+    let signData = try SSHWire.string(Data("session".utf8)) + Data([50]) + SSHWire.string("user") + SSHWire
+        .string("ssh-connection") + SSHWire.string("publickey") + SSHWire.boolean(true) + SSHWire
+        .string("test") + SSHWire.string(agentTestKey)
+    let sign = try Data([AgentMessage.signRequest]) + (SSHWire.string(agentTestKey)) + SSHWire
+        .string(signData) + SSHWire.u32(0)
+    let fullSignReply = connection.reply(peer: peer, payload: sign)
+    let expectedSignReply = try Data([AgentMessage.signResponse]) + SSHWire.string(Data("signature:".utf8) + signData)
+    try expect(fullSignReply == expectedSignReply, "bound signer must return the complete exact SSH sign response")
+    var hostboundData = try SSHWire.string(Data("session".utf8))
+    hostboundData.append(50)
+    hostboundData += try SSHWire.string("user")
+    hostboundData += try SSHWire.string("ssh-connection")
+    hostboundData += try SSHWire.string("publickey-hostbound-v00@openssh.com")
+    hostboundData += SSHWire.boolean(true)
+    hostboundData += try SSHWire.string("test")
+    hostboundData += try SSHWire.string(agentTestKey)
+    let hostboundPrefix = hostboundData
+    hostboundData += try SSHWire.string(Data("host".utf8))
+    let hostboundSign = try Data([AgentMessage.signRequest]) + SSHWire.string(agentTestKey) + SSHWire
+        .string(hostboundData) + SSHWire.u32(0)
+    try expect(connection.reply(peer: peer, payload: hostboundSign).first == AgentMessage.signResponse,
+               "host-bound userauth must match the verified host key")
+    let wrongHostboundData = try hostboundPrefix + SSHWire.string(Data("other".utf8))
+    let wrongHostbound = try Data([AgentMessage.signRequest]) + SSHWire.string(agentTestKey) + SSHWire
+        .string(wrongHostboundData) + SSHWire.u32(0)
+    try expect(connection.reply(peer: peer, payload: wrongHostbound) == Data([AgentMessage.failure]),
+               "host-bound userauth must reject a different host key")
+
+    for invalidSessionLength in [0, 129] {
+        let malformedBind = try SSHWire.string("session-bind@openssh.com") + SSHWire.string(Data("host".utf8)) +
+            SSHWire.string(Data(repeating: 1, count: invalidSessionLength)) + SSHWire.string(Data("proof".utf8)) +
+            SSHWire.boolean(false)
+        do {
+            try SessionBindingState().accept(payload: malformedBind, verifier: AgentTestBindingVerifier())
+            throw SelftestFailure(message: "session binding IDs outside the permitted length must fail")
+        } catch AgentProtocolError.denied {}
+    }
+
+    let concurrentBinding = SessionBindingState(); let bindSuccesses = LockedCounter()
+    DispatchQueue.concurrentPerform(iterations: 32) { _ in
+        let didBind = (try? concurrentBinding.accept(
+            payload: Data(bind.dropFirst()),
+            verifier: AgentTestBindingVerifier()
+        )) != nil
+        if didBind {
+            bindSuccesses.increment()
+        }
+    }
+    try expect(bindSuccesses.read() == 1, "concurrent duplicate bindings must admit exactly one")
+    let wrongSessionData = try SSHWire.string(Data("other-session".utf8)) + Data([50]) + SSHWire
+        .string("user") + SSHWire
+        .string("ssh-connection") + SSHWire.string("publickey") + SSHWire.boolean(true) + SSHWire
+        .string("test") + SSHWire.string(agentTestKey)
+    let wrongSession = try Data([AgentMessage.signRequest]) + SSHWire.string(agentTestKey) + SSHWire
+        .string(wrongSessionData) + SSHWire.u32(0)
+    try expect(connection.reply(peer: peer, payload: wrongSession) == Data([AgentMessage.failure]),
+               "bound agent must reject a different SSH session ID")
+    let wrongKeyData = try SSHWire.string(Data("session".utf8)) + Data([50]) + SSHWire.string("user") + SSHWire
+        .string("ssh-connection") + SSHWire.string("publickey") + SSHWire.boolean(true) + SSHWire
+        .string("test") + SSHWire.string(Data([
+            0,
+            0,
+            0,
+            5,
+            111,
+            116,
+            104,
+            101,
+            114
+        ]))
+    let wrongKey = try Data([AgentMessage.signRequest]) + SSHWire.string(agentTestKey) + SSHWire
+        .string(wrongKeyData) + SSHWire.u32(0)
+    try expect(connection.reply(peer: peer, payload: wrongKey) == Data([AgentMessage.failure]),
+               "bound agent must reject a different public-key blob")
+    registry.revoke(session.id)
+    try expect(connection.reply(peer: peer, payload: sign) == Data([AgentMessage.failure]),
+               "revoked authorization must prevent signing")
+    try expect(!FileManager.default.fileExists(atPath: session.directory.path),
+               "revocation must remove the registry-owned session directory")
+
+    let raceRegistry = try SessionRegistry(root: registryRoot.appendingPathComponent("race"))
+    let raceSession = try raceRegistry.create(
+        rootPID: 42,
+        rootStartTime: 7,
+        bundleID: "test.agent",
+        codeRequirement: "anchor test",
+        keyFingerprint: sshFingerprint(for: agentTestKey),
+        expiresAt: .now.addingTimeInterval(60), inspector: AgentTestInspector()
+    )
+    try expect(raceRegistry.authorize(raceSession.id), "race session must authorize")
+    let raceConnection = AgentConnection(
+        requester: RequesterVerifier(inspector: AgentTestInspector(), currentUID: Int32(getuid())),
+        registry: raceRegistry,
+        sessionID: raceSession.id,
+        signer: AgentTestSigner(),
+        bindingVerifier: AgentTestBindingVerifier()
+    )
+    _ = raceConnection.reply(peer: peer, payload: bind)
+    DispatchQueue.concurrentPerform(iterations: 32) { index in
+        if index == 0 {
+            raceRegistry.revoke(raceSession.id)
+        } else {
+            _ = raceConnection.reply(peer: peer, payload: sign)
+        }
+    }
+    try expect(raceConnection.reply(peer: peer, payload: sign) == Data([AgentMessage.failure]),
+               "revoke must deny every subsequently observed sign request")
+
+    let substitutionRegistry = try SessionRegistry(root: registryRoot.appendingPathComponent("substitution"))
+    let substituted = try substitutionRegistry.create(rootPID: 42, rootStartTime: 7, bundleID: "test.agent",
+                                                      codeRequirement: "anchor test",
+                                                      keyFingerprint: sshFingerprint(for: agentTestKey),
+                                                      expiresAt: .now.addingTimeInterval(60),
+                                                      inspector: AgentTestInspector())
+    let originalDirectory = substituted.directory.appendingPathExtension("original")
+    try FileManager.default.moveItem(at: substituted.directory, to: originalDirectory)
+    try FileManager.default.createDirectory(
+        at: substituted.directory,
+        withIntermediateDirectories: false,
+        attributes: [.posixPermissions: 0o700]
+    )
+    substitutionRegistry.revoke(substituted.id)
+    try expect(FileManager.default.fileExists(atPath: substituted.directory.path),
+               "same-UID replacement directory must not be removed")
+    try? FileManager.default.removeItem(at: originalDirectory)
+
+    let symlinkRegistry = try SessionRegistry(root: registryRoot.appendingPathComponent("session-symlink"))
+    let symlinkSession = try symlinkRegistry.create(rootPID: 42, rootStartTime: 7, bundleID: "test.agent",
+                                                    codeRequirement: "anchor test",
+                                                    keyFingerprint: sshFingerprint(for: agentTestKey),
+                                                    expiresAt: .now.addingTimeInterval(60),
+                                                    inspector: AgentTestInspector())
+    let outsideDirectory = registryRoot.appendingPathComponent("outside")
+    try FileManager.default.createDirectory(at: outsideDirectory, withIntermediateDirectories: false)
+    try FileManager.default.moveItem(at: symlinkSession.directory,
+                                     to: symlinkSession.directory.appendingPathExtension("original"))
+    guard symlink(outsideDirectory.path, symlinkSession.directory.path) == 0 else {
+        throw SelftestFailure(message: "session symlink test requires a local symbolic link")
+    }
+    symlinkRegistry.revoke(symlinkSession.id)
+    try expect(FileManager.default.fileExists(atPath: outsideDirectory.path),
+               "a substituted session symlink target must remain untouched")
+
+    let bindingVerifier = SecuritySessionBindingVerifier(); let edPrivate = Curve25519.Signing.PrivateKey()
+    let edHost = try SSHWire.string("ssh-ed25519") + SSHWire.string(edPrivate.publicKey.rawRepresentation)
+    let edSession = Data("ed25519-session".utf8)
+    let edSignature = try SSHWire.string("ssh-ed25519") + SSHWire.string(edPrivate.signature(for: edSession))
+    try bindingVerifier.verify(hostKey: edHost, sessionID: edSession, signature: edSignature)
+    do { try bindingVerifier.verify(hostKey: edHost, sessionID: Data("changed".utf8), signature: edSignature)
+        throw SelftestFailure(message: "Ed25519 binding signature must cover the exact session ID")
+    } catch AgentProtocolError.denied {}
+    do { try bindingVerifier.verify(
+        hostKey: SSHWire.string("ssh-rsa") + SSHWire.string(Data([1])),
+        sessionID: edSession,
+        signature: edSignature
+    )
+    throw SelftestFailure(message: "RSA host keys must fail closed")
+    } catch AgentProtocolError.unsupported {}
+    do { try bindingVerifier.verify(
+        hostKey: SSHWire.string("ssh-ed25519-cert-v01@openssh.com") + SSHWire.string(Data()),
+        sessionID: edSession,
+        signature: edSignature
+    )
+    throw SelftestFailure(message: "host certificates must fail closed")
+    } catch AgentProtocolError.unsupported {}
+    var p256Error: Unmanaged<CFError>?
+    guard let p256Private = SecKeyCreateRandomKey([
+        kSecAttrKeyType: kSecAttrKeyTypeECSECPrimeRandom, kSecAttrKeySizeInBits: 256
+    ] as CFDictionary, &p256Error), let p256Public = SecKeyCopyPublicKey(p256Private),
+                                        let p256Point = SecKeyCopyExternalRepresentation(p256Public,
+                                                                                         &p256Error) as Data?
+    else {
+        throw SelftestFailure(message: "P-256 binding vector requires a local Security key")
+    }
+    let p256Host = try SSHWire.string("ecdsa-sha2-nistp256") + SSHWire.string("nistp256") + SSHWire.string(p256Point)
+    let p256Session = Data("p256-session".utf8)
+    guard let p256DER = SecKeyCreateSignature(
+        p256Private,
+        .ecdsaSignatureMessageX962SHA256,
+        p256Session as CFData,
+        &p256Error
+    ) as Data? else {
+        throw SelftestFailure(message: "P-256 binding vector must sign")
+    }
+    let rawP256 = try CTKIdentitySigner.strictDERToRawP256(p256DER)
+    func mpint(_ raw: Data) -> Data {
+        let trimmed = Data(raw.drop { $0 == 0 }); let value = trimmed.isEmpty ? Data([0]) : trimmed
+        return value.first! & 0x80 == 0 ? value : Data([0]) + value
+    }
+    let p256Signature = try SSHWire.string("ecdsa-sha2-nistp256") + SSHWire.string(
+        SSHWire.string(mpint(Data(rawP256.prefix(32)))) + SSHWire.string(mpint(Data(rawP256.suffix(32))))
+    )
+    try bindingVerifier.verify(hostKey: p256Host, sessionID: p256Session, signature: p256Signature)
+    let expiredRegistry = try SessionRegistry(root: registryRoot.appendingPathComponent("expired"))
+    let expired = try expiredRegistry.create(
+        rootPID: 42,
+        rootStartTime: 7,
+        bundleID: "test.agent",
+        codeRequirement: "anchor test",
+        keyFingerprint: sshFingerprint(for: agentTestKey),
+        expiresAt: .now.addingTimeInterval(1), inspector: AgentTestInspector()
+    )
+    expiredRegistry.revoke(expired.id)
+    let expiredConnection = AgentConnection(
+        requester: RequesterVerifier(inspector: AgentTestInspector(), currentUID: Int32(getuid())),
+        registry: expiredRegistry,
+        sessionID: expired.id,
+        signer: AgentTestSigner(),
+        bindingVerifier: AgentTestBindingVerifier()
+    )
+    try expect(
+        expiredConnection
+            .reply(peer: peer, payload: Data([AgentMessage.requestIdentities])) == Data([AgentMessage.failure]),
+        "revoked sessions must fail closed"
+    )
+    let malformedDER = Data([0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00])
+    do {
+        _ = try CTKIdentitySigner
+            .strictDERToRawP256(malformedDER); throw SelftestFailure(message: "noncanonical DER must fail")
+    } catch AgentProtocolError.malformed {}
 }
 
 final class SequencedSSHExecutor: CommandExecuting, @unchecked Sendable {
@@ -153,6 +1076,8 @@ private func runHarnessIfRequested() -> Never? {
 }
 
 func run() throws {
+    do { try agentSelftests() } catch { throw SelftestFailure(message: "agent selftests: \(error)") }
+    do { try runtimeSelftests() } catch { throw SelftestFailure(message: "runtime selftests: \(error)") }
     try runKeychainIntegrationIfRequested()
     let app = MacopApp(keychainClient: FakeKeychainClient(response: .success(Data("test-secret".utf8))))
     let fileManager = FileManager.default
@@ -162,6 +1087,46 @@ func run() throws {
 
     try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
     let configDirectory = tempRoot.path
+
+    let sessionRoot = tempRoot.appendingPathComponent("sessions", isDirectory: true)
+    let sessionRegistry = try SessionRegistry(root: sessionRoot)
+    let verifiedSession = try sessionRegistry.create(
+        rootPID: 123,
+        rootStartTime: 456,
+        bundleID: "com.example.macop-test",
+        codeRequirement: "anchor test",
+        keyFingerprint: "SHA256:test",
+        expiresAt: Date().addingTimeInterval(60), inspector: SnapshotInspector(
+            snapshots: [123: ProcessSnapshot(pid: 123, parentPID: 1, startTime: 456)],
+            valid: true, identity: "com.example.macop-test"
+        )
+    )
+    let sessionEnvironment = VerifiedSessionLauncher.environment(for: verifiedSession)
+    try expect(
+        sessionEnvironment == ["SSH_AUTH_SOCK": verifiedSession.socketPath.path],
+        "verified-session launcher must pass only the dedicated socket"
+    )
+    try expect(
+        VerifiedSessionLauncher.notice(for: verifiedSession).contains("direct Apple provider use is not controlled"),
+        "verified-session notice must state the Apple-provider boundary"
+    )
+    let presentation = SessionAuthorizationPresentation(
+        identityLabel: "test",
+        application: "macop-test",
+        verification: "verified",
+        fingerprint: "SHA256:test",
+        sessionID: verifiedSession.id,
+        expiresAt: verifiedSession.expiresAt
+    )
+    try expect(
+        presentation.verification == "verified" && presentation.fingerprint == "SHA256:test"
+            && sessionRegistry.authorize(verifiedSession.id),
+        "only the registry-owned runtime may grant its activated session"
+    )
+    try expect(
+        sessionRegistry.verifySign(sessionID: verifiedSession.id, signerFingerprint: "SHA256:test") != nil,
+        "only the registry-owned grant may authorize the session fingerprint"
+    )
 
     var terminalSelectionPipe = [Int32](repeating: -1, count: 2)
     try expect(pipe(&terminalSelectionPipe) == 0, "selftest should create a non-terminal descriptor")

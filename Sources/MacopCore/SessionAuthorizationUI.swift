@@ -1,0 +1,120 @@
+import AppKit
+import Foundation
+import LocalAuthentication
+
+public struct SessionAuthorizationPresentation: Sendable, Equatable {
+    public let identityLabel: String
+    public let application: String
+    public let verification: String
+    public let fingerprint: String
+    public let sessionID: UUID
+    public let expiresAt: Date
+
+    public init(
+        identityLabel: String,
+        application: String,
+        verification: String,
+        fingerprint: String,
+        sessionID: UUID,
+        expiresAt: Date
+    ) {
+        self.identityLabel = identityLabel
+        self.application = application
+        self.verification = verification
+        self.fingerprint = fingerprint
+        self.sessionID = sessionID
+        self.expiresAt = expiresAt
+    }
+}
+
+public protocol SessionAuthorizationResultPrompting: Sendable {
+    func authorizeResult(
+        _ presentation: SessionAuthorizationPresentation,
+        completion: @escaping @Sendable (SessionAuthorizationResult) -> Void
+    )
+}
+
+/// A successful result owns the same LAContext that must be supplied to
+/// `CTKIdentitySigner`; callers must not replace it with a fresh context.
+public final class SessionAuthorizationResult: @unchecked Sendable {
+    public let approved: Bool
+    public let authenticationContext: LAContext?
+    public init(approved: Bool, authenticationContext: LAContext?) {
+        self.approved = approved
+        self.authenticationContext = authenticationContext
+    }
+}
+
+/// The prompt intentionally describes the boundary: it grants only a registry
+/// session and cannot govern direct use of Apple's PKCS#11 provider.
+public struct LocalAuthenticationSessionPrompt: SessionAuthorizationResultPrompting {
+    public init() {}
+
+    public func authorizeResult(
+        _ presentation: SessionAuthorizationPresentation,
+        completion: @escaping @Sendable (SessionAuthorizationResult) -> Void
+    ) {
+        // The runtime can be entered on the app main thread. Do not enqueue a
+        // MainActor task and then make that same thread wait on its completion.
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                Self.authorizeOnMain(presentation, completion: completion)
+            }
+            return
+        }
+        Task { @MainActor in
+            Self.authorizeOnMain(presentation, completion: completion)
+        }
+    }
+
+    @MainActor private static func authorizeOnMain(
+        _ presentation: SessionAuthorizationPresentation,
+        completion: @escaping @Sendable (SessionAuthorizationResult) -> Void
+    ) {
+        guard self.present(presentation) else {
+            completion(SessionAuthorizationResult(approved: false, authenticationContext: nil)); return
+        }
+        let context = AuthenticationContextBox(LAContext())
+        let expiry = ISO8601DateFormatter().string(from: presentation.expiresAt)
+        let reason = "Identity: \(presentation.identityLabel); application: \(presentation.application); "
+            + "verification: \(presentation.verification); key: \(presentation.fingerprint); "
+            + "session: \(presentation.sessionID.uuidString); expiry: \(expiry). "
+            + "Apple provider use outside macop-agent is not controlled."
+        context.value.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, _ in
+            completion(SessionAuthorizationResult(
+                approved: success, authenticationContext: success ? context.value : nil
+            ))
+        }
+    }
+
+    @MainActor private static func present(_ presentation: SessionAuthorizationPresentation) -> Bool {
+        let body = """
+        Identity: \(presentation.identityLabel)
+        Application: \(presentation.application)
+        Verification: \(presentation.verification)
+        Key: \(presentation.fingerprint)
+        Session: \(presentation.sessionID.uuidString)
+        Expires: \(ISO8601DateFormatter().string(from: presentation.expiresAt))
+
+        This authorization applies only through macop-agent. Direct Apple provider use is not controlled.
+        """
+        var approved = false
+        let show = {
+            let alert = NSAlert()
+            alert.messageText = "Authorize verified SSH session"
+            alert.informativeText = body
+            alert.addButton(withTitle: "Continue with Touch ID")
+            alert.addButton(withTitle: "Cancel")
+            approved = alert.runModal() == .alertFirstButtonReturn
+        }
+        show()
+        return approved
+    }
+}
+
+private final class AuthenticationContextBox: @unchecked Sendable {
+    let value: LAContext
+    init(_ value: LAContext) {
+        self.value = value
+    }
+}

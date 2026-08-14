@@ -1,6 +1,10 @@
+import Darwin
+
 // swiftlint:disable file_length
 import Dispatch
 import Foundation
+import LocalAuthentication
+import Security
 
 /// The small command boundary used by the Apple SSH wrapper.  Keeping it
 /// injectable lets tests assert argv without invoking CTK or creating keys.
@@ -57,6 +61,18 @@ private final class BoundedCommandCapture: @unchecked Sendable {
 }
 
 public enum SSHCommand {
+    public struct VerifiedSessionIdentity: Sendable {
+        public let fingerprint: String
+        fileprivate let label: String
+        fileprivate let publicKeyBlob: Data
+
+        public init(fingerprint: String, label: String, publicKeyBlob: Data) {
+            self.fingerprint = fingerprint
+            self.label = label
+            self.publicKeyBlob = publicKeyBlob
+        }
+    }
+
     public static let scAuth = "/usr/sbin/sc_auth"
     public static let sshKeygen = "/usr/bin/ssh-keygen"
     public static let ssh = "/usr/bin/ssh"
@@ -85,10 +101,7 @@ public enum SSHCommand {
         case "delete": return try self.delete(Array(args.dropFirst()), options: options, context: context)
         case "test": return try self.test(Array(args.dropFirst()), options: options, context: context)
         case "run": return try self.runWrapped(Array(args.dropFirst()), context: context)
-        case "agent": throw CLIError.unsupportedCommand(
-                command: "ssh agent",
-                reason: "Verified-session agent is not implemented by this wrapper build."
-            )
+        case "agent": return try self.agent(Array(args.dropFirst()), context: context)
         default: throw CLIError.invalidArguments(message: "Unknown ssh subcommand: \(subcommand)")
         }
     }
@@ -100,13 +113,14 @@ public enum SSHCommand {
         stdout: @escaping @Sendable (Data) -> Void, stderr: @escaping @Sendable (Data) -> Void
     ) throws -> Int32? {
         guard let streaming = executor as? any SSHStreamingExecuting,
-              let subcommand = args.first, subcommand == "test" || subcommand == "run"
+              let subcommand = args.first, subcommand == "test" || subcommand == "run" || subcommand == "agent"
         else { return nil }
         let context = SSHContext(env: env, executor: executor)
         let invocation: SSHInvocation
         switch subcommand {
         case "test": invocation = try testInvocation(Array(args.dropFirst()), context: context)
         case "run": invocation = try runInvocation(Array(args.dropFirst()), context: context)
+        case "agent": invocation = try agentInvocation(Array(args.dropFirst()), context: context)
         default: return nil
         }
         let capture = BoundedCommandCapture(limit: 65536)
@@ -124,14 +138,16 @@ public enum SSHCommand {
         args: [String], env: [String: String], executor: CommandExecutor
     ) throws -> Int32? {
         guard executor is SystemCommandExecutor, let subcommand = args.first,
-              subcommand == "test" || subcommand == "run"
+              subcommand == "test" || subcommand == "run" || subcommand == "agent"
         else {
             return nil
         }
         let context = SSHContext(env: env, executor: executor)
         let invocation = try subcommand == "test"
             ? self.testInvocation(Array(args.dropFirst()), context: context)
-            : self.runInvocation(Array(args.dropFirst()), context: context)
+            : subcommand == "run"
+            ? self.runInvocation(Array(args.dropFirst()), context: context)
+            : self.agentInvocation(Array(args.dropFirst()), context: context)
         let capture = BoundedCommandCapture(limit: 65536)
         let observer: (@Sendable (Data) -> Void)? = if subcommand == "test" {
             { @Sendable data in capture.append(data) }
@@ -151,9 +167,130 @@ public enum SSHCommand {
     public static func validateIdentityTable(_ output: String) throws {
         _ = try self.parseIdentities(output)
     }
+
+    /// Selects one CTK identity without exporting private material.  The label
+    /// is resolved through `sc_auth`; its application-label hash and the SSH
+    /// public blob must agree in the Keychain query performed by the signer.
+    public static func makeVerifiedSessionSigner(
+        label: String,
+        env: [String: String] = ProcessInfo.processInfo.environment,
+        executor: CommandExecutor = SystemCommandExecutor(),
+        authenticationContext: LAContext? = nil
+    ) throws -> CTKIdentitySigner {
+        let selected = try self.verifiedSessionIdentity(label: label, env: env, executor: executor)
+        do {
+            return try CTKIdentitySigner(
+                identityLabel: selected.label,
+                expectedPublicKeyBlob: selected.publicKeyBlob,
+                authenticationContext: authenticationContext
+            )
+        } catch {
+            throw CLIError.providerUnavailable(
+                provider: "CryptoTokenKit",
+                reason: "Could not construct a signer for the selected public identity."
+            )
+        }
+    }
+
+    /// Resolves only public identity metadata. This is safe to do before a
+    /// child is launched and lets the authorization UI display the exact key.
+    public static func verifiedSessionIdentity(
+        label: String,
+        env: [String: String] = ProcessInfo.processInfo.environment,
+        executor: CommandExecutor = SystemCommandExecutor()
+    ) throws -> VerifiedSessionIdentity {
+        let context = SSHContext(env: env, executor: executor)
+        let identity = try self.identity(label, context: context)
+        guard let hash = identity.hash else {
+            throw CLIError.providerUnavailable(
+                provider: "CryptoTokenKit",
+                reason: "Selected identity has no SHA-1 public-key hash."
+            )
+        }
+        let candidates = try self.providerKeys(context: context.restricted(to: hash))
+        guard candidates.count == 1,
+              let line = candidates.first?.line,
+              let blob = Self.sshBlob(fromPublicLine: line)
+        else {
+            throw CLIError.providerUnavailable(
+                provider: "ssh-keychain",
+                reason: "The selected CTK identity must expose exactly one SSH public key with the matching label."
+            )
+        }
+        return VerifiedSessionIdentity(
+            fingerprint: sshFingerprint(for: blob), label: label, publicKeyBlob: blob
+        )
+    }
 }
 
 private extension SSHCommand {
+    private static func agent(_ args: [String], context: SSHContext) throws -> CommandResult {
+        let invocation = try self.agentInvocation(args, context: context)
+        return try context.executor.execute(
+            path: invocation.path,
+            arguments: invocation.arguments,
+            environment: invocation.environment
+        )
+    }
+
+    private static func agentInvocation(_ args: [String], context: SSHContext) throws -> SSHInvocation {
+        guard let mode = args.first, mode == "shell" || mode == "application" else {
+            throw CLIError.invalidArguments(
+                message: "Usage: macop ssh agent shell <identity-label> -- <program> [arguments...] | "
+                    + "macop ssh agent application <identity-label> <application-path>"
+            )
+        }
+        if mode == "shell" {
+            guard args.count >= 4, args[2] == "--" else {
+                throw CLIError
+                    .invalidArguments(
+                        message: "Usage: macop ssh agent shell <identity-label> -- <program> [arguments...]"
+                    )
+            }
+        } else {
+            guard args.count == 3 else {
+                throw CLIError
+                    .invalidArguments(message: "Usage: macop ssh agent application <identity-label> <application-path>")
+            }
+        }
+        let executable = try self.resolveAgentExecutable()
+        return SSHInvocation(path: executable, arguments: args, environment: context.env)
+    }
+
+    private static func resolveAgentExecutable() throws -> String {
+        // CommandLine.arguments[0] is caller-controlled and can be merely
+        // "macop" when invoked through PATH. Resolve the running image instead.
+        var byteCount: UInt32 = 0
+        _ = _NSGetExecutablePath(nil, &byteCount)
+        guard byteCount > 0 else {
+            throw CLIError.notFound(message: "Could not resolve the running macop executable.")
+        }
+        let path = UnsafeMutablePointer<CChar>.allocate(capacity: Int(byteCount))
+        defer { path.deallocate() }
+        guard _NSGetExecutablePath(path, &byteCount) == 0 else {
+            throw CLIError.notFound(message: "Could not resolve the running macop executable.")
+        }
+        let executable = URL(fileURLWithPath: String(cString: path)).resolvingSymlinksInPath()
+            .deletingLastPathComponent().appendingPathComponent("macop-agent").path
+        var details = stat()
+        guard lstat(executable, &details) == 0,
+              details.st_mode & S_IFMT == S_IFREG,
+              details.st_uid == getuid(),
+              details.st_mode & 0o022 == 0,
+              FileManager.default.isExecutableFile(atPath: executable)
+        else { throw CLIError.notFound(message: "macop-agent is missing or unsafe beside macop.") }
+        var staticCode: SecStaticCode?
+        var expected: SecRequirement?
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: executable) as CFURL, [], &staticCode) == errSecSuccess,
+              let staticCode,
+              SecRequirementCreateWithString("identifier \"macop-agent\"" as CFString, [], &expected) == errSecSuccess,
+              let expected,
+              SecStaticCodeCheckValidity(staticCode, SecCSFlags(rawValue: kSecCSStrictValidate), expected) ==
+              errSecSuccess
+        else { throw CLIError.notFound(message: "macop-agent is missing or unsafe beside macop.") }
+        return executable
+    }
+
     private static func create(
         _ args: [String],
         options: GlobalOptions,
@@ -462,6 +599,12 @@ private extension SSHCommand {
 
     private static func isSHA1Hash(_ value: String) -> Bool {
         value.range(of: "^[0-9A-Fa-f]{40}$", options: .regularExpression) != nil
+    }
+
+    private static func sshBlob(fromPublicLine line: String) -> Data? {
+        let fields = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+        guard fields.count >= 2 else { return nil }
+        return Data(base64Encoded: String(fields[1]))
     }
 
     private static func resolveExecutable(_ command: String, environment: CommandEnvironment) throws -> String {

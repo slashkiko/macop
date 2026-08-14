@@ -3,7 +3,7 @@
 Status: Draft
 Last updated: 2026-08-14
 
-> **Phase 0 update (2026-08-14):** CTK identityをApple純正`ssh-keychain.dylib`から直接利用できるため、「macop-agentだけが署名できる」という排他性は不採用とする。共用socketから元applicationを推定する方式も採用しない。一方、Phase 0bでapplication別の短命socket、起動PID・code identity・session nonce・process ancestry、OpenSSH session bindingを組み合わせるverified-session agentが条件付きで成立することを実機確認した。Section 9.3–9.4と[feasibility report](./macop-phase0-feasibility-2026-08-14.md)が、本文中の競合する旧記述より優先する。
+> **Phase 0 update (2026-08-14):** CTK identityをApple純正`ssh-keychain.dylib`から直接利用できるため、「macop-agentだけが署名できる」という排他性は不採用とする。共用socketから元applicationを推定する方式も採用しない。一方、Phase 0bでapplication別の短命socket、起動PID・code identity・process ancestry、OpenSSH session bindingを組み合わせるverified-session agentが条件付きで成立することを実機確認した。nonceはrootから観測できる証拠ではなく、launcher/registry内のopaque reservation capabilityに限定する。Section 9.3–9.4と[feasibility report](./macop-phase0-feasibility-2026-08-14.md)が、本文中の競合する旧記述より優先する。
 
 ## 1. 概要
 
@@ -202,7 +202,7 @@ op://$APP_ENV/GitHub/token
 }
 ```
 
-設定ファイルは`~/Library/Application Support/macop/config.json`に置き、所有者だけが読めるpermissionにする。設定ファイルにはsecretそのものを保存しない。`macop config init`と`macop config validate`はこの非機密設定だけを作成・検証し、Keychain itemの作成はしない。
+設定ファイルは`~/Library/Application Support/macop/config.json`に置く。親directoryはcurrent user所有の`0700`、fileはcurrent user所有の`0600`を厳密に要求し、これ以外のownerまたはmodeは読み込み時に拒否する。設定ファイルにはsecretそのものを保存しない。`macop config init`と`macop config validate`はこの非機密設定だけを作成・検証し、Keychain itemの作成はしない。
 
 referenceの各path segmentはpercent decodeする。`$NAME`はreference解決前に現在の環境変数から展開できる。未定義変数、循環参照、query parameter（`?attribute=otp`、`?ssh-format=openssh`など）は構文または未対応エラーにする。
 
@@ -327,7 +327,7 @@ macop ssh delete github
 
 `macop`が設定へ保存するのはidentity label、公開鍵、公開鍵ハッシュなどの非機密metadataだけであり、secret値やprivate keyは保存しない。`run`と`test`はApple純正`ssh`へ対象identityと`PKCS11Provider=/usr/lib/ssh-keychain.dylib`を指定し、同時に`ForwardAgent=no`を明示する。`create`は`p-256-ne -t bio`を標準にする。
 
-`macop ssh agent ...`の公開CLI予定は削除しない。Phase 4ではprovider wrapperとverified-session agentを内部的に分離し、既存のApple純正`op`互換commandと公開CLI契約には影響させない。
+verified-session agentは`macop ssh agent shell <identity-label> -- <program> [arguments...]`と`macop ssh agent application <identity-label> <application-path>`で起動する。いずれも新規に起動した協調rootだけを対象とし、既存application、外部relay、実CTK/Touch ID/GitHub/Sourcetree/TerminalのE2E互換性は保証しない。Phase 4ではprovider wrapperとverified-session agentを内部的に分離し、既存のApple純正`op`互換commandには影響させない。
 
 ### 9.3 Phase 0で確定した限界
 
@@ -343,15 +343,15 @@ macop ssh delete github
 Phase 4は二つの経路を提供する。
 
 1. **Apple provider wrapper:** 秘密鍵fileなし、non-exportable private key、Touch ID、既存`macop ssh run/test`を提供する。Apple providerからの直接利用も可能であり、macopのapplication別承認は適用されない。
-2. **verified-session agent:** macopがapplicationまたはshell sessionごとに短命なproxy socketを発行する。共用のstable `SSH_AUTH_SOCK`は公開しない。sessionをroot PID・process開始時刻・bundle ID・code requirement・nonce・鍵fingerprint・期限へ結び付け、直接peerが登録rootまたは生存中の子孫であることを毎接続時に確認する。
+2. **verified-session agent:** macopがapplicationまたはshell sessionごとに短命なproxy socketを発行する。共用のstable `SSH_AUTH_SOCK`は公開しない。sessionをroot PID・process開始時刻・bundle ID・code requirement・鍵fingerprint・期限へ結び付け、直接peerが登録rootまたは生存中の子孫であることを毎接続時に確認する。nonceはrootへ渡さず、launcherとregistryが同一reservationを取り違えないためだけに保持する。
 
-verified modeでは、有効なOpenSSH session bindingが署名要求より前に届くことを必須にし、`forwarding=1`、bindingなし、外部relay、終了済みroot sessionをfail closedで拒否する。承認画面にはapplication、検証状態、鍵名とfingerprint、対象session、期限を表示し、「macop-agent経由だけに適用され、Apple providerからの直接利用は制御しない」と明記する。
+verified modeでは、有効なOpenSSH session bindingが署名要求より前に届くことを必須にし、`forwarding=1`、bindingなし、外部relay、終了済みroot sessionをfail closedで拒否する。承認画面にはapplication、簡潔な `verified (code requirement matched)` 状態、鍵名とfingerprint、対象session、期限を表示し、生のcode requirementは表示しない。「macop-agent経由だけに適用され、Apple providerからの直接利用は制御しない」と明記する。host bindingで受け入れるhost keyは`ssh-ed25519`と`ecdsa-sha2-nistp256`だけとし、RSAとhost certificateは互換fallbackなしで拒否する。
 
-Phase 0bでは、最小`.app`を`NSWorkspace.OpenConfiguration`から起動して専用`SSH_AUTH_SOCK`とnonceを渡し、launcherの起動PIDとsocket peer PID、bundle ID、nonceが一致することを確認した。process ancestry試験では正規の子processを許可し、socket pathを知る外部processとroot終了後の孤児processを拒否した。Sourcetree固有の挙動、Terminalタブ単位integration、実CTK identityでのTouch ID / GitHub E2EはPhase 4の未完了項目とする。
+Phase 0bでは、最小`.app`を`NSWorkspace.OpenConfiguration`から起動して専用`SSH_AUTH_SOCK`とnonce環境変数を渡し、launcherの起動PIDとsocket peer PID、bundle ID、および協調probeが自己申告したnonceが一致することを確認した。このnonce一致はproduction rootをagent側から認証した証拠ではない。macOSでは同一UIDでも`KERN_PROCARGS2`による他process環境の取得が許可されないため、productionではnonceを子processへ渡さず、rootから再観測して照合する設計も採用しない。process ancestry試験では正規の子processを許可し、socket pathを知る外部processとroot終了後の孤児processを拒否した。Sourcetree固有の挙動、Terminalタブ単位integration、実CTK identityでのTouch ID / GitHub E2EはPhase 4の未完了項目とする。
 
 この設計でも、登録application自体の侵害、process injection、登録process tree内の悪意あるrelayは防御境界外である。「macopだけが署名できる」「任意の既存applicationを事後に認証できる」とは主張しない。
 
-session nonceとsocket pathは相関情報であり、それらの秘匿性だけを認証境界にしない。同一userが値を観測する可能性を前提に、process identityとcode identityの検証を併用する。
+nonceはlauncher/registryが保持するreservation相関情報であり、rootの認証材料ではない。socket pathの秘匿性だけも認証境界にしない。process identityとcode identityの検証を併用する。
 
 詳細な実機結果は[Phase 0 feasibility report](./macop-phase0-feasibility-2026-08-14.md)を参照する。
 
@@ -496,7 +496,7 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - `macop ssh run/test`が起動するApple純正SSHでは`ForwardAgent=no`を明示する。
 - 共用のstable `SSH_AUTH_SOCK`を公開しない。
 - application名はmacopが作成したverified sessionの登録情報から表示し、接続後の親process推定だけでは決定しない。
-- verified modeはroot PID・開始時刻・code identity・session nonce・鍵fingerprintへ承認を結び付ける。
+- verified modeはroot PID・開始時刻・code identity・鍵fingerprint・期限へ承認を結び付ける。nonceはlauncher/registry内の予約相関だけに使う。
 - verified modeは有効なOpenSSH session bindingを必須にし、`forwarding=1`とbindingなしを拒否する。
 - 登録applicationの侵害、process injection、登録process tree内の悪意あるrelayを防げるとは主張しない。
 - Apple純正providerを含む同一user session内の別processからCTK identity利用を排他的に禁止できるとは主張しない。
@@ -512,7 +512,7 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - 2026-08-14にPhase 0a / 0bを完了した
 - Apple純正`ssh-keychain.dylib`がCTK identityを直接署名へ使えるため、`macop-agent`だけを署名processにする排他性は成立しない
 - 共用socketではrelayより前の元clientを識別できないため、stable socket案は不採用とした
-- application別の専用socketでは、起動PID・peer PID・bundle ID・session nonceの一致、外部relayと終了済みsessionの拒否を確認した
+- Phase 0 spikeのapplication別専用socketでは、起動PID・peer PID・bundle IDと協調probeが自己申告したnonceの一致、外部relayと終了済みsessionの拒否を確認した。nonce自己申告はproductionのroot認証証拠にせず、productionではlauncher/registry内部の予約相関に限定した
 - Apple OpenSSH 10.2のsession bindingでAgent Forwardingを`forwarding=1`として検出できた
 - verified-session agentを条件付きGoとした。Sourcetree、Terminalタブ、実CTK identity / Touch ID / GitHub E2Eは未検証
 - 詳細は[Phase 0 feasibility report](./macop-phase0-feasibility-2026-08-14.md)を参照する

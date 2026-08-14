@@ -7,7 +7,7 @@
 
 元設計の「Secure Enclave署名を実行できるprocessは`macop-agent`だけ」という排他性は成立しない。Apple純正`ssh-keychain.dylib`から同じCTK identityへ到達できるためである。この迂回は許容し、macopの保証を「macop-agent経由の要求に対するapplication別承認」へ限定する。
 
-共用のstable `SSH_AUTH_SOCK`から元applicationを推定する方式も採用しない。一方、Phase 0bの実機spikeにより、macopが新規起動したapplicationへセッション専用socketを渡し、起動PID・bundle identity・session nonce・process ancestryを検証する方式は成立する見込みを得た。外部relayと終了済みsessionは拒否でき、Apple OpenSSH 10.2はAgent Forwardingを`session-bind@openssh.com`の`forwarding=1`としてagentへ通知した。
+共用のstable `SSH_AUTH_SOCK`から元applicationを推定する方式も採用しない。一方、Phase 0bの実機spikeにより、macopが新規起動したapplicationへセッション専用socketを渡し、起動PID・bundle identity・process ancestryを検証する方式は成立する見込みを得た。外部relayと終了済みsessionは拒否でき、Apple OpenSSH 10.2はAgent Forwardingを`session-bind@openssh.com`の`forwarding=1`としてagentへ通知した。
 
 したがってPhase 4は、Apple provider wrapperに加えて、**verified-session agentを条件付きで採用する**。ただし強い承認UXを提供するのはmacopが検証済みsessionを作れるapplicationに限り、共用socket、既存起動済みapplication、非協調SSH clientを同等に扱わない。
 
@@ -57,16 +57,16 @@ origin_pid=29499 relay_pid=29498 agent_observed_pid=29498
 - 推測困難なsession nonceを模した環境変数
 - `createsNewApplicationInstance = true`
 
-launcherが取得した`NSRunningApplication.processIdentifier`と、socket接続中に`LOCAL_PEERPID`で取得した直接peer PIDは一致した。bundle IDとsession nonceも一致した。
+launcherが取得した`NSRunningApplication.processIdentifier`と、socket接続中に`LOCAL_PEERPID`で取得した直接peer PIDは一致した。bundle IDと、協調probe applicationが自身の環境から読み取って返したsession nonceも一致した。
 
 ```text
 launched_pid=56818 peer_pid=56818 pid_match=yes
 bundle=local.macop.phase0b.probe token_match=yes
 ```
 
-これにより、「macopが作ったsessionへ紐付くapplication」という表示は可能である。任意の既存applicationを事後に識別したという意味ではない。
+これにより、「macopが作ったsessionへ紐付くapplication」という表示は可能である。任意の既存applicationを事後に識別したという意味ではない。また、`token_match=yes`は協調probeによる自己申告であり、production rootをagent側から認証した証拠ではない。
 
-session nonceはsession相関と取り違え防止に使うが、環境変数の秘匿性だけを認証境界にしない。同一userによる値の観測を想定し、root PID・開始時刻・process ancestry・code identityとの一致を必須にする。
+production実装で同一UID processの環境をagent側から再観測する一次APIとして検討した`KERN_PROCARGS2`は、macOS 26.5.2で`Operation not permitted`となった。sandbox / privacy policyで変動し得る非公開的な取得経路やrootの自己申告を認証に使わず、productionではnonceを子processへ渡さない。nonceはlauncherとregistryが同一reservationを取り違えないための内部opaque capabilityとしてだけ保持する。rootの認証はPID・開始時刻・process ancestry・live code identityで行う。
 
 ### 2. process ancestryと外部relay拒否
 
@@ -104,14 +104,14 @@ verified modeでは、署名要求より前の有効なsession bindingを必須�
 ### verified-session agent
 
 - 共用のstable `SSH_AUTH_SOCK`は公開しない。
-- macopがapplicationまたはshell sessionごとに短命なproxy socketとsession nonceを作る。
+- macopがapplicationまたはshell sessionごとに短命なproxy socketを作る。nonceはlauncher/registry内のopaque reservation capabilityとしてのみ作る。
 - sessionはroot PID・開始時刻・bundle ID・code requirement・鍵fingerprint・期限へ結び付ける。
 - proxyは直接peerが登録rootまたは生存中の子孫であることを毎接続時に確認する。
 - agentは署名前にOpenSSH session bindingを検証し、`forwarding=1`またはbindingなしを拒否する。
 - 承認画面にはapplication、検証状態、鍵名とfingerprint、対象session、期限を表示する。
 - 画面には「この承認はmacop-agent経由だけに適用され、Apple providerからの直接利用は制御しない」と明記する。
 - cache keyに少なくともsession ID、root PIDと開始時刻、code identity、鍵fingerprintを含める。
-- session nonce単独、socket pathのランダム性単独を接続元認証として扱わない。
+- nonceとsocket pathのランダム性を接続元認証として扱わない。nonceはroot環境へ渡さず、rootから観測もしない。
 
 ## 未検証事項とPhase 4開始条件
 

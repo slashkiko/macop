@@ -1,8 +1,399 @@
+import AppKit
+import Darwin
 import Foundation
+import MacopCore
+import MacopPTY
+import Security
 
-FileHandle.standardError.write(Data("macop-agent: not implemented yet\n".utf8))
-exit(ExitCode.unsupported.rawValue)
+private let usage = """
+Usage:
+  macop-agent shell <identity-label> -- <program> [arguments...]
+  macop-agent application <identity-label> <application-path>
 
-private enum ExitCode: Int32 {
-    case unsupported = 3
+Each invocation creates one private, short-lived SSH_AUTH_SOCK. It never
+publishes a shared agent socket. The launched root and its descendants alone
+may use it until the root exits or the session expires.
+"""
+
+private func withDebug(_ initial: CommandResult) -> CommandResult {
+    guard ProcessInfo.processInfo.environment["MACOP_AGENT_DEBUG"] == "1" else { return initial }
+    let isJSON = ProcessInfo.processInfo.environment["MACOP_AGENT_FORMAT"] == "json"
+    if isJSON, let rendered = jsonDebug(initial) {
+        return rendered
+    }
+    if !isJSON {
+        return CommandResult(
+            exitCode: initial.exitCode,
+            stdout: initial.stdout,
+            stderr: initial.stderr + "macop: debug exit_code=\(initial.exitCode) command=ssh\n"
+        )
+    }
+    return initial
+}
+
+private func jsonDebug(_ result: CommandResult) -> CommandResult? {
+    guard var payload = (try? JSONSerialization.jsonObject(with: Data(result.stderr.utf8))) as? [String: Any],
+          var error = payload["error"] as? [String: Any]
+    else { return nil }
+    error["debug"] = ["exit_code": result.exitCode, "context": "command=ssh-agent"]
+    payload["error"] = error
+    guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+          let stderr = String(data: data, encoding: .utf8)
+    else { return nil }
+    return CommandResult(exitCode: result.exitCode, stderr: stderr + "\n")
+}
+
+private func debugSuccess(_ exitCode: Int32) {
+    guard ProcessInfo.processInfo.environment["MACOP_AGENT_DEBUG"] == "1",
+          ProcessInfo.processInfo.environment["MACOP_AGENT_FORMAT"] != "json"
+    else { return }
+    FileHandle.standardError.write(Data("macop: debug exit_code=\(exitCode) command=ssh\n".utf8))
+}
+
+private func fail(_ message: String, _ code: Int32 = ExitCode.invalidArguments.rawValue) -> Never {
+    let format: OutputFormat = ProcessInfo.processInfo
+        .environment["MACOP_AGENT_FORMAT"] == "json" ? .json : .humanReadable
+    let error: CLIError = code == ExitCode.invalidArguments.rawValue
+        ? .invalidArguments(message: message)
+        : code == ExitCode.providerUnavailable.rawValue
+        ? .providerUnavailable(provider: "CryptoTokenKit", reason: message)
+        : code == ExitCode.notFound.rawValue ? .notFound(message: message) : .denied(message: message)
+    let result = withDebug(ErrorRenderer.render(error: error, format: format))
+    FileHandle.standardError.write(Data(result.stderr.utf8)); exit(result.exitCode)
+}
+
+private func rootDirectory() -> URL {
+    // sockaddr_un allows only 104 path bytes on Darwin. FileManager's per-user
+    // temporary directory is often already too long once the UUID subdirectory
+    // and socket name are appended, so use the short system tmp namespace.
+    URL(fileURLWithPath: "/tmp/macop-agent-\(getuid())", isDirectory: true)
+}
+
+private func environment(for reservation: VerifiedSessionReservation) -> [String: String] {
+    ProcessInfo.processInfo.environment.merging(VerifiedSessionLauncher.environment(for: reservation)) { _, new in new }
+}
+
+private func hasInteractiveTerminal() -> Bool {
+    isatty(STDIN_FILENO) == 1 && isatty(STDOUT_FILENO) == 1
+}
+
+private final class SignalCoordinator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pendingSignal: Int32?
+    private var cleanupComplete = false
+    private var owned: OwnedProcess?
+    private var signalDescendants: [Int32: UInt64] = [:]
+    private var rootWaitActive = false
+    private let signalPipe: Int32
+    private let gracefulShutdownNanoseconds: UInt64
+
+    init(gracefulShutdownNanoseconds: UInt64 = 2_000_000_000) {
+        self.gracefulShutdownNanoseconds = gracefulShutdownNanoseconds
+        self.signalPipe = macop_signal_pipe_install()
+        precondition(self.signalPipe >= 0, "unable to install agent signal pipe")
+    }
+
+    deinit {
+        macop_signal_pipe_restore()
+    }
+
+    func installOwned(_ owned: OwnedProcess) {
+        self.drainSignalPipe()
+        self.lock.lock(); self.owned = owned; let pending = self.pendingSignal; self.lock.unlock()
+        if let pending {
+            self.forward(pending, owned: owned)
+        }
+    }
+
+    var exitStatus: Int32? {
+        self.drainSignalPipe()
+        self.lock.lock(); defer { self.lock.unlock() }
+        return self.cleanupComplete ? self.pendingSignal.map { 128 + $0 } : nil
+    }
+
+    var requestedExitStatus: Int32? {
+        self.drainSignalPipe()
+        self.lock.lock(); defer { self.lock.unlock() }
+        return self.pendingSignal.map { 128 + $0 }
+    }
+
+    func isCancellationRequested() -> Bool {
+        self.drainSignalPipe()
+        self.lock.lock(); defer { self.lock.unlock() }
+        return self.pendingSignal != nil
+    }
+
+    func beginRootWait() {
+        self.lock.lock(); self.rootWaitActive = true; self.lock.unlock()
+    }
+
+    func endRootWait() {
+        self.lock.lock(); self.rootWaitActive = false; self.lock.unlock()
+    }
+
+    /// Called by the runtime defer or main return path. This is deliberately
+    /// the sole synchronous cleanup/reap owner; Dispatch signal handlers only
+    /// latch and forward, so they never race a foreground waitpid.
+    func finalizeSignalCleanupIfNeeded() {
+        self.lock.lock()
+        let signalRequested = self.pendingSignal != nil
+        let value = self.owned
+        let descendants = self.signalDescendants
+        let complete = self.cleanupComplete
+        let rootWaitActive = self.rootWaitActive
+        self.lock.unlock()
+        guard signalRequested, !complete else { return }
+        if let value {
+            terminateOwnedRoot(
+                value,
+                additionalDescendants: descendants,
+                reapRoot: !rootWaitActive,
+                gracefulShutdownNanoseconds: self.gracefulShutdownNanoseconds
+            )
+        }
+        self.lock.lock(); self.cleanupComplete = true; self.lock.unlock()
+    }
+
+    func cancelLaunch(_ owned: OwnedProcess) {
+        if self.isCancellationRequested() {
+            self.finalizeSignalCleanupIfNeeded()
+        } else {
+            terminateOwnedRoot(owned)
+        }
+    }
+
+    private func drainSignalPipe() {
+        var values = [UInt8](repeating: 0, count: 32)
+        while true {
+            let count = values.withUnsafeMutableBytes { buffer in
+                Darwin.read(self.signalPipe, buffer.baseAddress, buffer.count)
+            }
+            guard count > 0 else { return }
+            for value in values.prefix(Int(count)) {
+                self.receive(Int32(value))
+            }
+        }
+    }
+
+    private func receive(_ number: Int32) {
+        self.lock.lock()
+        if self.pendingSignal == nil {
+            self.pendingSignal = number
+        }
+        let value = self.owned
+        self.lock.unlock()
+        if let value {
+            self.forward(number, owned: value)
+        }
+    }
+
+    private func forward(_ signal: Int32, owned: OwnedProcess) {
+        let descendants = captureDescendants(for: owned)
+        self.lock.lock()
+        self.signalDescendants.merge(descendants) { current, _ in current }
+        let merged = self.signalDescendants
+        self.lock.unlock()
+        forwardSignal(signal, owned: owned, descendants: merged)
+    }
+}
+
+private func runSignalFixture() -> Int32 {
+    let signals = SignalCoordinator(gracefulShutdownNanoseconds: 100_000_000)
+    let path = ProcessInfo.processInfo.environment["MACOP_AGENT_SIGNAL_CHILD_FILE"] ?? "/dev/null"
+    do {
+        let script = "(trap '' TERM INT; exec /bin/sleep 1000) & echo $! > '\(path)'; while :; do sleep 1; done"
+        let pid = try spawn(["/bin/sh", "-c", script], environment: ProcessInfo.processInfo.environment,
+                            isolatedProcessGroup: true)
+        let owned = try capture(pid, mode: "shell")
+        signals.installOwned(owned)
+        signals.beginRootWait()
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = try? waitForShellExit(pid) { signals.isCancellationRequested() }
+            signals.endRootWait()
+        }
+        while signals.exitStatus == nil {
+            signals.finalizeSignalCleanupIfNeeded()
+            usleep(20000)
+        }
+        return signals.exitStatus!
+    } catch {
+        return signals.requestedExitStatus ?? ExitCode.denied.rawValue
+    }
+}
+
+private func runApplicationSignalFixture() -> Int32 {
+    let signals = SignalCoordinator(gracefulShutdownNanoseconds: 100_000_000)
+    let path = ProcessInfo.processInfo.environment["MACOP_AGENT_SIGNAL_CHILD_FILE"] ?? "/dev/null"
+    do {
+        let script = "(trap '' TERM INT; exec /bin/sleep 1000) & echo $! > '\(path)'; while :; do sleep 1; done"
+        let pid = try spawn(["/bin/sh", "-c", script], environment: ProcessInfo.processInfo.environment,
+                            isolatedProcessGroup: true)
+        let owned = try capture(pid, mode: "application")
+        signals.installOwned(owned)
+        signals.beginRootWait()
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = try? waitForApplicationExit(owned) { signals.isCancellationRequested() }
+            signals.endRootWait()
+        }
+        while signals.exitStatus == nil {
+            signals.finalizeSignalCleanupIfNeeded()
+            usleep(20000)
+        }
+        return signals.exitStatus!
+    } catch {
+        return signals.requestedExitStatus ?? ExitCode.denied.rawValue
+    }
+}
+
+private func identity(for pid: Int32) throws -> (bundleID: String, requirement: String) {
+    var code: SecCode?
+    guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid: pid] as CFDictionary, [], &code) == errSecSuccess,
+          let code else { throw AgentProtocolError.denied }
+    var staticCode: SecStaticCode?
+    guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+          let staticCode else { throw AgentProtocolError.denied }
+    var info: CFDictionary?
+    guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSRequirementInformation), &info) ==
+        errSecSuccess,
+        let values = info as? [CFString: Any], let bundleID = values[kSecCodeInfoIdentifier] as? String,
+        !bundleID.isEmpty
+    else { throw AgentProtocolError.denied }
+    var requirementRef: SecRequirement?; var requirementText: CFString?
+    guard SecCodeCopyDesignatedRequirement(staticCode, [], &requirementRef) == errSecSuccess,
+          let requirementRef,
+          SecRequirementCopyString(requirementRef, [], &requirementText) == errSecSuccess,
+          let requirement = requirementText as String?
+    else { throw AgentProtocolError.denied }
+    var expected: SecRequirement?
+    guard SecRequirementCreateWithString(requirement as CFString, [], &expected) == errSecSuccess,
+          let expected,
+          SecStaticCodeCheckValidity(staticCode, SecCSFlags(rawValue: kSecCSStrictValidate), expected) == errSecSuccess
+    else { throw AgentProtocolError.denied }
+    return (bundleID, requirement)
+}
+
+private func run(mode: String, label: String, target: [String], signals: SignalCoordinator) throws -> Int32 {
+    let registry = try SessionRegistry(root: rootDirectory())
+    let dependencies = VerifiedSessionRuntimeDependencies(
+        selectIdentity: { try SSHCommand.verifiedSessionIdentity(label: $0) },
+        launch: { reservation in
+            let owned: OwnedProcess
+            if mode == "shell" {
+                let isolatedProcessGroup = !hasInteractiveTerminal()
+                let pid = try spawn(
+                    target, environment: environment(for: reservation), isolatedProcessGroup: isolatedProcessGroup
+                )
+                // Capture the start time and group before any operation that
+                // could fail. Never re-read ownership in a deferred cleanup:
+                // a recycled PID must not be signalled.
+                do {
+                    owned = try capture(pid, mode: mode)
+                } catch {
+                    abandon(pid, mode: mode, isolated: isolatedProcessGroup)
+                    throw error
+                }
+            } else if mode == "application" {
+                let application = try launchApplication(target[0], environment: environment(for: reservation))
+                do {
+                    owned = try capture(application.processIdentifier, mode: mode, app: application)
+                } catch {
+                    abandon(application.processIdentifier, mode: mode, app: application)
+                    throw error
+                }
+            } else {
+                throw AgentProtocolError.denied
+            }
+            var established = false
+            signals.installOwned(owned)
+            defer {
+                if !established {
+                    terminateOwnedRoot(owned)
+                }
+            }
+            let code = try identity(for: owned.pid)
+            established = true
+            return VerifiedSessionRuntimeLaunch(
+                request: VerifiedSessionLaunchRequest(rootPID: owned.pid, rootStartTime: owned.startTime,
+                                                      bundleID: code.bundleID, codeRequirement: code.requirement),
+                waitForExit: {
+                    if mode == "shell" {
+                        signals.beginRootWait()
+                        defer { signals.endRootWait() }
+                        return try waitForShellExit(owned.pid) { signals.isCancellationRequested() }
+                    }
+                    signals.beginRootWait()
+                    defer { signals.endRootWait() }
+                    return try waitForApplicationExit(owned) { signals.isCancellationRequested() }
+                },
+                cancel: {
+                    signals.cancelLaunch(owned)
+                }
+            )
+        },
+        activate: { reservation, request in
+            try registry.activate(
+                reservation: reservation,
+                rootPID: request.rootPID,
+                rootStartTime: request.rootStartTime,
+                bundleID: request.bundleID,
+                codeRequirement: request.codeRequirement,
+                inspector: SystemRequesterInspector()
+            )
+        },
+        prompt: LocalAuthenticationSessionPrompt(),
+        makeSigner: { try SSHCommand.makeVerifiedSessionSigner(label: $0, authenticationContext: $1) },
+        makeAgent: { registry, sessionID, connections in
+            VerifiedSessionAgent(registry: registry, sessionID: sessionID, connections: connections)
+        },
+        isCancellationRequested: { signals.isCancellationRequested() }
+    )
+    let status = try VerifiedSessionRuntime(registry: registry, dependencies: dependencies).run(label: label)
+    signals.finalizeSignalCleanupIfNeeded()
+    return signals.exitStatus ?? status
+}
+
+if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_LIFECYCLE_FIXTURES"] == "1" {
+    exit(runLifecycleFixtures() ? ExitCode.success.rawValue : ExitCode.denied.rawValue)
+}
+
+if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_SIGNAL_FIXTURE"] == "1" {
+    exit(runSignalFixture())
+}
+
+if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_APPLICATION_SIGNAL_FIXTURE"] == "1" {
+    exit(runApplicationSignalFixture())
+}
+
+private let signals = SignalCoordinator()
+let args = Array(CommandLine.arguments.dropFirst())
+guard let mode = args.first, args.count >= 3 else { fail(usage) }
+let label = args[1]
+do {
+    switch mode {
+    case "shell":
+        guard let separator = args.firstIndex(of: "--"), separator >= 2, separator + 1 < args.count else { fail(usage) }
+        let status = try run(mode: mode, label: label, target: Array(args[(separator + 1)...]), signals: signals)
+        debugSuccess(status)
+        exit(status)
+    case "application":
+        guard args.count == 3 else { fail(usage) }
+        let status = try run(mode: mode, label: label, target: [args[2]], signals: signals)
+        debugSuccess(status)
+        exit(status)
+    default: fail(usage)
+    }
+} catch {
+    signals.finalizeSignalCleanupIfNeeded()
+    if let status = signals.requestedExitStatus {
+        exit(status)
+    }
+    if let error = error as? CLIError {
+        let result = withDebug(ErrorRenderer.render(
+            error: error,
+            format: ProcessInfo.processInfo.environment["MACOP_AGENT_FORMAT"] == "json" ? .json : .humanReadable
+        ))
+        FileHandle.standardError.write(Data(result.stderr.utf8))
+        exit(result.exitCode)
+    }
+    fail("verified session denied", ExitCode.denied.rawValue)
 }

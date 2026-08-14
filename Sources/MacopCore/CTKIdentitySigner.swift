@@ -3,23 +3,24 @@ import LocalAuthentication
 import Security
 
 /// A non-exporting signer for one, already selected CryptoTokenKit identity.
-/// `applicationLabel` is the authoritative public-key hash from `sc_auth`; the
-/// matching public SSH blob is checked again so a broad Keychain query cannot
-/// silently select another identity.
+/// The CTK label is matched exactly and the resulting certificate public key
+/// must produce the selected SSH blob.  The `sc_auth` hash is used only for
+/// Apple provider selection; it is not assumed to equal Keychain's opaque
+/// application-label attribute.
 public struct CTKIdentitySigner: AgentKeySigning, @unchecked Sendable {
     public let publicKeyBlob: Data
     public let fingerprint: String
     private let privateKey: SecKey
 
     public init(
-        applicationLabel: Data,
+        identityLabel: String,
         expectedPublicKeyBlob: Data,
         authenticationContext: LAContext? = nil
     ) throws {
-        guard !applicationLabel.isEmpty else { throw AgentProtocolError.denied }
+        guard !identityLabel.isEmpty else { throw AgentProtocolError.denied }
         var query: [CFString: Any] = [
             kSecClass: kSecClassIdentity,
-            kSecAttrApplicationLabel: applicationLabel,
+            kSecAttrLabel: identityLabel,
             kSecMatchLimit: kSecMatchLimitAll,
             kSecReturnRef: true
         ]

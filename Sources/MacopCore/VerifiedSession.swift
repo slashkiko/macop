@@ -6,6 +6,7 @@ import Security
 // opening-brace rule for declarations that cannot fit on a single line.
 // swiftlint:disable opening_brace
 // swiftlint:disable identifier_name
+// swiftlint:disable file_length
 
 public struct VerifiedSession: Sendable, Equatable {
     public let id: UUID; public let nonce: String; public let directory: URL; public let socketPath: URL
@@ -21,6 +22,16 @@ public struct VerifiedSession: Sendable, Equatable {
     }
 }
 
+public struct VerifiedSessionReservation: Sendable, Equatable {
+    public let id: UUID; public let nonce: String; public let directory: URL; public let socketPath: URL
+    public let keyFingerprint: String; public let expiresAt: Date
+
+    public init(id: UUID, nonce: String, directory: URL, socketPath: URL, keyFingerprint: String, expiresAt: Date) {
+        self.id = id; self.nonce = nonce; self.directory = directory; self.socketPath = socketPath
+        self.keyFingerprint = keyFingerprint; self.expiresAt = expiresAt
+    }
+}
+
 public struct ProcessSnapshot: Sendable, Equatable {
     public let pid: Int32; public let parentPID: Int32; public let startTime: UInt64
     public init(pid: Int32, parentPID: Int32, startTime: UInt64) {
@@ -33,11 +44,14 @@ public protocol RequesterInspecting: Sendable {
     func validatedCodeIdentity(pid: Int32, requirement: String) throws -> String
 }
 
-/// The sole authority for live sessions and grants. Session objects supplied by
-/// callers are never trusted: every authorization is resolved by its UUID.
 public final class SessionRegistry: @unchecked Sendable {
+    fileprivate struct Storage {
+        let reservation: VerifiedSessionReservation; let device: dev_t; let inode: ino_t; let directoryFD: Int32
+    }
+
     fileprivate struct Stored {
-        let session: VerifiedSession; let device: dev_t; let inode: ino_t; let directoryFD: Int32
+        var session: VerifiedSession?
+        let storage: Storage
     }
 
     private var sessions: [UUID: Stored] = [:]; private var grants = Set<UUID>()
@@ -46,24 +60,22 @@ public final class SessionRegistry: @unchecked Sendable {
     public init(root: URL, fileManager: FileManager = .default) throws {
         self.root = root; self.fileManager = fileManager
         try makeSecureDirectory(root, fileManager: fileManager)
-        let fd = open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        let fd = open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw AgentProtocolError.denied }
         do { let value = try directoryStat(fd); self.rootFD = fd; _ = value } catch { close(fd); throw error }
     }
 
     deinit {
         for stored in self.sessions.values {
-            close(stored.directoryFD)
+            // Cleanup remains descriptor/inode-bound, so a substituted visible
+            // path is never removed during registry teardown.
+            try? cleanupOwned(stored.storage, rootFD: self.rootFD)
         }
         close(rootFD)
     }
 
-    // swiftlint:disable:next function_parameter_count
-    public func create(rootPID: Int32, rootStartTime: UInt64, bundleID: String, codeRequirement: String,
-                       keyFingerprint: String, expiresAt: Date) throws -> VerifiedSession
-    {
-        guard rootPID > 0, rootStartTime > 0, expiresAt > .now, !bundleID.isEmpty, !codeRequirement.isEmpty,
-              !keyFingerprint.isEmpty else { throw AgentProtocolError.denied }
+    public func reserve(keyFingerprint: String, expiresAt: Date) throws -> VerifiedSessionReservation {
+        guard expiresAt > .now, !keyFingerprint.isEmpty else { throw AgentProtocolError.denied }
         self.lock.lock(); defer { lock.unlock() }
         let id = UUID(); let directory = self.root.appendingPathComponent(id.uuidString, isDirectory: true)
         var directoryCreated = false; var fd: Int32 = -1
@@ -75,18 +87,23 @@ public final class SessionRegistry: @unchecked Sendable {
         do {
             guard mkdirat(self.rootFD, id.uuidString, 0o700) == 0 else { throw AgentProtocolError.denied }
             directoryCreated = true
-            fd = openat(self.rootFD, id.uuidString, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            fd = openat(self.rootFD, id.uuidString, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             guard fd >= 0 else { throw AgentProtocolError.denied }
             let stat = try directoryStat(fd)
-            let session = VerifiedSession(id: id, nonce: UUID().uuidString.replacingOccurrences(of: "-", with: ""),
-                                          directory: directory,
-                                          socketPath: directory.appendingPathComponent("agent.sock"),
-                                          rootPID: rootPID, rootStartTime: rootStartTime, bundleID: bundleID,
-                                          codeRequirement: codeRequirement, keyFingerprint: keyFingerprint,
-                                          expiresAt: expiresAt)
-            self.sessions[id] = Stored(session: session, device: stat.st_dev, inode: stat.st_ino, directoryFD: fd)
+            let reservation = VerifiedSessionReservation(
+                id: id,
+                nonce: UUID().uuidString.replacingOccurrences(of: "-", with: ""),
+                directory: directory,
+                socketPath: directory.appendingPathComponent("agent.sock"),
+                keyFingerprint: keyFingerprint,
+                expiresAt: expiresAt
+            )
+            self.sessions[id] = Stored(
+                session: nil,
+                storage: Storage(reservation: reservation, device: stat.st_dev, inode: stat.st_ino, directoryFD: fd)
+            )
             fd = -1
-            return session
+            return reservation
         } catch {
             if directoryCreated {
                 _ = unlinkat(self.rootFD, id.uuidString, AT_REMOVEDIR)
@@ -95,22 +112,136 @@ public final class SessionRegistry: @unchecked Sendable {
         }
     }
 
+    public func activate(
+        reservation: VerifiedSessionReservation,
+        rootPID: Int32,
+        rootStartTime: UInt64,
+        bundleID: String,
+        codeRequirement: String,
+        inspector: any RequesterInspecting = SystemRequesterInspector(),
+        now: Date = .now
+    ) throws -> VerifiedSession {
+        guard rootPID > 0, rootStartTime > 0, !bundleID.isEmpty, !codeRequirement.isEmpty else {
+            self.revoke(reservation.id)
+            throw AgentProtocolError.denied
+        }
+        self.lock.lock(); defer { lock.unlock() }
+        guard var stored = self.sessions[reservation.id] else {
+            self.removeLocked(reservation.id)
+            throw AgentProtocolError.denied
+        }
+        // A repeated activation must never tear down the already-valid live
+        // session.  Only a malformed/stale *pending* capability is revoked.
+        guard stored.session == nil else { throw AgentProtocolError.denied }
+        guard stored.storage.reservation.expiresAt > now,
+              constantTimeEqual(Data(reservation.nonce.utf8), Data(stored.storage.reservation.nonce.utf8)),
+              inspector.snapshot(of: rootPID)?.startTime == rootStartTime,
+              (try? inspector.validatedCodeIdentity(pid: rootPID, requirement: codeRequirement)) == bundleID
+        else {
+            self.removeLocked(reservation.id)
+            throw AgentProtocolError.denied
+        }
+        let pending = stored.storage.reservation
+        let session = VerifiedSession(
+            id: pending.id,
+            nonce: pending.nonce,
+            directory: pending.directory,
+            socketPath: pending.socketPath,
+            rootPID: rootPID,
+            rootStartTime: rootStartTime,
+            bundleID: bundleID,
+            codeRequirement: codeRequirement,
+            keyFingerprint: pending.keyFingerprint,
+            expiresAt: pending.expiresAt
+        )
+        stored.session = session
+        self.sessions[reservation.id] = stored
+        return session
+    }
+
+    // swiftlint:disable:next function_parameter_count
+    public func create(rootPID: Int32, rootStartTime: UInt64, bundleID: String, codeRequirement: String,
+                       keyFingerprint: String, expiresAt: Date,
+                       inspector: any RequesterInspecting = SystemRequesterInspector()) throws -> VerifiedSession
+    {
+        let reservation = try self.reserve(keyFingerprint: keyFingerprint, expiresAt: expiresAt)
+        return try self.activate(
+            reservation: reservation,
+            rootPID: rootPID,
+            rootStartTime: rootStartTime,
+            bundleID: bundleID,
+            codeRequirement: codeRequirement,
+            inspector: inspector
+        )
+    }
+
     public func authorize(_ id: UUID, now: Date = .now) -> Bool {
         self.lock.lock(); defer { lock.unlock() }
-        guard let stored = activeLocked(id, now: now)
-        else { return false }; self.grants.insert(stored.session.id); return true
+        guard let stored = activeLocked(id, now: now), let session = stored.session
+        else { return false }; self.grants.insert(session.id); return true
     }
 
     public func session(_ id: UUID, now: Date = .now) -> VerifiedSession? {
         self.lock.lock(); defer { lock.unlock() }; return self.activeLocked(id, now: now)?.session
     }
 
+    /// Returns metadata for a session which has reserved its private socket but
+    /// has not necessarily been activated yet.  This is intentionally not an
+    /// authorization decision: only `session(_:)` represents an active grant.
+    public func reservation(_ id: UUID, now: Date = .now) -> VerifiedSessionReservation? {
+        self.lock.lock(); defer { lock.unlock() }
+        guard let stored = self.sessions[id], stored.storage.reservation.expiresAt > now else {
+            return nil
+        }
+        return stored.storage.reservation
+    }
+
+    /// Returns the visible socket path only while it names the directory object
+    /// retained by this registry. Darwin has no `bindat`; callers must repeat
+    /// this check after `bind` and revoke on any substitution.
+    public func pinnedSocketBindPath(for id: UUID, now: Date = .now) -> String? {
+        self.lock.lock(); defer { self.lock.unlock() }
+        guard let stored = self.sessions[id], stored.storage.reservation.expiresAt > now,
+              let current = try? directoryStat(stored.storage.directoryFD),
+              current.st_dev == stored.storage.device, current.st_ino == stored.storage.inode,
+              visibleStorageMatches(stored.storage)
+        else { return nil }
+        return stored.storage.reservation.socketPath.path
+    }
+
+    /// Removes the private socket by directory descriptor. This remains safe
+    /// if an attacker renames the visible session directory after reservation.
+    public func removeSocket(for id: UUID) {
+        self.lock.lock(); defer { self.lock.unlock() }
+        guard let stored = self.sessions[id] else { return }
+        _ = unlinkat(stored.storage.directoryFD, "agent.sock", 0)
+    }
+
+    public func secureSocketPermissions(for id: UUID) -> Bool {
+        self.lock.lock(); defer { self.lock.unlock() }
+        guard let stored = self.sessions[id],
+              let current = try? directoryStat(stored.storage.directoryFD),
+              current.st_dev == stored.storage.device, current.st_ino == stored.storage.inode
+        else { return false }
+        return fchmodat(stored.storage.directoryFD, "agent.sock", 0o600, 0) == 0
+    }
+
+    public func validateBoundSocket(for id: UUID) -> Bool {
+        self.lock.lock(); defer { self.lock.unlock() }
+        guard let stored = self.sessions[id], visibleStorageMatches(stored.storage) else { return false }
+        var socket = stat()
+        guard lstat(stored.storage.reservation.socketPath.path, &socket) == 0,
+              socket.st_mode & S_IFMT == S_IFSOCK, socket.st_uid == getuid(), socket.st_mode & 0o077 == 0
+        else { return false }
+        return true
+    }
+
     public func verifySign(sessionID: UUID, signerFingerprint: String, now: Date = .now) -> VerifiedSession? {
         self.lock.lock(); defer { lock.unlock() }
-        guard let stored = activeLocked(sessionID, now: now), grants.contains(sessionID),
-              constantTimeEqual(Data(stored.session.keyFingerprint.utf8), Data(signerFingerprint.utf8))
+        guard let stored = activeLocked(sessionID, now: now), let session = stored.session, grants.contains(sessionID),
+              constantTimeEqual(Data(session.keyFingerprint.utf8), Data(signerFingerprint.utf8))
         else { return nil }
-        return stored.session
+        return session
     }
 
     public func revoke(_ id: UUID) {
@@ -119,13 +250,19 @@ public final class SessionRegistry: @unchecked Sendable {
 
     public func expire(now: Date = .now) {
         self.lock.lock(); defer { lock.unlock() }
-        for id in Array(self.sessions.keys) where self.activeLocked(id, now: now) == nil {}
+        for id in Array(self.sessions.keys)
+            where self.sessions[id]?.storage.reservation.expiresAt ?? .distantFuture <= now
+        {
+            self.removeLocked(id)
+        }
     }
 
     public func revokeDeadRoots(inspector: any RequesterInspecting = SystemRequesterInspector()) {
         self.lock.lock(); defer { lock.unlock() }
         for (id, stored) in self.sessions
-            where inspector.snapshot(of: stored.session.rootPID)?.startTime != stored.session.rootStartTime
+            where stored.session.map({ session in
+                inspector.snapshot(of: session.rootPID)?.startTime != session.rootStartTime
+            }) ?? false
         {
             removeLocked(id)
         }
@@ -133,13 +270,14 @@ public final class SessionRegistry: @unchecked Sendable {
 
     private func activeLocked(_ id: UUID, now: Date) -> Stored? {
         guard let stored = sessions[id] else { return nil }
-        guard stored.session.expiresAt > now else { self.removeLocked(id); return nil }
+        guard stored.storage.reservation.expiresAt > now else { self.removeLocked(id); return nil }
+        guard stored.session != nil else { return nil }
         return stored
     }
 
     private func removeLocked(_ id: UUID) {
         guard let stored = sessions.removeValue(forKey: id) else { return }; self.grants.remove(id)
-        try? cleanupOwned(stored, rootFD: self.rootFD)
+        try? cleanupOwned(stored.storage, rootFD: self.rootFD)
     }
 }
 
@@ -175,15 +313,25 @@ private func removeNewDirectory(_ url: URL) throws {
     _ = try ownedDirectoryStat(url); guard rmdir(url.path) == 0 else { throw AgentProtocolError.denied }
 }
 
-private func cleanupOwned(_ stored: SessionRegistry.Stored, rootFD: Int32) throws {
-    defer { close(stored.directoryFD) }
-    let current = try directoryStat(stored.directoryFD)
-    guard current.st_dev == stored.device, current.st_ino == stored.inode else { throw AgentProtocolError.denied }
-    _ = unlinkat(stored.directoryFD, "agent.sock", 0)
-    var named = stat(); let name = stored.session.id.uuidString
-    guard fstatat(rootFD, name, &named, AT_SYMLINK_NOFOLLOW) == 0, named.st_dev == stored.device,
-          named.st_ino == stored.inode,
+private func cleanupOwned(_ storage: SessionRegistry.Storage, rootFD: Int32) throws {
+    defer { close(storage.directoryFD) }
+    let current = try directoryStat(storage.directoryFD)
+    guard current.st_dev == storage.device, current.st_ino == storage.inode else { throw AgentProtocolError.denied }
+    _ = unlinkat(storage.directoryFD, "agent.sock", 0)
+    var named = stat(); let name = storage.reservation.id.uuidString
+    guard fstatat(rootFD, name, &named, AT_SYMLINK_NOFOLLOW) == 0, named.st_dev == storage.device,
+          named.st_ino == storage.inode,
           unlinkat(rootFD, name, AT_REMOVEDIR) == 0 else { throw AgentProtocolError.denied }
+}
+
+private func visibleStorageMatches(_ storage: SessionRegistry.Storage) -> Bool {
+    var visible = stat()
+    return lstat(storage.reservation.directory.path, &visible) == 0
+        && visible.st_mode & S_IFMT == S_IFDIR
+        && visible.st_uid == getuid()
+        && visible.st_mode & 0o077 == 0
+        && visible.st_dev == storage.device
+        && visible.st_ino == storage.inode
 }
 
 public struct RequesterPeer: Sendable, Equatable { public let pid: Int32; public let uid: Int32
@@ -319,3 +467,4 @@ public func constantTimeEqual(_ left: Data, _ right: Data) -> Bool {
 
 // swiftlint:enable opening_brace
 // swiftlint:enable identifier_name
+// swiftlint:enable file_length
