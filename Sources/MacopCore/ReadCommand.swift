@@ -1,9 +1,13 @@
 import Foundation
 
 public enum ReadCommand {
-    public static func run(args: [String], options: GlobalOptions, env: [String: String]) throws -> CommandResult {
+    public static func run(
+        args: [String],
+        options: GlobalOptions,
+        env: [String: String],
+        client: any KeychainClient = SystemKeychainClient()
+    ) throws -> CommandResult {
         let parsed = try parseArgs(args)
-        _ = parsed.noNewline
         let reference = try ReferenceResolver.parse(parsed.reference, env: env)
 
         switch reference {
@@ -14,12 +18,23 @@ public enum ReadCommand {
                 configDirectory: options.configDirectory
             )
             try self.validateFieldAccess(configItem: configItem, section: section, field: field)
-            let providerKind = try ConfigStore.providerKind(for: configItem)
-            throw self.providerNotImplemented(for: providerKind)
-        case .keychainGeneric, .keychainInternet:
-            throw self.providerNotImplemented(for: .keychainGeneric)
+            let text = try KeychainProvider.readText(self.query(for: configItem), client: client)
+            return CommandResult(exitCode: 0, stdout: text + (parsed.noNewline ? "" : "\n"))
+        case let .keychainGeneric(service, account):
+            return try self.output(
+                KeychainProvider.readText(.generic(service: service, account: account), client: client),
+                noNewline: parsed.noNewline
+            )
+        case let .keychainInternet(server, account):
+            return try self.output(
+                KeychainProvider.readText(.internet(server: server, account: account), client: client),
+                noNewline: parsed.noNewline
+            )
         case .secureEnclave:
-            throw self.providerNotImplemented(for: .secureEnclave)
+            throw CLIError.unsupportedProvider(
+                provider: "secure-enclave",
+                reason: "Reading Secure Enclave identities as secrets is not supported."
+            )
         }
     }
 
@@ -36,7 +51,34 @@ public enum ReadCommand {
                     flag: arg,
                     reason: "Writing secrets to persistent files is disabled by the macop security policy."
                 )
+            case "--otp":
+                throw CLIError.unsupportedFlag(flag: arg, reason: "OTP retrieval is not supported by macop.")
+            case "--ssh-format":
+                throw CLIError.unsupportedFlag(
+                    flag: arg,
+                    reason: "Exporting SSH private keys is not supported by macop."
+                )
             default:
+                let persistentFlag = ["--out-file", "--file-mode", "--force"]
+                    .first { arg.hasPrefix("\($0)=") }
+                if let persistentFlag {
+                    throw CLIError.unsupportedFlag(
+                        flag: persistentFlag,
+                        reason: "Writing secrets to persistent files is disabled by the macop security policy."
+                    )
+                }
+                if arg.hasPrefix("--otp=") {
+                    throw CLIError.unsupportedFlag(
+                        flag: "--otp",
+                        reason: "OTP retrieval is not supported by macop."
+                    )
+                }
+                if arg.hasPrefix("--ssh-format=") {
+                    throw CLIError.unsupportedFlag(
+                        flag: "--ssh-format",
+                        reason: "Exporting SSH private keys is not supported by macop."
+                    )
+                }
                 if arg.hasPrefix("-") {
                     throw CLIError.invalidArguments(message: "Unknown read flag: \(arg)")
                 }
@@ -63,18 +105,17 @@ public enum ReadCommand {
         }
     }
 
-    private static func providerNotImplemented(for provider: ConfigProviderKind) -> CLIError {
-        switch provider {
-        case .keychainGeneric, .keychainInternet:
-            .providerUnavailable(
-                provider: "keychain",
-                reason: "keychain provider wiring is not implemented yet."
-            )
-        case .secureEnclave:
-            .providerUnavailable(
-                provider: "secure-enclave",
-                reason: "secure-enclave read is not implemented yet."
-            )
+    private static func query(for item: ConfigItem) throws -> KeychainQuery {
+        if item.provider == "keychain-internet", let server = item.server, let account = item.account {
+            return .internet(server: server, account: account)
         }
+        if item.provider == "keychain-generic", let service = item.service, let account = item.account {
+            return .generic(service: service, account: account)
+        }
+        throw CLIError.unsupportedProvider(provider: item.provider, reason: "This provider cannot supply secret text.")
+    }
+
+    private static func output(_ text: String, noNewline: Bool) throws -> CommandResult {
+        CommandResult(exitCode: 0, stdout: text + (noNewline ? "" : "\n"))
     }
 }

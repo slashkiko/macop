@@ -7,10 +7,20 @@ private func write(_ text: String, to handle: FileHandle) {
 }
 
 let app = MacopApp()
-let result = app.run(
-    argv: CommandLine.arguments,
-    env: ProcessInfo.processInfo.environment
-)
+let environment = ProcessInfo.processInfo.environment
+let result = app.runInteractivelyIfNeeded(argv: CommandLine.arguments, env: environment) ?? {
+    if let streamed = app.runStreamingIfNeeded(
+        argv: CommandLine.arguments,
+        env: environment,
+        stdout: { try? FileHandle.standardOutput.write(contentsOf: $0) },
+        stderr: { try? FileHandle.standardError.write(contentsOf: $0) }
+    ) {
+        return streamed
+    }
+    let input = CommandLine.arguments.dropFirst().contains("inject") ? FileHandle.standardInput
+        .readDataToEndOfFile() : Data()
+    return app.run(argv: CommandLine.arguments, env: environment, input: input)
+}()
 
 if !result.stdout.isEmpty {
     write(result.stdout, to: .standardOutput)

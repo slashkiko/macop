@@ -1,6 +1,7 @@
 import Foundation
 
 public enum CLIError: Error {
+    case runtimeError(message: String)
     case invalidArguments(message: String)
     case unsupportedCommand(command: String, reason: String)
     case unsupportedFlag(flag: String, reason: String)
@@ -20,6 +21,13 @@ public enum ErrorRenderer {
         let provider: String?
 
         switch error {
+        case let .runtimeError(detail):
+            exitCode = ExitCode.runtimeError.rawValue
+            message = detail
+            code = "runtime_error"
+            command = nil
+            flag = nil
+            provider = nil
         case let .invalidArguments(detail):
             exitCode = ExitCode.invalidArguments.rawValue
             message = detail
@@ -104,6 +112,7 @@ public enum ErrorRenderer {
 
             if let command, var errorInfo = payload["error"] as? [String: Any] {
                 errorInfo["command"] = command
+                errorInfo["documentation"] = "https://github.com/slashkiko/macop#op-compatibility"
                 payload["error"] = errorInfo
             }
             if let flag, var errorInfo = payload["error"] as? [String: Any] {

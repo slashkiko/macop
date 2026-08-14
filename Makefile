@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 .PHONY: setup bootstrap hooks-install
-.PHONY: format format-check lint test build
+.PHONY: format format-check lint test test-keychain-integration test-pty build
 .PHONY: ci ci-swift ci-workflows ci-secrets
 .PHONY: pin-actions pin-actions-check
 .PHONY: workflow-lint workflow-security
@@ -31,6 +31,14 @@ lint:
 
 test:
 	swift run macop-selftest
+
+test-keychain-integration:
+	MACOP_RUN_KEYCHAIN_INTEGRATION=1 swift run macop-selftest
+
+test-pty: build
+	@python3 scripts/test-pty.py
+	@.build/debug/macop run --debug -- /usr/bin/true 2>&1 | grep -Fx 'macop: debug exit_code=0 command=run'
+	@.build/debug/macop run -- /bin/sh -c 'kill -TERM $$$$'; status=$$?; test $$status -eq 143
 
 build:
 	$(SWIFTPM_GIT_SAFE_BARE) swift build

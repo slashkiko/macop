@@ -5,6 +5,8 @@ xcuserdata/
 
 # SwiftPM
 .build/
+__pycache__/
+*.pyc
 .swiftpm/
 Package.resolved
 

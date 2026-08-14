@@ -11,7 +11,10 @@ public enum ReferenceResolver {
     public static func parse(_ input: String, env: [String: String]) throws -> SecretReference {
         let expanded = try expandEnvironmentVariables(in: input, env: env)
         guard !expanded.contains("?") else {
-            throw CLIError.invalidArguments(message: "Reference query parameters are not supported.")
+            throw CLIError.unsupportedFlag(
+                flag: "reference query parameter",
+                reason: "Reference query parameters are not supported by macop."
+            )
         }
 
         if expanded.hasPrefix("op://") {
@@ -94,6 +97,14 @@ public enum ReferenceResolver {
     }
 
     private static func expandEnvironmentVariables(in input: String, env: [String: String]) throws -> String {
+        try self.expandEnvironmentVariables(in: input, env: env, resolving: [])
+    }
+
+    private static func expandEnvironmentVariables(
+        in input: String,
+        env: [String: String],
+        resolving: Set<String>
+    ) throws -> String {
         let pattern = #"\$[A-Za-z_][A-Za-z0-9_]*"#
         let regex = try NSRegularExpression(pattern: pattern)
         let range = NSRange(input.startIndex ..< input.endIndex, in: input)
@@ -110,7 +121,13 @@ public enum ReferenceResolver {
             guard let replacement = env[name] else {
                 throw CLIError.invalidArguments(message: "Undefined environment variable in reference: \(token)")
             }
-            output.replaceSubrange(matchRange, with: replacement)
+            guard !resolving.contains(name) else {
+                throw CLIError.invalidArguments(message: "Cyclic environment variable reference: \(token)")
+            }
+            var nested = resolving
+            nested.insert(name)
+            let expandedReplacement = try expandEnvironmentVariables(in: replacement, env: env, resolving: nested)
+            output.replaceSubrange(matchRange, with: expandedReplacement)
         }
         return output
     }
