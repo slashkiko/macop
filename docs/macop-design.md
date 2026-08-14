@@ -370,6 +370,8 @@ session nonceとsocket pathは相関情報であり、それらの秘匿性だ�
 
 通常Keychainのsecret取得は`security -w`を子プロセスとして呼ばず、Security.frameworkを直接利用する。これにより不要なstdout出力を避ける。
 
+verified-session agentのhost binding検証にはApple標準のCryptoKitとSecurity.frameworkを使用する。受け入れるhost keyは`ssh-ed25519`と`ecdsa-sha2-nistp256`だけであり、RSAとhost certificateは検証不能な互換fallbackを設けずfail closedで拒否する。
+
 ## 11. 未対応エラー
 
 ### 11.1 人間向け
@@ -436,7 +438,7 @@ flowchart TD
 ### 12.1 言語・package構成
 
 - Swift 6 language mode、Swift Package Manager、macOS専用とする。
-- package dependencyは持たない。使用するplatform frameworkはFoundation、Security、CryptoTokenKit、LocalAuthentication、AppKit、Darwinだけとする。
+- package dependencyは持たない。使用するplatform frameworkはFoundation、CryptoKit、Security、CryptoTokenKit、LocalAuthentication、AppKit、Darwinだけとする。
 - argument parserは自前実装し、`swift-argument-parser`などの外部packageは追加しない。
 - executable targetは`MacopCLI`、`MacopAgent`、`MacopSelftest`、library targetは`MacopCore`とする。`MacopAgent`はverified-session agentとapplication別承認UIを提供するmenu bar appへ段階的に拡張する。
 
