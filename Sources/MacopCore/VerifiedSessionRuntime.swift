@@ -119,10 +119,16 @@ public final class VerifiedSessionRuntime: @unchecked Sendable {
         }
         guard !self.dependencies.isCancellationRequested() else { throw AgentProtocolError.denied }
         let session = try self.dependencies.activate(reservation, launched.request)
+        // Activation pins the exact designated requirement in the registry.
+        // The launch boundary independently checked the canonical executable
+        // path and retained this one live signing snapshot for the UI.
+        let launchedIdentity = launched.request.codeIdentity
         let result = try self.prompt(SessionAuthorizationPresentation(
             identityLabel: label,
-            application: session.bundleID,
-            verification: "verified (code requirement matched)",
+            application: launchedIdentity.canonicalPath,
+            verification: launchedIdentity.provenanceSummary,
+            signingAuthority: launchedIdentity.signatureSummary,
+            cdHash: Self.abbreviatedCDHash(launchedIdentity.cdHash),
             fingerprint: session.keyFingerprint,
             sessionID: session.id,
             expiresAt: session.expiresAt
@@ -148,6 +154,11 @@ public final class VerifiedSessionRuntime: @unchecked Sendable {
             throw AgentProtocolError.denied
         }
         return result
+    }
+
+    private static func abbreviatedCDHash(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "unavailable" }
+        return value.count > 16 ? "\(value.prefix(12))…\(value.suffix(4))" : value
     }
 }
 

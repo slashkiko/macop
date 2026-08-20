@@ -1,6 +1,10 @@
 import Foundation
 
 public enum InjectCommand {
+    public static func requiresStandardInput(args: [String]) throws -> Bool {
+        try self.parseArgs(args) == nil
+    }
+
     public static func run(
         args: [String],
         options: GlobalOptions,

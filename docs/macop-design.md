@@ -202,7 +202,9 @@ op://$APP_ENV/GitHub/token
 }
 ```
 
-設定ファイルは`~/Library/Application Support/macop/config.json`に置く。親directoryはcurrent user所有の`0700`、fileはcurrent user所有の`0600`を厳密に要求し、これ以外のownerまたはmodeは読み込み時に拒否する。設定ファイルにはsecretそのものを保存しない。`macop config init`と`macop config validate`はこの非機密設定だけを作成・検証し、Keychain itemの作成はしない。
+設定ファイルは`~/Library/Application Support/macop/config.json`に置く。親directoryはcurrent user所有の`0700`、fileはcurrent user所有の`0600`を厳密に要求し、extended ACLによる追加grantも拒否する。これ以外のowner、mode、ACLは読み込み時に拒否する。設定ファイルにはsecretそのものを保存しない。`macop config init`と`macop config validate`はこの非機密設定だけを作成・検証し、Keychain itemの作成はしない。
+
+読み込み時はconfig directoryと`config.json`を最終pathのsymbolic linkを辿らずにopenし、owner/mode/typeを検証した同じfile descriptorから読む。`keychain://internet/<server>/<account>`はpath/protocolなどで複数itemに一致し得るため、ちょうど1件でなければ値を選ばずにエラーにする。
 
 referenceの各path segmentはpercent decodeする。`$NAME`はreference解決前に現在の環境変数から展開できる。未定義変数、循環参照、query parameter（`?attribute=otp`、`?ssh-format=openssh`など）は構文または未対応エラーにする。
 
@@ -345,7 +347,7 @@ Phase 4は二つの経路を提供する。
 1. **Apple provider wrapper:** 秘密鍵fileなし、non-exportable private key、Touch ID、既存`macop ssh run/test`を提供する。Apple providerからの直接利用も可能であり、macopのapplication別承認は適用されない。
 2. **verified-session agent:** macopがapplicationまたはshell sessionごとに短命なproxy socketを発行する。共用のstable `SSH_AUTH_SOCK`は公開しない。sessionをroot PID・process開始時刻・bundle ID・code requirement・鍵fingerprint・期限へ結び付け、直接peerが登録rootまたは生存中の子孫であることを毎接続時に確認する。nonceはrootへ渡さず、launcherとregistryが同一reservationを取り違えないためだけに保持する。
 
-verified modeでは、有効なOpenSSH session bindingが署名要求より前に届くことを必須にし、`forwarding=1`、bindingなし、外部relay、終了済みroot sessionをfail closedで拒否する。承認画面にはapplication、簡潔な `verified (code requirement matched)` 状態、鍵名とfingerprint、対象session、期限を表示し、生のcode requirementは表示しない。「macop-agent経由だけに適用され、Apple providerからの直接利用は制御しない」と明記する。host bindingで受け入れるhost keyは`ssh-ed25519`と`ecdsa-sha2-nistp256`だけとし、RSAとhost certificateは互換fallbackなしで拒否する。
+verified modeでは、有効なOpenSSH session bindingが署名要求より前に届くことを必須にし、`forwarding=1`、bindingなし、外部relay、終了済みroot sessionをfail closedで拒否する。承認画面には起動前に選択したものと一致したcanonical executable path、署名authority/team、短縮cdhash、鍵名とfingerprint、対象session、期限を表示する。Apple anchorとTeam IDを確認できた場合だけ「trusted signature + exact image pinned」、ad-hoc/unanchoredなら「exact image pinned; publisher unverified」とする。同一live snapshotのidentifier+cdhash（trusted時はApple anchor+Team IDも含む）から最終requirementを構築してlive `SecCode`へstrict検証し、その同じrequirementをregistryへ保存する。生のcode requirementは表示しない。「macop-agent経由だけに適用され、Apple providerからの直接利用は制御しない」と明記する。host bindingで受け入れるhost keyは`ssh-ed25519`と`ecdsa-sha2-nistp256`だけとし、RSAとhost certificateは互換fallbackなしで拒否する。
 
 Phase 0bでは、最小`.app`を`NSWorkspace.OpenConfiguration`から起動して専用`SSH_AUTH_SOCK`とnonce環境変数を渡し、launcherの起動PIDとsocket peer PID、bundle ID、および協調probeが自己申告したnonceが一致することを確認した。このnonce一致はproduction rootをagent側から認証した証拠ではない。macOSでは同一UIDでも`KERN_PROCARGS2`による他process環境の取得が許可されないため、productionではnonceを子processへ渡さず、rootから再観測して照合する設計も採用しない。process ancestry試験では正規の子processを許可し、socket pathを知る外部processとroot終了後の孤児processを拒否した。Sourcetree固有の挙動、Terminalタブ単位integration、実CTK identityでのTouch ID / GitHub E2EはPhase 4の未完了項目とする。
 
@@ -472,7 +474,7 @@ Swiftの通常メモリを完全にzeroizeできるとは主張しない。secre
 
 ### 12.4 code signingと導入
 
-MVPは本人のMacでのsource buildを対象とし、`swift build -c release`後に`~/.local/bin/macop`へ配置する。script互換用の`op`は同directoryのsymlinkとする。CLIにはad-hoc signature（`codesign --sign -`）を使う。verified-session agentのcode identityを安定して検証するため、agent appとlauncherの署名要件はPhase 4で別途固定する。Developer ID signing、notarization、installerは配布時の後続スコープとする。
+MVPの通常CLIは本人のMacでのsource buildを対象とし、`swift build -c release`後に`~/.local/bin/macop`へ配置する。script互換用の`op`は同directoryのsymlinkとする。通常CLIはad-hoc signature（`codesign --sign -`）を使える。ただしverified-session agentはsame-UIDのad-hoc binary replacementを防げないため、ad-hoc source buildではfail closedとする。production verified modeにはApple anchor付きの同一Developer Team署名と、`macop`/`macop-agent`の固定identifierを要求する。helperは`POSIX_SPAWN_START_SUSPENDED`でexec後・user code実行前に停止し、親がlive `SecCode`を固定identifier/Team/Apple anchor要件で検証してから再開する。Developer ID signing、notarization、installerはこのproduction配布境界を満たす後続スコープとする。
 
 Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain設定に依存するため、MVPの実機integration testで確認する。`doctor`はinstall path、code signature、Keychain / CTK access結果、`ssh-keychain.dylib`の存在、選択されるSSH client、実効`ForwardAgent`設定を表示する。`doctor`自身はsecret値を表示しない。
 

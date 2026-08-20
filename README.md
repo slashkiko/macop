@@ -20,11 +20,18 @@ codesign --force --sign - --identifier macop "$HOME/.local/bin/macop"
 codesign --force --sign - --identifier macop-agent "$HOME/.local/bin/macop-agent"
 ```
 
-Ensure `$HOME/.local/bin` is on `PATH`. `macop-agent` must stay a safe,
-user-owned sibling of `macop`; macop resolves its own executable image rather
-than the command name used through `PATH`, and accepts only a regular,
-user-owned, non-group/world-writable `macop-agent` with a strict valid code
-signature whose identifier is `macop-agent`. Re-run `codesign` for both after
+Ensure `$HOME/.local/bin` is on `PATH`. The source-build commands above are
+appropriate for the ordinary Keychain and `ssh` wrapper commands, but ad-hoc
+signing is deliberately **not** eligible for `macop ssh agent`: same-user
+replacement cannot be made safe with an ad-hoc signature. Verified sessions
+require a production pair signed by one Apple Developer team (Apple-anchored,
+same Team ID, `macop` and `macop-agent` identifiers). Keep the helper as a
+regular user-owned, non-group/world-writable sibling; macop resolves its own
+image rather than `PATH`, validates both static signatures, and the helper
+is spawned suspended. Before any helper code can execute, the parent validates
+the live process image against the fixed helper identifier and the already
+validated Team ID, then resumes it; the helper also re-validates itself as
+defense in depth. Re-run the production signing step for both files after
 replacing them.
 Keychain authorization prompts can change after a binary update; use
 `macop doctor` to inspect the local prerequisites without printing secrets.
@@ -62,8 +69,12 @@ macop config validate
 
 The default file is `~/Library/Application Support/macop/config.json`. macop
 requires the directory to be owned by the current user with mode `0700`, and
-the file to be current-user owned with mode `0600`; it rejects weaker or
-different permissions rather than attempting to repair them silently.
+the file to be current-user owned with mode `0600`, with no extended ACL grants. It opens both without
+following a final-path symlink and reads the already-validated file descriptor,
+rejecting weaker or different permissions rather than attempting to repair them
+silently. A generic or internet-password mapping is intentionally valid only
+when its selector matches exactly one accessible Keychain item; use distinct
+service/account or server/account metadata for items that must coexist.
 
 Only lookup metadata belongs in the file. For example, this is safe because it
 contains no secret value:
@@ -92,6 +103,9 @@ The supported secret boundary is deliberately narrow:
 - `item list` and `item get` return macop metadata. Their JSON is a macop schema
   with `schema_version`, not a complete 1Password item schema; `--reveal` is an
   explicit request to expose an item field.
+- Resolved secrets exist in process memory while a command is prepared and
+  relayed. macop does not guarantee zeroization, locked memory, or protection
+  from process memory inspection, core dumps, or swap.
 
 `--out-file`, secret-bearing argv, Apple Passwords access, binary/NUL secrets,
 and unsupported 1Password cloud/vault commands are outside this contract.
@@ -211,10 +225,20 @@ Only the socket is passed to the new process. A nonce stays as an opaque
 launcher-to-registry reservation capability; it is not read from, or used to
 authenticate, the launched root. Requests remain pending until activation;
 signing requires OpenSSH session binding and is revoked when the root exits or
-the session expires. Existing
+the fixed ten-minute session deadline shown in the approval prompt expires. Existing
 applications, manually exported socket paths, relays outside the launched
 process tree, and direct `ssh-keychain.dylib` use are intentionally outside
 this verified-session contract.
+
+The approval prompt shows the launched root's canonical executable path, the
+signature authority/team (when anchored), and an abbreviated cdhash from one
+live code-signing snapshot. An ad-hoc or unanchored image is labelled `exact
+image pinned; publisher unverified`; it is never represented as a verified
+publisher. From that same snapshot, macop builds and validates a final live
+requirement containing the exact identifier and cdhash (plus Apple anchor and
+Team ID for trusted publishers); the registry stores that same requirement.
+The agent rejects a root whose live executable path differs from the exact
+command or application executable selected before launch.
 
 With `--debug`, human-readable agent invocations emit one safe
 `macop: debug exit_code=N command=ssh` line. JSON error responses retain the
@@ -224,6 +248,11 @@ JSON debug record that could corrupt that program's output protocol.
 
 Focused/manual checks:
 
+- `MACOP_TEAM_SIGNED_MAIN=/path/to/macop MACOP_TEAM_SIGNED_HELPER=/path/to/macop-agent swift run macop-selftest`
+  enables the gated integration check for a production Apple-anchored,
+  same-Team signed pair, including a suspended live helper launch; ordinary
+  ad-hoc CI exercises the negative policy and suspended pre-execution rejection
+  instead.
 - `make test-keychain-integration` creates and removes a dedicated local test
   Keychain item; it may prompt for Keychain access.
 - `make test-pty` verifies interactive relay and signal behavior.

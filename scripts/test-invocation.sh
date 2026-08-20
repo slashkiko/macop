@@ -45,4 +45,25 @@ PATH="$bin_dir:$legacy_dir:$PATH" op compatibility --format=json \
 test "$(PATH="$bin_dir:$legacy_dir:$PATH" command -v op)" = "$bin_dir/op"
 test "$(PATH="$bin_dir:$legacy_dir:$PATH" op --version)" = "macop 0.1.0"
 
+# Keep stdin open while a non-inject command contains the literal argument
+# "inject". The CLI must parse the selected command instead of blocking on
+# unrelated argv text.
+MACOP_PATH="$bin_dir/macop" /usr/bin/python3 - <<'PY'
+import os
+import subprocess
+
+process = subprocess.Popen(
+    [os.environ["MACOP_PATH"], "item", "get", "inject"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+try:
+    process.wait(timeout=1)
+except subprocess.TimeoutExpired:
+    process.terminate()
+    process.wait()
+    raise AssertionError("an argument named inject must not make the CLI read stdin")
+PY
+
 printf '%s\n' 'alias and op symlink invocation fixture passed'

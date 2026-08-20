@@ -101,7 +101,7 @@ public enum ReadCommand {
         }
         let requested = section.map { "\($0)/\(field)" } ?? field
         guard allowedFields.contains(requested) else {
-            throw CLIError.notFound(message: "Field \"\(requested)\" is not configured for this item.")
+            throw CLIError.notFound(message: "The requested field is not configured for this item.")
         }
     }
 

@@ -6,6 +6,8 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
     public let identityLabel: String
     public let application: String
     public let verification: String
+    public let signingAuthority: String
+    public let cdHash: String
     public let fingerprint: String
     public let sessionID: UUID
     public let expiresAt: Date
@@ -14,6 +16,8 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
         identityLabel: String,
         application: String,
         verification: String,
+        signingAuthority: String,
+        cdHash: String,
         fingerprint: String,
         sessionID: UUID,
         expiresAt: Date
@@ -21,6 +25,8 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
         self.identityLabel = identityLabel
         self.application = application
         self.verification = verification
+        self.signingAuthority = signingAuthority
+        self.cdHash = cdHash
         self.fingerprint = fingerprint
         self.sessionID = sessionID
         self.expiresAt = expiresAt
@@ -77,6 +83,7 @@ public struct LocalAuthenticationSessionPrompt: SessionAuthorizationResultPrompt
         let context = AuthenticationContextBox(LAContext())
         let expiry = ISO8601DateFormatter().string(from: presentation.expiresAt)
         let reason = "Identity: \(presentation.identityLabel); application: \(presentation.application); "
+            + "signature: \(presentation.signingAuthority); cdhash: \(presentation.cdHash); "
             + "verification: \(presentation.verification); key: \(presentation.fingerprint); "
             + "session: \(presentation.sessionID.uuidString); expiry: \(expiry). "
             + "Apple provider use outside macop-agent is not controlled."
@@ -91,6 +98,8 @@ public struct LocalAuthenticationSessionPrompt: SessionAuthorizationResultPrompt
         let body = """
         Identity: \(presentation.identityLabel)
         Application: \(presentation.application)
+        Signature: \(presentation.signingAuthority)
+        CDHash: \(presentation.cdHash)
         Verification: \(presentation.verification)
         Key: \(presentation.fingerprint)
         Session: \(presentation.sessionID.uuidString)

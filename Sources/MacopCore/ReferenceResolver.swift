@@ -71,7 +71,7 @@ public enum ReferenceResolver {
         case "internet":
             return .keychainInternet(server: segments[1], account: segments[2])
         default:
-            throw CLIError.invalidArguments(message: "Unsupported keychain reference kind: \(segments[0])")
+            throw CLIError.invalidArguments(message: "Unsupported keychain reference kind.")
         }
     }
 
@@ -119,10 +119,10 @@ public enum ReferenceResolver {
             let token = String(output[matchRange])
             let name = String(token.dropFirst())
             guard let replacement = env[name] else {
-                throw CLIError.invalidArguments(message: "Undefined environment variable in reference: \(token)")
+                throw CLIError.invalidArguments(message: "Reference uses an undefined environment variable.")
             }
             guard !resolving.contains(name) else {
-                throw CLIError.invalidArguments(message: "Cyclic environment variable reference: \(token)")
+                throw CLIError.invalidArguments(message: "Reference contains a cyclic environment variable expansion.")
             }
             var nested = resolving
             nested.insert(name)

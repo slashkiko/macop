@@ -5,6 +5,9 @@ import MacopCore
 import MacopPTY
 import Security
 
+// The executable owns production launch, prompt, and signal coordination.
+// swiftlint:disable file_length
+
 private let usage = """
 Usage:
   macop-agent shell <identity-label> -- <program> [arguments...]
@@ -65,8 +68,11 @@ private func fail(_ message: String, _ code: Int32 = ExitCode.invalidArguments.r
 private func rootDirectory() -> URL {
     // sockaddr_un allows only 104 path bytes on Darwin. FileManager's per-user
     // temporary directory is often already too long once the UUID subdirectory
-    // and socket name are appended, so use the short system tmp namespace.
-    URL(fileURLWithPath: "/tmp/macop-agent-\(getuid())", isDirectory: true)
+    // and socket name are appended, so use a randomized name in the short
+    // system tmp namespace. Randomization prevents another user from reserving
+    // one predictable path and denying every verified session for this UID.
+    let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16)
+    return URL(fileURLWithPath: "/tmp/macop-agent-\(getuid())-\(suffix)", isDirectory: true)
 }
 
 private func environment(for reservation: VerifiedSessionReservation) -> [String: String] {
@@ -197,91 +203,104 @@ private final class SignalCoordinator: @unchecked Sendable {
     }
 }
 
-private func runSignalFixture() -> Int32 {
-    let signals = SignalCoordinator(gracefulShutdownNanoseconds: 100_000_000)
-    let path = ProcessInfo.processInfo.environment["MACOP_AGENT_SIGNAL_CHILD_FILE"] ?? "/dev/null"
-    do {
-        let script = "(trap '' TERM INT; exec /bin/sleep 1000) & echo $! > '\(path)'; while :; do sleep 1; done"
-        let pid = try spawn(["/bin/sh", "-c", script], environment: ProcessInfo.processInfo.environment,
-                            isolatedProcessGroup: true)
-        let owned = try capture(pid, mode: "shell")
-        signals.installOwned(owned)
-        signals.beginRootWait()
-        DispatchQueue.global(qos: .userInitiated).async {
-            _ = try? waitForShellExit(pid) { signals.isCancellationRequested() }
-            signals.endRootWait()
+#if DEBUG
+    private func runSignalFixture() -> Int32 {
+        let signals = SignalCoordinator(gracefulShutdownNanoseconds: 100_000_000)
+        do {
+            let script = "(trap '' TERM INT; exec /bin/sleep 1000) & echo $! > \"$MACOP_AGENT_SIGNAL_CHILD_FILE\"; while :; do sleep 1; done"
+            let pid = try spawn(["/bin/sh", "-c", script], environment: ProcessInfo.processInfo.environment,
+                                isolatedProcessGroup: true)
+            let owned = try capture(pid, mode: "shell")
+            signals.installOwned(owned)
+            signals.beginRootWait()
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = try? waitForShellExit(pid) { signals.isCancellationRequested() }
+                signals.endRootWait()
+            }
+            while signals.exitStatus == nil {
+                signals.finalizeSignalCleanupIfNeeded()
+                usleep(20000)
+            }
+            return signals.exitStatus!
+        } catch {
+            return signals.requestedExitStatus ?? ExitCode.denied.rawValue
         }
-        while signals.exitStatus == nil {
-            signals.finalizeSignalCleanupIfNeeded()
-            usleep(20000)
-        }
-        return signals.exitStatus!
-    } catch {
-        return signals.requestedExitStatus ?? ExitCode.denied.rawValue
     }
+
+    private func runApplicationSignalFixture() -> Int32 {
+        let signals = SignalCoordinator(gracefulShutdownNanoseconds: 100_000_000)
+        do {
+            let script = "(trap '' TERM INT; exec /bin/sleep 1000) & echo $! > \"$MACOP_AGENT_SIGNAL_CHILD_FILE\"; while :; do sleep 1; done"
+            let pid = try spawn(["/bin/sh", "-c", script], environment: ProcessInfo.processInfo.environment,
+                                isolatedProcessGroup: true)
+            let owned = try capture(pid, mode: "application")
+            signals.installOwned(owned)
+            signals.beginRootWait()
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = try? waitForApplicationExit(owned) { signals.isCancellationRequested() }
+                signals.endRootWait()
+            }
+            while signals.exitStatus == nil {
+                signals.finalizeSignalCleanupIfNeeded()
+                usleep(20000)
+            }
+            return signals.exitStatus!
+        } catch {
+            return signals.requestedExitStatus ?? ExitCode.denied.rawValue
+        }
+    }
+#endif
+
+private struct LaunchCodeIdentity {
+    let bundleID: String
+    let requirement: String
+    let snapshot: LiveCodeIdentity
 }
 
-private func runApplicationSignalFixture() -> Int32 {
-    let signals = SignalCoordinator(gracefulShutdownNanoseconds: 100_000_000)
-    let path = ProcessInfo.processInfo.environment["MACOP_AGENT_SIGNAL_CHILD_FILE"] ?? "/dev/null"
-    do {
-        let script = "(trap '' TERM INT; exec /bin/sleep 1000) & echo $! > '\(path)'; while :; do sleep 1; done"
-        let pid = try spawn(["/bin/sh", "-c", script], environment: ProcessInfo.processInfo.environment,
-                            isolatedProcessGroup: true)
-        let owned = try capture(pid, mode: "application")
-        signals.installOwned(owned)
-        signals.beginRootWait()
-        DispatchQueue.global(qos: .userInitiated).async {
-            _ = try? waitForApplicationExit(owned) { signals.isCancellationRequested() }
-            signals.endRootWait()
-        }
-        while signals.exitStatus == nil {
-            signals.finalizeSignalCleanupIfNeeded()
-            usleep(20000)
-        }
-        return signals.exitStatus!
-    } catch {
-        return signals.requestedExitStatus ?? ExitCode.denied.rawValue
-    }
+private func identity(for pid: Int32, expectedPath: String) throws -> LaunchCodeIdentity {
+    let inspection = try LiveCodeIdentityInspector.inspect(pid: pid, expectedPath: expectedPath)
+    return LaunchCodeIdentity(
+        bundleID: inspection.identity.identifier,
+        requirement: inspection.codeRequirement,
+        snapshot: inspection.identity
+    )
 }
 
-private func identity(for pid: Int32) throws -> (bundleID: String, requirement: String) {
-    var code: SecCode?
-    guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid: pid] as CFDictionary, [], &code) == errSecSuccess,
-          let code else { throw AgentProtocolError.denied }
-    var staticCode: SecStaticCode?
-    guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
-          let staticCode else { throw AgentProtocolError.denied }
-    var info: CFDictionary?
-    guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSRequirementInformation), &info) ==
-        errSecSuccess,
-        let values = info as? [CFString: Any], let bundleID = values[kSecCodeInfoIdentifier] as? String,
-        !bundleID.isEmpty
-    else { throw AgentProtocolError.denied }
-    var requirementRef: SecRequirement?; var requirementText: CFString?
-    guard SecCodeCopyDesignatedRequirement(staticCode, [], &requirementRef) == errSecSuccess,
-          let requirementRef,
-          SecRequirementCopyString(requirementRef, [], &requirementText) == errSecSuccess,
-          let requirement = requirementText as String?
-    else { throw AgentProtocolError.denied }
-    var expected: SecRequirement?
-    guard SecRequirementCreateWithString(requirement as CFString, [], &expected) == errSecSuccess,
-          let expected,
-          SecStaticCodeCheckValidity(staticCode, SecCSFlags(rawValue: kSecCSStrictValidate), expected) == errSecSuccess
-    else { throw AgentProtocolError.denied }
-    return (bundleID, requirement)
+private func expectedExecutable(mode: String, target: [String], environment: [String: String]) throws -> String {
+    guard let target = target.first else { throw AgentProtocolError.denied }
+    if mode == "application" {
+        let app = URL(fileURLWithPath: target).resolvingSymlinksInPath()
+        guard let executable = Bundle(url: app)?.executableURL else { throw AgentProtocolError.denied }
+        return LiveCodeIdentityInspector.canonicalPath(executable.path)
+    }
+    if target.contains("/") {
+        return LiveCodeIdentityInspector.canonicalPath(target)
+    }
+    let searchPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+    for directory in searchPath.split(separator: ":", omittingEmptySubsequences: false) {
+        let candidate = URL(fileURLWithPath: directory.isEmpty ? "." : String(directory))
+            .appendingPathComponent(target).path
+        if FileManager.default.isExecutableFile(atPath: candidate) {
+            return LiveCodeIdentityInspector.canonicalPath(candidate)
+        }
+    }
+    throw AgentProtocolError.denied
 }
 
 private func run(mode: String, label: String, target: [String], signals: SignalCoordinator) throws -> Int32 {
-    let registry = try SessionRegistry(root: rootDirectory())
+    let root = rootDirectory()
+    let registry = try SessionRegistry(root: root)
+    defer { _ = rmdir(root.path) }
     let dependencies = VerifiedSessionRuntimeDependencies(
         selectIdentity: { try SSHCommand.verifiedSessionIdentity(label: $0) },
         launch: { reservation in
+            let launchEnvironment = environment(for: reservation)
+            let expectedPath = try expectedExecutable(mode: mode, target: target, environment: launchEnvironment)
             let owned: OwnedProcess
             if mode == "shell" {
                 let isolatedProcessGroup = !hasInteractiveTerminal()
                 let pid = try spawn(
-                    target, environment: environment(for: reservation), isolatedProcessGroup: isolatedProcessGroup
+                    target, environment: launchEnvironment, isolatedProcessGroup: isolatedProcessGroup
                 )
                 // Capture the start time and group before any operation that
                 // could fail. Never re-read ownership in a deferred cleanup:
@@ -293,7 +312,7 @@ private func run(mode: String, label: String, target: [String], signals: SignalC
                     throw error
                 }
             } else if mode == "application" {
-                let application = try launchApplication(target[0], environment: environment(for: reservation))
+                let application = try launchApplication(target[0], environment: launchEnvironment)
                 do {
                     owned = try capture(application.processIdentifier, mode: mode, app: application)
                 } catch {
@@ -310,11 +329,12 @@ private func run(mode: String, label: String, target: [String], signals: SignalC
                     terminateOwnedRoot(owned)
                 }
             }
-            let code = try identity(for: owned.pid)
+            let code = try identity(for: owned.pid, expectedPath: expectedPath)
             established = true
             return VerifiedSessionRuntimeLaunch(
                 request: VerifiedSessionLaunchRequest(rootPID: owned.pid, rootStartTime: owned.startTime,
-                                                      bundleID: code.bundleID, codeRequirement: code.requirement),
+                                                      bundleID: code.bundleID, codeRequirement: code.requirement,
+                                                      codeIdentity: code.snapshot),
                 waitForExit: {
                     if mode == "shell" {
                         signals.beginRootWait()
@@ -352,23 +372,26 @@ private func run(mode: String, label: String, target: [String], signals: SignalC
     return signals.exitStatus ?? status
 }
 
-if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_LIFECYCLE_FIXTURES"] == "1" {
-    exit(runLifecycleFixtures() ? ExitCode.success.rawValue : ExitCode.denied.rawValue)
-}
+#if DEBUG
+    if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_LIFECYCLE_FIXTURES"] == "1" {
+        exit(runLifecycleFixtures() ? ExitCode.success.rawValue : ExitCode.denied.rawValue)
+    }
 
-if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_SIGNAL_FIXTURE"] == "1" {
-    exit(runSignalFixture())
-}
+    if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_SIGNAL_FIXTURE"] == "1" {
+        exit(runSignalFixture())
+    }
 
-if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_APPLICATION_SIGNAL_FIXTURE"] == "1" {
-    exit(runApplicationSignalFixture())
-}
+    if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_APPLICATION_SIGNAL_FIXTURE"] == "1" {
+        exit(runApplicationSignalFixture())
+    }
+#endif
 
 private let signals = SignalCoordinator()
 let args = Array(CommandLine.arguments.dropFirst())
 guard let mode = args.first, args.count >= 3 else { fail(usage) }
 let label = args[1]
 do {
+    try TrustedAgentHelperVerifier.requireTrustedRunningHelper()
     switch mode {
     case "shell":
         guard let separator = args.firstIndex(of: "--"), separator >= 2, separator + 1 < args.count else { fail(usage) }

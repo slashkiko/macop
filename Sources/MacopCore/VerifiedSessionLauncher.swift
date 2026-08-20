@@ -13,12 +13,20 @@ public struct VerifiedSessionLaunchRequest: Sendable {
     public let rootStartTime: UInt64
     public let bundleID: String
     public let codeRequirement: String
+    public let codeIdentity: LiveCodeIdentity
 
-    public init(rootPID: Int32, rootStartTime: UInt64, bundleID: String, codeRequirement: String) {
+    public init(
+        rootPID: Int32,
+        rootStartTime: UInt64,
+        bundleID: String,
+        codeRequirement: String,
+        codeIdentity: LiveCodeIdentity
+    ) {
         self.rootPID = rootPID
         self.rootStartTime = rootStartTime
         self.bundleID = bundleID
         self.codeRequirement = codeRequirement
+        self.codeIdentity = codeIdentity
     }
 }
 

@@ -65,10 +65,12 @@ public final class VerifiedSessionAgent: @unchecked Sendable {
     private let clientSendBuffer: Int32
     private let maximumClientOutput: Int
     private let maximumClients: Int
+    private let maximumPendingClients: Int
     private let lock = NSLock()
     private let listening = NSCondition()
     private var listeningFD: Int32 = -1
     private var clients = Set<Int32>()
+    private var pendingClients = Set<Int32>()
     private var socketPathIdentity: SocketPathIdentity?
     private var stopped = false
 
@@ -82,7 +84,8 @@ public final class VerifiedSessionAgent: @unchecked Sendable {
         frameWriteTimeout: TimeInterval = 5,
         clientSendBuffer: Int32 = 64 * 1024,
         maximumClientOutput: Int = 1 * 1024 * 1024,
-        maximumClients: Int = 32
+        maximumClients: Int = 32,
+        maximumPendingClients: Int = 4
     ) {
         self.registry = registry
         self.sessionID = sessionID
@@ -94,6 +97,7 @@ public final class VerifiedSessionAgent: @unchecked Sendable {
         self.clientSendBuffer = max(1024, clientSendBuffer)
         self.maximumClientOutput = max(SSHWire.maxFrameLength, maximumClientOutput)
         self.maximumClients = max(1, maximumClients)
+        self.maximumPendingClients = max(1, min(maximumPendingClients, self.maximumClients))
     }
 
     deinit { self.stop() }
@@ -158,12 +162,18 @@ public final class VerifiedSessionAgent: @unchecked Sendable {
             guard Self.setCloseOnExec(client) else { close(client); continue }
             guard Self.setSendBuffer(client, bytes: self.clientSendBuffer) else { close(client); continue }
             self.lock.lock()
-            guard self.clients.count < self.maximumClients else {
+            // A connection remains pending until activation, approval, and
+            // signer installation have all completed. Keep those waiters in a
+            // separate small budget so they cannot consume every client slot.
+            guard self.clients.count < self.maximumClients,
+                  self.pendingClients.count < self.maximumPendingClients
+            else {
                 self.lock.unlock()
                 close(client)
                 continue
             }
             self.clients.insert(client)
+            self.pendingClients.insert(client)
             self.lock.unlock()
             self.queue.async { [self] in self.serveConnection(client) }
         }
@@ -249,7 +259,7 @@ public final class VerifiedSessionAgent: @unchecked Sendable {
 
     private func serveConnection(_ socket: Int32) {
         defer {
-            self.lock.lock(); self.clients.remove(socket); self.lock.unlock()
+            self.lock.lock(); self.clients.remove(socket); self.pendingClients.remove(socket); self.lock.unlock()
             close(socket)
         }
         guard let peer = try? SocketPeerEvidence.read(from: socket) else { return }
@@ -266,9 +276,19 @@ public final class VerifiedSessionAgent: @unchecked Sendable {
                 usleep(10000)
             }
         }
+        self.lock.lock(); self.pendingClients.remove(socket); self.lock.unlock()
+        guard let session = self.registry.session(self.sessionID),
+              connection!.requester.verify(peer: peer, session: session)
+        else { return }
         var outputBytes = 0
         while self.registry.session(self.sessionID) != nil {
             guard self.socketPathIsUnchanged() else { self.failClosedForSocketSubstitution(); return }
+            guard Self.waitForFrameStart(socket, shouldStop: {
+                self.shouldStop() || self.registry.session(self.sessionID) == nil || !self.socketPathIsUnchanged()
+            }) else {
+                guard self.socketPathIsUnchanged() else { self.failClosedForSocketSubstitution(); return }
+                return
+            }
             guard let payload = try? Self.readFrame(socket, timeout: self.frameReadTimeout) else { return }
             guard self.socketPathIsUnchanged() else { self.failClosedForSocketSubstitution(); return }
             let reply = connection!.reply(peer: peer, payload: payload)
@@ -335,6 +355,27 @@ public final class VerifiedSessionAgent: @unchecked Sendable {
         let length = try SSHWire.readU32(header)
         guard length <= UInt32(SSHWire.maxFrameLength) else { throw AgentProtocolError.tooLarge }
         return try self.readExactly(Int(length), from: socket, deadline: deadline)
+    }
+
+    private static func waitForFrameStart(_ socket: Int32, shouldStop: () -> Bool) -> Bool {
+        while !shouldStop() {
+            var descriptor = pollfd(fd: socket, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&descriptor, 1, 250)
+            if ready < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                return false
+            }
+            guard ready > 0 else { continue }
+            if descriptor.revents & Int16(POLLIN) != 0 {
+                return true
+            }
+            if descriptor.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 {
+                return false
+            }
+        }
+        return false
     }
 
     private static func readExactly(_ count: Int, from socket: Int32, deadline: UInt64) throws -> Data {

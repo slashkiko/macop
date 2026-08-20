@@ -16,6 +16,13 @@ func spawn(_ argv: [String], environment: [String: String], isolatedProcessGroup
     var attributes: posix_spawnattr_t?
     guard posix_spawnattr_init(&attributes) == 0 else { throw AgentProtocolError.denied }
     defer { posix_spawnattr_destroy(&attributes) }
+    var actions: posix_spawn_file_actions_t?
+    guard posix_spawn_file_actions_init(&actions) == 0 else { throw AgentProtocolError.denied }
+    defer { posix_spawn_file_actions_destroy(&actions) }
+    guard posix_spawn_file_actions_addinherit_np(&actions, STDIN_FILENO) == 0,
+          posix_spawn_file_actions_addinherit_np(&actions, STDOUT_FILENO) == 0,
+          posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO) == 0
+    else { throw AgentProtocolError.denied }
     var flags: Int16 = 0
     var childSignalMask = sigset_t()
     sigemptyset(&childSignalMask)
@@ -27,7 +34,7 @@ func spawn(_ argv: [String], environment: [String: String], isolatedProcessGroup
           posix_spawnattr_setsigdefault(&attributes, &childSignalDefaults) == 0,
           posix_spawnattr_getflags(&attributes, &flags) == 0
     else { throw AgentProtocolError.denied }
-    flags |= Int16(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF)
+    flags |= Int16(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_CLOEXEC_DEFAULT)
     if isolatedProcessGroup {
         guard posix_spawnattr_setflags(&attributes, flags | Int16(POSIX_SPAWN_SETPGROUP)) == 0,
               // A zero process-group argument asks posix_spawn to establish a
@@ -40,7 +47,7 @@ func spawn(_ argv: [String], environment: [String: String], isolatedProcessGroup
     }
     let result = arguments.withUnsafeMutableBufferPointer { argvBuffer in
         variables.withUnsafeMutableBufferPointer { environmentBuffer in
-            posix_spawnp(&pid, program, nil, &attributes, argvBuffer.baseAddress, environmentBuffer.baseAddress)
+            posix_spawnp(&pid, program, &actions, &attributes, argvBuffer.baseAddress, environmentBuffer.baseAddress)
         }
     }
     guard result == 0 else { throw AgentProtocolError.denied }
@@ -303,7 +310,7 @@ func terminateOwnedRoot(
     }
 }
 
-private func waitForFile(_ url: URL) -> Bool {
+func waitForFile(_ url: URL) -> Bool {
     let deadline = DispatchTime.now().uptimeNanoseconds + 2_000_000_000
     while DispatchTime.now().uptimeNanoseconds < deadline {
         if FileManager.default.fileExists(atPath: url.path) {
@@ -318,7 +325,7 @@ private func processExists(_ pid: Int32) -> Bool {
     kill(pid_t(pid), 0) == 0 || errno == EPERM
 }
 
-private func waitForProcessExit(_ pid: Int32) -> Bool {
+func waitForProcessExit(_ pid: Int32) -> Bool {
     let deadline = DispatchTime.now().uptimeNanoseconds + 2_000_000_000
     while DispatchTime.now().uptimeNanoseconds < deadline {
         if !processExists(pid) {
@@ -327,73 +334,4 @@ private func waitForProcessExit(_ pid: Int32) -> Bool {
         usleep(20000)
     }
     return !processExists(pid)
-}
-
-private func fixtureFailure(_ stage: String) -> Bool {
-    if ProcessInfo.processInfo.environment["MACOP_AGENT_LIFECYCLE_DEBUG"] == "1" {
-        FileHandle.standardError.write(Data("lifecycle fixture failed: \(stage)\n".utf8))
-    }
-    return false
-}
-
-/// Hidden, CTK-independent process fixtures used by the agent helper test.
-/// They exercise the actual spawn/ownership/termination path, including a
-/// TERM-ignoring forked child. A pseudo-terminal wrapper invokes this binary
-/// separately to confirm interactive children retain its foreground group.
-func runLifecycleFixtures() -> Bool {
-    let root = FileManager.default.temporaryDirectory
-        .appendingPathComponent("macop-agent-lifecycle-\(UUID().uuidString)")
-    defer { try? FileManager.default.removeItem(at: root) }
-    do {
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let childFile = root.appendingPathComponent("child")
-        let script = "trap '' TERM; (trap '' TERM; exec /bin/sleep 1000) & echo $! > '\(childFile.path)'; while :; do sleep 1; done"
-        let pid = try spawn(["/bin/sh", "-c", script], environment: ProcessInfo.processInfo.environment,
-                            isolatedProcessGroup: true)
-        let owned = try capture(pid, mode: "shell")
-        guard waitForFile(childFile),
-              let child = try Int32(String(contentsOf: childFile).trimmingCharacters(in: .whitespacesAndNewlines))
-        else { abandon(pid, mode: "shell", isolated: true); return fixtureFailure("shell-ready") }
-        terminateOwnedRoot(owned)
-        guard waitForProcessExit(pid), waitForProcessExit(child) else { return fixtureFailure("shell-cleanup") }
-
-        let failedChildFile = root.appendingPathComponent("capture-failure-child")
-        let failedScript = "(trap '' TERM; exec /bin/sleep 1000) & echo $! > '\(failedChildFile.path)'; while :; do sleep 1; done"
-        let failedPID = try spawn(["/bin/sh", "-c", failedScript], environment: ProcessInfo.processInfo.environment,
-                                  isolatedProcessGroup: true)
-        guard waitForFile(failedChildFile),
-              let failedChild = try Int32(String(contentsOf: failedChildFile)
-                  .trimmingCharacters(in: .whitespacesAndNewlines))
-        else { abandon(failedPID, mode: "shell", isolated: true); return fixtureFailure("capture-failure-ready") }
-        abandon(failedPID, mode: "shell", isolated: true)
-        guard waitForProcessExit(failedPID), waitForProcessExit(failedChild)
-        else { return fixtureFailure("capture-failure-cleanup") }
-
-        let appChildFile = root.appendingPathComponent("app-child")
-        let appScript = "trap '' TERM; (trap '' TERM; exec /bin/sleep 1000) & echo $! > '\(appChildFile.path)'; while :; do sleep 1; done"
-        let appPID = try spawn(["/bin/sh", "-c", appScript], environment: ProcessInfo.processInfo.environment,
-                               isolatedProcessGroup: true)
-        let appOwned = try capture(appPID, mode: "application")
-        guard waitForFile(appChildFile),
-              let appChild = try Int32(String(contentsOf: appChildFile).trimmingCharacters(in: .whitespacesAndNewlines))
-        else { abandon(appPID, mode: "shell", isolated: true); return fixtureFailure("app-ready") }
-        terminateOwnedRoot(appOwned)
-        _ = try? waitForShellExit(appPID)
-        guard waitForProcessExit(appPID) else { return fixtureFailure("app-root-cleanup") }
-        guard waitForProcessExit(appChild) else { return fixtureFailure("app-child-cleanup") }
-
-        if isatty(STDIN_FILENO) == 1, isatty(STDOUT_FILENO) == 1 {
-            let interactivePID = try spawn(["/bin/sh", "-c", "trap 'exit 130' INT; read -r _ </dev/tty"],
-                                           environment: ProcessInfo.processInfo.environment,
-                                           isolatedProcessGroup: false)
-            guard getpgid(pid_t(interactivePID)) == getpgrp() else {
-                abandon(interactivePID, mode: "shell"); return fixtureFailure("interactive-pgrp")
-            }
-            _ = kill(pid_t(interactivePID), SIGINT)
-            guard (try? waitForShellExit(interactivePID)) == 130 else { return fixtureFailure("interactive-sigint") }
-        }
-        return true
-    } catch {
-        return fixtureFailure("threw")
-    }
 }

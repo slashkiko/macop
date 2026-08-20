@@ -17,6 +17,59 @@ public enum RunCommand {
         )
     }
 
+    public static func relayTrustedAgent(
+        argv: [String], environment: [String: String], policy: TrustedAgentLaunchPolicy,
+        stdout: @escaping @Sendable (Data) -> Void, stderr: @escaping @Sendable (Data) -> Void
+    ) throws -> Int32 {
+        try ProcessRunner.executeStreaming(
+            argv: argv, environment: environment, stdin: nil,
+            stdoutRedactor: nil, stderrRedactor: nil, stdout: stdout, stderr: stderr,
+            suspendedPolicy: policy
+        )
+    }
+
+    public static func captureTrustedAgent(
+        argv: [String], environment: [String: String], policy: TrustedAgentLaunchPolicy, limit: Int
+    ) throws -> CommandResult {
+        try ProcessRunner.execute(
+            argv: argv, environment: environment, stdin: nil,
+            stdoutRedactor: nil, stderrRedactor: nil, captureLimit: limit,
+            suspendedPolicy: policy
+        )
+    }
+
+    public static func runTrustedAgentInteractively(
+        argv: [String], environment: [String: String], policy: TrustedAgentLaunchPolicy
+    ) throws -> Int32 {
+        try SuspendedTerminalProcess.execute(
+            argv: argv,
+            environment: environment,
+            validate: { try policy.validateRunningProcess($0) }
+        )
+    }
+
+    /// Process-level fixture seam for PTY/job-control coverage. Production
+    /// trusted-agent dispatch always uses `runTrustedAgentInteractively`.
+    public static func runSuspendedInteractiveFixture(
+        argv: [String], environment: [String: String],
+        validate: @escaping @Sendable (Int32) throws -> Void
+    ) throws -> Int32 {
+        try SuspendedTerminalProcess.execute(argv: argv, environment: environment, validate: validate)
+    }
+
+    /// Process-level fixture seam for the non-interactive suspended launch.
+    /// Production trusted-agent dispatch always supplies a code-identity policy.
+    public static func captureSuspendedFixture(
+        argv: [String], environment: [String: String], limit: Int,
+        validate: @escaping @Sendable (Int32) throws -> Void
+    ) throws -> CommandResult {
+        try ProcessRunner.execute(
+            argv: argv, environment: environment, stdin: nil,
+            stdoutRedactor: nil, stderrRedactor: nil, captureLimit: limit,
+            suspendedValidator: validate
+        )
+    }
+
     public static func capture(
         argv: [String], environment: [String: String], limit: Int
     ) throws -> CommandResult {
@@ -122,7 +175,7 @@ public enum RunCommand {
                 client: client
             )
             childEnvironment[key] = resolved.output
-            secrets.append(contentsOf: resolved.secrets + [resolved.output])
+            secrets.append(contentsOf: resolved.secrets)
         }
         let stdin = try parsed.stdinReference.map {
             try Data(SecretMaterial.resolveSingleReference($0, options: options, env: childEnvironment, client: client)
@@ -402,12 +455,32 @@ enum SecretMaterial {
     }
 }
 
+private enum ExecutableResolver {
+    static func resolve(_ command: String, environment: [String: String]) throws -> String {
+        if command.contains("/") {
+            guard access(command, X_OK) == 0 else {
+                throw CLIError.runtimeError(message: "Unable to start command: \(command).")
+            }
+            return command
+        }
+        let path = environment["PATH"] ?? "/usr/bin:/bin"
+        for directory in path.split(separator: ":", omittingEmptySubsequences: false) {
+            let candidate = (directory.isEmpty ? "." : String(directory)) + "/" + command
+            if access(candidate, X_OK) == 0 {
+                return candidate
+            }
+        }
+        throw CLIError.runtimeError(message: "Unable to start command: \(command).")
+    }
+}
+
 private enum ProcessRunner {
     // swiftlint:disable:next function_parameter_count
     static func executeStreaming(
         argv: [String], environment: [String: String], stdin: Data?, stdoutRedactor: SecretRedactor?,
         stderrRedactor: SecretRedactor?, stdout: @escaping @Sendable (Data) -> Void,
-        stderr: @escaping @Sendable (Data) -> Void
+        stderr: @escaping @Sendable (Data) -> Void,
+        suspendedPolicy: TrustedAgentLaunchPolicy? = nil
     ) throws -> Int32 {
         let result = try self.execute(
             argv: argv,
@@ -417,7 +490,8 @@ private enum ProcessRunner {
             stderrRedactor: stderrRedactor,
             stdoutSink: stdout,
             stderrSink: stderr,
-            captureLimit: 0
+            captureLimit: 0,
+            suspendedPolicy: suspendedPolicy
         )
         return result.exitCode
     }
@@ -425,8 +499,16 @@ private enum ProcessRunner {
     static func execute(
         argv: [String], environment: [String: String], stdin: Data?, stdoutRedactor: SecretRedactor?,
         stderrRedactor: SecretRedactor?, stdoutSink: (@Sendable (Data) -> Void)? = nil,
-        stderrSink: (@Sendable (Data) -> Void)? = nil, captureLimit: Int = .max
+        stderrSink: (@Sendable (Data) -> Void)? = nil, captureLimit: Int = .max,
+        suspendedPolicy: TrustedAgentLaunchPolicy? = nil,
+        suspendedValidator: (@Sendable (Int32) throws -> Void)? = nil
     ) throws -> CommandResult {
+        let executable = try ExecutableResolver.resolve(argv[0], environment: environment)
+        let validator = suspendedValidator ?? suspendedPolicy.map { policy in
+            { try policy.validateRunningProcess($0) }
+        }
+        let signalGate = try validator.map { _ in try SuspendedSignalGate() }
+        defer { signalGate?.finish() }
         var input = [Int32](repeating: -1, count: 2); var output = input; var errors = input
         defer { for descriptor in input + output + errors where descriptor >= 0 {
             _ = close(descriptor)
@@ -440,6 +522,22 @@ private enum ProcessRunner {
         }
         defer {
             posix_spawn_file_actions_destroy(&actions)
+        }
+        var attributes: posix_spawnattr_t?
+        guard posix_spawnattr_init(&attributes) == 0 else {
+            throw CLIError.runtimeError(message: "Unable to configure process descriptors.")
+        }
+        defer { posix_spawnattr_destroy(&attributes) }
+        var spawnFlags: Int16 = 0
+        let requestedFlags = Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
+            | (validator == nil ? 0 : Int16(POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_SETSIGMASK))
+        var childSignalMask = sigset_t()
+        sigemptyset(&childSignalMask)
+        guard posix_spawnattr_getflags(&attributes, &spawnFlags) == 0,
+              posix_spawnattr_setflags(&attributes, spawnFlags | requestedFlags) == 0,
+              validator == nil || posix_spawnattr_setsigmask(&attributes, &childSignalMask) == 0
+        else {
+            throw CLIError.runtimeError(message: "Unable to isolate process descriptors.")
         }
         posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO); posix_spawn_file_actions_adddup2(
             &actions,
@@ -456,19 +554,54 @@ private enum ProcessRunner {
             envPointers.compactMap(\.self).forEach { free($0) }
         }
         var pid: pid_t = 0
-        let status = argvPointers.withUnsafeMutableBufferPointer { argvBuffer in
-            envPointers.withUnsafeMutableBufferPointer { envBuffer in
-                posix_spawnp(&pid, argvBuffer[0], &actions, nil, argvBuffer.baseAddress, envBuffer.baseAddress)
+        let status = executable.withCString { executablePointer in
+            argvPointers.withUnsafeMutableBufferPointer { argvBuffer in
+                envPointers.withUnsafeMutableBufferPointer { envBuffer in
+                    posix_spawn(
+                        &pid,
+                        executablePointer,
+                        &actions,
+                        &attributes,
+                        argvBuffer.baseAddress,
+                        envBuffer.baseAddress
+                    )
+                }
             }
         }
         guard status == 0 else { throw CLIError.runtimeError(message: "Unable to start command: \(argv[0]).") }
         var childReaped = false
+        var childResumed = validator == nil
         defer {
             if !childReaped {
-                _ = kill(pid, SIGTERM)
+                _ = kill(pid, childResumed ? SIGTERM : SIGKILL)
                 var ignoredStatus: Int32 = 0
                 while waitpid(pid, &ignoredStatus, 0) == -1, errno == EINTR {}
             }
+        }
+        if let validator, let signalGate {
+            do {
+                try validator(pid)
+            } catch {
+                _ = kill(pid, SIGKILL)
+                var ignoredStatus: Int32 = 0
+                while waitpid(pid, &ignoredStatus, 0) == -1, errno == EINTR {}
+                childReaped = true
+                throw CLIError.denied(message: "The launched macop-agent image did not match the trusted helper.")
+            }
+            if let signalNumber = signalGate.pendingCancellation() {
+                _ = kill(pid, SIGKILL)
+                var ignoredStatus: Int32 = 0
+                while waitpid(pid, &ignoredStatus, 0) == -1, errno == EINTR {}
+                childReaped = true
+                return CommandResult(exitCode: 128 + signalNumber, stdout: "", stderr: "")
+            }
+            guard kill(pid, SIGCONT) == 0 else {
+                throw CLIError.runtimeError(message: "Unable to resume trusted macop-agent.")
+            }
+            childResumed = true
+            // The ordinary streaming wait keeps the caller's prior signal
+            // behavior. The gate exists only across the trusted pre-exec check.
+            signalGate.finishBeforeWait()
         }
         _ = close(input[0]); input[0] = -1; _ = close(output[1]); output[1] = -1; _ = close(errors[1]); errors[1] = -1
         let outputRead = output[0]
@@ -577,6 +710,220 @@ private struct PreparedRun {
     let noMasking: Bool
 }
 
+/// Holds INT/TERM while a suspended image is being authenticated. A signal
+/// observed before the resume boundary is consumed and returned to the caller;
+/// it can never be delivered by first running an unapproved child image.
+private final class SuspendedSignalGate {
+    let descriptor: Int32
+    private var previousMask = sigset_t()
+    private var maskBlocked = false
+    private var bridgeInstalled = false
+
+    init() throws {
+        self.descriptor = macop_signal_pipe_install()
+        guard self.descriptor >= 0 else {
+            throw CLIError.runtimeError(message: "Unable to monitor helper signals.")
+        }
+        self.bridgeInstalled = true
+        var mask = sigset_t()
+        sigemptyset(&mask)
+        sigaddset(&mask, SIGINT)
+        sigaddset(&mask, SIGTERM)
+        guard pthread_sigmask(SIG_BLOCK, &mask, &self.previousMask) == 0 else {
+            macop_signal_pipe_restore()
+            self.bridgeInstalled = false
+            throw CLIError.runtimeError(message: "Unable to isolate helper validation signals.")
+        }
+        self.maskBlocked = true
+    }
+
+    func pendingCancellation() -> Int32? {
+        var observed = self.drainSignals()
+        var pending = sigset_t()
+        guard sigpending(&pending) == 0 else { return observed.first }
+        for signalNumber in [SIGINT, SIGTERM] where sigismember(&pending, signalNumber) == 1 {
+            var singleSignal = sigset_t()
+            sigemptyset(&singleSignal)
+            sigaddset(&singleSignal, signalNumber)
+            var consumed: Int32 = 0
+            if sigwait(&singleSignal, &consumed) == 0 {
+                observed.append(consumed)
+            }
+        }
+        return observed.first { $0 == SIGINT || $0 == SIGTERM }
+    }
+
+    /// Restore the original handlers while cancellation remains blocked, then
+    /// unmask. This avoids swallowing signals during the ordinary child wait.
+    func finishBeforeWait() {
+        self.restoreBridge()
+        self.restoreMask()
+    }
+
+    /// Interactive callers keep the bridge after unmasking so later signals can
+    /// be forwarded to the already authenticated child.
+    func unblockForForwarding() {
+        self.restoreMask()
+    }
+
+    func finish() {
+        self.restoreMask()
+        self.restoreBridge()
+    }
+
+    private func drainSignals() -> [Int32] {
+        var result = [Int32]()
+        var buffer = [UInt8](repeating: 0, count: 16)
+        while true {
+            let count = read(self.descriptor, &buffer, buffer.count)
+            if count < 0, errno == EINTR {
+                continue
+            }
+            guard count > 0 else { return result }
+            result.append(contentsOf: buffer.prefix(Int(count)).map(Int32.init))
+        }
+    }
+
+    private func restoreMask() {
+        guard self.maskBlocked else { return }
+        _ = pthread_sigmask(SIG_SETMASK, &self.previousMask, nil)
+        self.maskBlocked = false
+    }
+
+    private func restoreBridge() {
+        guard self.bridgeInstalled else { return }
+        macop_signal_pipe_restore()
+        self.bridgeInstalled = false
+    }
+}
+
+/// The trusted helper already owns the caller's terminal and launches the
+/// requested root itself. A new pseudo-terminal would obscure foreground-job
+/// semantics, so start the exact helper suspended in the wrapper's existing
+/// foreground process group, validate its live SecCode, then resume it.
+private enum SuspendedTerminalProcess {
+    static func execute(
+        argv: [String], environment: [String: String],
+        validate: @escaping @Sendable (Int32) throws -> Void
+    ) throws -> Int32 {
+        guard !argv.isEmpty, isatty(STDIN_FILENO) == 1, isatty(STDOUT_FILENO) == 1 else {
+            throw CLIError.runtimeError(message: "Unable to configure trusted helper terminal.")
+        }
+        var arguments = argv.map { strdup($0) } + [nil]
+        var variables = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer {
+            arguments.compactMap(\.self).forEach { free($0) }
+            variables.compactMap(\.self).forEach { free($0) }
+        }
+        var attributes: posix_spawnattr_t?
+        guard posix_spawnattr_init(&attributes) == 0 else {
+            throw CLIError.runtimeError(message: "Unable to configure trusted helper.")
+        }
+        defer { posix_spawnattr_destroy(&attributes) }
+        let signalGate = try SuspendedSignalGate()
+        defer { signalGate.finish() }
+        let flags = Int16(
+            POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_SETSIGMASK
+        )
+        var childSignalMask = sigset_t()
+        sigemptyset(&childSignalMask)
+        guard posix_spawnattr_setflags(&attributes, flags) == 0,
+              posix_spawnattr_setsigmask(&attributes, &childSignalMask) == 0
+        else { throw CLIError.runtimeError(message: "Unable to isolate trusted helper.") }
+        var actions: posix_spawn_file_actions_t?
+        guard posix_spawn_file_actions_init(&actions) == 0 else {
+            throw CLIError.runtimeError(message: "Unable to configure trusted helper terminal.")
+        }
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        guard posix_spawn_file_actions_addinherit_np(&actions, STDIN_FILENO) == 0,
+              posix_spawn_file_actions_addinherit_np(&actions, STDOUT_FILENO) == 0,
+              posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO) == 0
+        else { throw CLIError.runtimeError(message: "Unable to inherit trusted helper terminal.") }
+        var pid: pid_t = 0
+        let spawnStatus = arguments.withUnsafeMutableBufferPointer { argumentBuffer in
+            variables.withUnsafeMutableBufferPointer { environmentBuffer in
+                posix_spawn(
+                    &pid, argv[0], &actions, &attributes,
+                    argumentBuffer.baseAddress, environmentBuffer.baseAddress
+                )
+            }
+        }
+        guard spawnStatus == 0 else { throw CLIError.runtimeError(message: "Unable to start macop-agent.") }
+        var reaped = false
+        defer {
+            if !reaped {
+                _ = kill(pid, SIGKILL)
+                var ignored: Int32 = 0
+                while waitpid(pid, &ignored, 0) == -1, errno == EINTR {}
+            }
+        }
+        do {
+            try validate(pid)
+        } catch {
+            throw CLIError.denied(message: "The launched macop-agent image did not match the trusted helper.")
+        }
+        guard getpgid(pid) == getpgrp() else {
+            throw CLIError.runtimeError(message: "Unable to resume trusted macop-agent.")
+        }
+        if let signalNumber = signalGate.pendingCancellation() {
+            _ = kill(pid, SIGKILL)
+            var ignored: Int32 = 0
+            while waitpid(pid, &ignored, 0) == -1, errno == EINTR {}
+            reaped = true
+            return 128 + signalNumber
+        }
+        guard kill(pid, SIGCONT) == 0 else {
+            throw CLIError.runtimeError(message: "Unable to resume trusted macop-agent.")
+        }
+        signalGate.unblockForForwarding()
+        var status: Int32 = 0
+        var forwardedSignal: Int32?
+        var forcedDeadline: UInt64?
+        while true {
+            let waited = waitpid(pid, &status, WNOHANG)
+            if waited == pid {
+                reaped = true
+                return self.exitCode(for: status)
+            }
+            if waited == -1, errno != EINTR {
+                throw CLIError.runtimeError(message: "Unable to wait for trusted macop-agent.")
+            }
+            for signalNumber in self.drainSignals(signalGate.descriptor) {
+                if signalNumber == SIGINT || signalNumber == SIGTERM {
+                    forwardedSignal = forwardedSignal ?? signalNumber
+                    forcedDeadline = forcedDeadline ?? DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+                    _ = kill(pid, signalNumber)
+                }
+            }
+            if let deadline = forcedDeadline, DispatchTime.now().uptimeNanoseconds >= deadline {
+                _ = kill(pid, SIGKILL)
+                while waitpid(pid, &status, 0) == -1, errno == EINTR {}
+                reaped = true
+                return forwardedSignal.map { 128 + $0 } ?? ExitCode.denied.rawValue
+            }
+            var descriptor = pollfd(fd: signalGate.descriptor, events: Int16(POLLIN), revents: 0)
+            _ = poll(&descriptor, 1, 50)
+        }
+    }
+
+    private static func drainSignals(_ descriptor: Int32) -> [Int32] {
+        var result = [Int32]()
+        var buffer = [UInt8](repeating: 0, count: 16)
+        while true {
+            let count = read(descriptor, &buffer, buffer.count)
+            if count < 0, errno == EINTR {
+                continue
+            }
+            guard count > 0 else { return result }
+            result.append(contentsOf: buffer.prefix(Int(count)).map(Int32.init))
+        }
+    }
+
+    private static func exitCode(for status: Int32) -> Int32 {
+        status & 0x7F != 0 ? 128 + (status & 0x7F) : (status >> 8) & 0xFF
+    }
+}
+
 /// A synchronous relay used only when the CLI itself owns an interactive
 /// terminal. Keeping it here (rather than in MacopCLI) makes the process and
 /// secret-handling boundary identical for all executable entry points.
@@ -589,7 +936,7 @@ private enum TerminalRelay {
         guard ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 else {
             throw CLIError.runtimeError(message: "Unable to read terminal size.")
         }
-        let executable = try self.resolveExecutable(argv[0], environment: environment)
+        let executable = try ExecutableResolver.resolve(argv[0], environment: environment)
         var ptyController: Int32 = -1; var pid: pid_t = 0
         // execve receives the resolved path separately; argv[0] remains exactly
         // what the caller supplied, matching execvp's public contract.
@@ -683,23 +1030,6 @@ private enum TerminalRelay {
             descriptors[0].revents = 0; descriptors[1].revents = 0
         }
         return self.exitCode(for: status)
-    }
-
-    private static func resolveExecutable(_ command: String, environment: [String: String]) throws -> String {
-        if command.contains("/") {
-            guard access(command, X_OK) == 0 else {
-                throw CLIError.runtimeError(message: "Unable to start command: \(command).")
-            }
-            return command
-        }
-        let path = environment["PATH"] ?? "/usr/bin:/bin"
-        for directory in path.split(separator: ":", omittingEmptySubsequences: false) {
-            let candidate = (directory.isEmpty ? "." : String(directory)) + "/" + command
-            if access(candidate, X_OK) == 0 {
-                return candidate
-            }
-        }
-        throw CLIError.runtimeError(message: "Unable to start command: \(command).")
     }
 
     private static func relayInput(from source: Int32, to destination: Int32) throws {

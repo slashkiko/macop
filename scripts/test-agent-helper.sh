@@ -26,7 +26,7 @@ status=$?
 set -e
 
 test ! -s "$stdout_file"
-test "$status" -eq 4 -o "$status" -eq 6
+test "$status" -eq 3
 /usr/bin/python3 - "$stderr_file" <<'PY'
 import json
 import pathlib
@@ -35,10 +35,10 @@ import sys
 text = pathlib.Path(sys.argv[1]).read_text()
 payload = json.loads(text)
 error = payload.get("error", {})
-assert error.get("code") in {"provider_unavailable", "not_found"}, payload
+assert error.get("code") == "unsupported_command", payload
 assert "debug" in error, payload
 message = error.get("message", "")
-assert "macop-agent is missing or unsafe" not in message, payload
+assert "team-signed" in message and "ad-hoc" in message, payload
 PY
 
 set +e
@@ -49,7 +49,7 @@ status=$?
 set -e
 
 test ! -s "$stdout_file"
-test "$status" -eq 4 -o "$status" -eq 6
+test "$status" -eq 3
 test "$(grep -Ec '^macop: debug exit_code=[0-9]+ command=ssh$' "$stderr_file")" -eq 1
 
 # Exercise macop-agent's direct human error renderer too. The top-level macop

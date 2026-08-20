@@ -219,7 +219,15 @@ private func runtimeSelftests() throws {
                         rootPID: 42,
                         rootStartTime: 7,
                         bundleID: "test.agent",
-                        codeRequirement: "anchor test"
+                        codeRequirement: "anchor test",
+                        codeIdentity: LiveCodeIdentity(
+                            canonicalPath: "/tmp/test-agent",
+                            identifier: "test.agent",
+                            teamID: nil,
+                            signingAuthority: nil,
+                            cdHash: "00112233445566778899",
+                            hasTrustedPublisher: false
+                        )
                     ),
                     waitForExit: { exit }, cancel: { state.cancel() }
                 )
@@ -244,10 +252,113 @@ private func runtimeSelftests() throws {
     let (success, state, _) = try runRuntime(approved: true, signer: AgentTestSigner(), exit: 143)
     try expect(success == 143, "runtime must preserve conventional signal exit status")
     let presentation = state.snapshot().0
-    try expect(presentation?.identityLabel == "test" && presentation?.application == "test.agent"
+    try expect(presentation?.identityLabel == "test" && presentation?.application == "/tmp/test-agent"
         && presentation?.fingerprint == sshFingerprint(for: agentTestKey)
-        && presentation?.verification == "verified (code requirement matched)",
+        && presentation?.verification == "exact image pinned; publisher unverified"
+        && presentation?.cdHash == "001122334455…8899",
         "runtime presentation must be derived from the activated registry session")
+    let trustedMain = LiveCodeIdentity(
+        canonicalPath: "/Applications/macop", identifier: "macop", teamID: "TEAM123",
+        signingAuthority: "Developer ID Application: Example", cdHash: "aabbccdd",
+        hasTrustedPublisher: true
+    )
+    let trustedHelper = LiveCodeIdentity(
+        canonicalPath: "/Applications/macop-agent", identifier: "macop-agent", teamID: "TEAM123",
+        signingAuthority: "Developer ID Application: Example", cdHash: "eeff0011",
+        hasTrustedPublisher: true
+    )
+    try expect(
+        TrustedAgentHelperVerifier.isTrustedPair(main: trustedMain, helper: trustedHelper),
+        "matching anchored team-signed helper pair must be eligible"
+    )
+    let spoofedTerminal = LiveCodeIdentity(
+        canonicalPath: "/tmp/Terminal", identifier: "com.apple.Terminal", teamID: nil,
+        signingAuthority: nil, cdHash: "11223344", hasTrustedPublisher: false
+    )
+    try expect(
+        !TrustedAgentHelperVerifier.isTrustedPair(main: spoofedTerminal, helper: trustedHelper)
+            && spoofedTerminal.provenanceSummary == "exact image pinned; publisher unverified",
+        "an ad-hoc process using an Apple identifier must never gain publisher provenance"
+    )
+    let wrongIdentifierMain = LiveCodeIdentity(
+        canonicalPath: trustedMain.canonicalPath, identifier: "com.example.macop", teamID: trustedMain.teamID,
+        signingAuthority: trustedMain.signingAuthority, cdHash: trustedMain.cdHash, hasTrustedPublisher: true
+    )
+    try expect(
+        !TrustedAgentHelperVerifier.isTrustedPair(main: wrongIdentifierMain, helper: trustedHelper),
+        "a trusted main executable with any identifier other than macop must be rejected"
+    )
+    let wrongTeamHelper = LiveCodeIdentity(
+        canonicalPath: trustedHelper.canonicalPath, identifier: trustedHelper.identifier, teamID: "OTHERTEAM",
+        signingAuthority: trustedHelper.signingAuthority, cdHash: trustedHelper.cdHash, hasTrustedPublisher: true
+    )
+    try expect(
+        !TrustedAgentHelperVerifier.isTrustedPair(main: trustedMain, helper: wrongTeamHelper),
+        "a helper signed by another team must be rejected"
+    )
+    let wrongIdentifierHelper = LiveCodeIdentity(
+        canonicalPath: trustedHelper.canonicalPath, identifier: "macop-helper", teamID: trustedHelper.teamID,
+        signingAuthority: trustedHelper.signingAuthority, cdHash: trustedHelper.cdHash, hasTrustedPublisher: true
+    )
+    try expect(
+        !TrustedAgentHelperVerifier.isTrustedPair(main: trustedMain, helper: wrongIdentifierHelper),
+        "a trusted helper with any identifier other than macop-agent must be rejected"
+    )
+    let emptyTeamMain = LiveCodeIdentity(
+        canonicalPath: trustedMain.canonicalPath, identifier: "macop", teamID: "",
+        signingAuthority: trustedMain.signingAuthority, cdHash: trustedMain.cdHash, hasTrustedPublisher: true
+    )
+    try expect(
+        !TrustedAgentHelperVerifier.isTrustedPair(main: emptyTeamMain, helper: trustedHelper),
+        "an empty signing Team ID must be rejected"
+    )
+    try expect(
+        !LiveCodeIdentityInspector.matchesExpectedPath(actual: "/tmp/other-root", expected: "/tmp/test-agent"),
+        "a launched root whose executable differs from the selected path must be rejected"
+    )
+    let forbiddenSideEffect = URL(fileURLWithPath: "/tmp/macop-suspended-child-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: forbiddenSideEffect) }
+    do {
+        _ = try RunCommand.captureTrustedAgent(
+            argv: ["/usr/bin/touch", forbiddenSideEffect.path],
+            environment: ProcessInfo.processInfo.environment,
+            policy: TrustedAgentLaunchPolicy(
+                executablePath: "/usr/bin/touch", teamID: "ATTACKER", identifier: "macop-agent"
+            ),
+            limit: 1024
+        )
+        throw SelftestFailure(message: "a substituted helper must fail live validation")
+    } catch let error as CLIError {
+        guard case .denied = error else { throw error }
+    }
+    try expect(
+        !FileManager.default.fileExists(atPath: forbiddenSideEffect.path),
+        "a helper rejected after suspended spawn must never execute its first side effect"
+    )
+    for signalNumber in [SIGINT, SIGTERM] {
+        let cancelledSideEffect = URL(
+            fileURLWithPath: "/tmp/macop-suspended-cancel-\(signalNumber)-\(UUID().uuidString)"
+        )
+        defer { try? FileManager.default.removeItem(at: cancelledSideEffect) }
+        let cancelled = try RunCommand.captureSuspendedFixture(
+            argv: ["/usr/bin/touch", cancelledSideEffect.path],
+            environment: ProcessInfo.processInfo.environment,
+            limit: 1024,
+            validate: { _ in
+                usleep(20000)
+                _ = raise(signalNumber)
+                usleep(20000)
+            }
+        )
+        try expect(
+            cancelled.exitCode == 128 + signalNumber,
+            "a cancellation arriving during streaming validation must return its signal status"
+        )
+        try expect(
+            !FileManager.default.fileExists(atPath: cancelledSideEffect.path),
+            "a streaming child cancelled during validation must never be resumed"
+        )
+    }
     let mismatched = AgentTestSigner(publicKeyBlob: agentTestKey, fingerprint: "SHA256:other")
     let (failed, mismatchState, _) = try runRuntime(approved: true, signer: mismatched, exit: 0)
     try expect(failed == nil && mismatchState.snapshot().1, "fingerprint mismatch must deny and cancel launched root")
@@ -290,6 +401,102 @@ private func agentSelftests() throws {
         requirement: selfRequirement
     )
     try expect(!selfIdentifier.isEmpty, "self process must pass its own designated requirement")
+    let selfPath = try RunningExecutable.path()
+    let liveInspection = try LiveCodeIdentityInspector.inspect(pid: getpid(), expectedPath: selfPath)
+    let liveSigning = liveInspection.identity
+    let staticSigning = try LiveCodeIdentityInspector.inspectStatic(path: selfPath)
+    try expect(
+        LiveCodeIdentityInspector.matchesExpectedPath(actual: liveSigning.canonicalPath, expected: selfPath)
+            && liveSigning.identifier == selfIdentifier && liveSigning.identifier == staticSigning.identifier
+            && liveSigning.cdHash != nil && liveSigning.cdHash == staticSigning.cdHash
+            && liveSigning.signatureFlags != 0 && liveSigning.signatureFlags == staticSigning.signatureFlags,
+        "live signing extraction must include the snapshot executable path, identifier, cdhash, and signing flags"
+    )
+    try expect(
+        liveInspection.codeRequirement.contains("cdhash H\"")
+            && liveInspection.codeRequirement.contains("identifier \"")
+            && !liveInspection.codeRequirement.contains("com.apple.Terminal"),
+        "live inspection must return its exact identifier+cdhash-bound requirement"
+    )
+    let mismatchedPathCandidate = LiveCodeIdentity(
+        canonicalPath: "/tmp/macop-forged-main-executable",
+        identifier: liveSigning.identifier,
+        teamID: liveSigning.teamID,
+        signingAuthority: liveSigning.signingAuthority,
+        cdHash: liveSigning.cdHash,
+        signatureFlags: liveSigning.signatureFlags,
+        hasTrustedPublisher: liveSigning.hasTrustedPublisher
+    )
+    do {
+        _ = try LiveCodeIdentityInspector.validateCandidateForTesting(
+            pid: getpid(), expectedPath: selfPath, candidate: mismatchedPathCandidate
+        )
+        throw SelftestFailure(message: "same live metadata with another main executable path must fail")
+    } catch AgentProtocolError.denied {}
+    let forgedHashCandidate = LiveCodeIdentity(
+        canonicalPath: liveSigning.canonicalPath,
+        identifier: liveSigning.identifier,
+        teamID: liveSigning.teamID,
+        signingAuthority: liveSigning.signingAuthority,
+        cdHash: String(repeating: "0", count: liveSigning.cdHash?.count ?? 40),
+        signatureFlags: liveSigning.signatureFlags,
+        hasTrustedPublisher: liveSigning.hasTrustedPublisher
+    )
+    do {
+        _ = try LiveCodeIdentityInspector.validateCandidateForTesting(
+            pid: getpid(), expectedPath: selfPath, candidate: forgedHashCandidate
+        )
+        throw SelftestFailure(message: "same-identifier metadata with another cdhash must fail live validation")
+    } catch AgentProtocolError.denied {}
+    let forgedTeamCandidate = LiveCodeIdentity(
+        canonicalPath: liveSigning.canonicalPath,
+        identifier: liveSigning.identifier,
+        teamID: "TEAMBBBBBB",
+        signingAuthority: "Forged Team B",
+        cdHash: liveSigning.cdHash,
+        signatureFlags: liveSigning.signatureFlags,
+        hasTrustedPublisher: true
+    )
+    do {
+        _ = try LiveCodeIdentityInspector.validateCandidateForTesting(
+            pid: getpid(), expectedPath: selfPath, candidate: forgedTeamCandidate
+        )
+        throw SelftestFailure(message: "Team B metadata must fail against another live signer")
+    } catch AgentProtocolError.denied {}
+    if ProcessInfo.processInfo.environment["MACOP_REQUIRE_TEAM_SIGNED_TEST"] == "1" {
+        try expect(
+            liveSigning.hasTrustedPublisher && liveSigning.teamID?.isEmpty == false
+                && liveSigning.signingAuthority?.isEmpty == false,
+            "team-signed integration mode requires Apple-anchored Team ID and certificate metadata"
+        )
+    }
+    if let signedMain = ProcessInfo.processInfo.environment["MACOP_TEAM_SIGNED_MAIN"] {
+        if let signedHelper = ProcessInfo.processInfo.environment["MACOP_TEAM_SIGNED_HELPER"] {
+            let mainIdentity = try LiveCodeIdentityInspector.inspectStatic(path: signedMain)
+            let helperIdentity = try LiveCodeIdentityInspector.inspectStatic(path: signedHelper)
+            try expect(
+                TrustedAgentHelperVerifier.isTrustedPair(main: mainIdentity, helper: helperIdentity),
+                "team-signed integration paths must identify an anchored same-Team macop/helper pair"
+            )
+            guard let teamID = mainIdentity.teamID else {
+                throw SelftestFailure(message: "team-signed integration main must expose a Team ID")
+            }
+            let launch = try RunCommand.captureTrustedAgent(
+                argv: [helperIdentity.canonicalPath],
+                environment: ProcessInfo.processInfo.environment,
+                policy: TrustedAgentLaunchPolicy(
+                    executablePath: helperIdentity.canonicalPath,
+                    teamID: teamID,
+                    identifier: TrustedAgentHelperVerifier.helperIdentifier
+                ),
+                limit: 4096
+            )
+            try expect(
+                launch.exitCode == ExitCode.invalidArguments.rawValue,
+                "team-signed integration helper must pass suspended live validation before its usage error"
+            )
+        }
+    }
 
     var peerSockets = [Int32](repeating: -1, count: 2)
     guard socketpair(AF_UNIX, SOCK_STREAM, 0, &peerSockets) == 0 else {
@@ -445,7 +652,7 @@ private func agentSelftests() throws {
     )
     let liveAgent = VerifiedSessionAgent(
         registry: liveRegistry, sessionID: liveReservation.id, connections: deferredConnections,
-        inspector: liveInspector, frameReadTimeout: 0.15, maximumClients: 1
+        inspector: liveInspector, frameReadTimeout: 0.15, maximumClients: 2, maximumPendingClients: 1
     )
     DispatchQueue.global().async { try? liveAgent.serve() }
     try expect(liveAgent.waitUntilListening(timeout: 2), "reserved listener must bind before child launch")
@@ -465,6 +672,32 @@ private func agentSelftests() throws {
         guard connected == 0
         else { close(descriptor); throw SelftestFailure(message: "absolute reserved socket path must connect") }
         return descriptor
+    }
+    func receiveLiveAgentFrame(from descriptor: Int32, timeoutMilliseconds: Int32 = 2000) throws -> Data {
+        func readExactly(_ count: Int) throws -> Data {
+            var result = Data(repeating: 0, count: count)
+            var offset = 0
+            while offset < count {
+                var ready = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+                guard poll(&ready, 1, timeoutMilliseconds) > 0,
+                      ready.revents & Int16(POLLIN) != 0
+                else { throw SelftestFailure(message: "live agent must return a complete frame") }
+                let received = result.withUnsafeMutableBytes { buffer in
+                    recv(descriptor, buffer.baseAddress!.advanced(by: offset), count - offset, 0)
+                }
+                guard received > 0 else {
+                    throw SelftestFailure(message: "live agent must not close during a response frame")
+                }
+                offset += received
+            }
+            return result
+        }
+        let header = try readExactly(4)
+        let length = header.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        guard length <= UInt32(SSHWire.maxFrameLength) else {
+            throw SelftestFailure(message: "live agent response frame must respect the protocol limit")
+        }
+        return try readExactly(Int(length))
     }
     let pendingClient = try connectLiveAgent()
     defer { _ = close(pendingClient) }
@@ -490,10 +723,24 @@ private func agentSelftests() throws {
     try expect(liveRegistry.authorize(liveReservation.id), "live session must grant only after signer installation")
     var replyPoll = pollfd(fd: pendingClient, events: Int16(POLLIN), revents: 0)
     try expect(poll(&replyPoll, 1, 2000) > 0, "activated client must receive identities response")
-    var response = [UInt8](repeating: 0, count: 64)
-    let received = recv(pendingClient, &response, response.count, 0)
-    try expect(received >= 5 && response[4] == AgentMessage.identitiesAnswer,
+    let response = try receiveLiveAgentFrame(from: pendingClient)
+    try expect(response.first == AgentMessage.identitiesAnswer,
                "real listener must bind peer evidence and reply with exact identities message")
+    usleep(250_000)
+    let idleSent = identitiesRequest.withUnsafeBytes {
+        send(pendingClient, $0.baseAddress!, identitiesRequest.count, Int32(MSG_NOSIGNAL))
+    }
+    try expect(idleSent == identitiesRequest.count, "idle client must send a second complete request")
+    var idlePoll = pollfd(fd: pendingClient, events: Int16(POLLIN), revents: 0)
+    try expect(
+        poll(&idlePoll, 1, 2000) > 0,
+        "a complete request after the frame timeout must retain the active connection"
+    )
+    let idleResponse = try receiveLiveAgentFrame(from: pendingClient)
+    try expect(
+        idleResponse.first == AgentMessage.identitiesAnswer,
+        "frame timeout must apply only after the next frame starts"
+    )
     let partialHeader = Data([0, 0, 0, 1])
     let partialSent = partialHeader.prefix(1).withUnsafeBytes {
         send(pendingClient, $0.baseAddress!, 1, Int32(MSG_NOSIGNAL))
@@ -966,6 +1213,15 @@ private func agentSelftests() throws {
         SSHWire.string(mpint(Data(rawP256.prefix(32)))) + SSHWire.string(mpint(Data(rawP256.suffix(32))))
     )
     try bindingVerifier.verify(hostKey: p256Host, sessionID: p256Session, signature: p256Signature)
+    for coordinateLength in [34, 256] {
+        let oversizedSignature = try SSHWire.string("ecdsa-sha2-nistp256") + SSHWire.string(
+            SSHWire.string(Data(repeating: 1, count: coordinateLength)) + SSHWire.string(Data([1]))
+        )
+        do {
+            try bindingVerifier.verify(hostKey: p256Host, sessionID: p256Session, signature: oversizedSignature)
+            throw SelftestFailure(message: "oversized P-256 coordinates must fail without trapping")
+        } catch AgentProtocolError.malformed {}
+    }
     let expiredRegistry = try SessionRegistry(root: registryRoot.appendingPathComponent("expired"))
     let expired = try expiredRegistry.create(
         rootPID: 42,
@@ -1068,6 +1324,25 @@ private func runHarnessIfRequested() -> Never? {
         ?? "keychain://generic/service/account"
 
     switch mode {
+    case "--suspended-interactive":
+        do {
+            let status = try RunCommand.runSuspendedInteractiveFixture(
+                argv: Array(arguments.dropFirst()),
+                environment: harnessEnvironment,
+                validate: { _ in
+                    if let readyPath = processEnvironment["MACOP_SUSPENDED_VALIDATION_READY"] {
+                        FileManager.default.createFile(atPath: readyPath, contents: Data())
+                    }
+                    let delay = processEnvironment["MACOP_SUSPENDED_VALIDATION_DELAY_US"].flatMap(useconds_t.init)
+                    if let delay {
+                        usleep(delay)
+                    }
+                }
+            )
+            exit(status)
+        } catch {
+            exit(ExitCode.runtimeError.rawValue)
+        }
     case "--pty-run", "--pty-run-large-stdin":
         let argv = ["macop"] + Array(arguments.dropFirst())
         let environment = harnessEnvironment.merging(
@@ -1114,6 +1389,25 @@ func run() throws {
     try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
     let configDirectory = tempRoot.path
 
+    let sentinel = open("/dev/null", O_RDONLY)
+    guard sentinel >= 3 else { throw SelftestFailure(message: "ambient FD sentinel must be available") }
+    defer { _ = close(sentinel) }
+    let sentinelFlags = fcntl(sentinel, F_GETFD)
+    try expect(sentinelFlags >= 0 && fcntl(sentinel, F_SETFD, sentinelFlags & ~FD_CLOEXEC) == 0,
+               "ambient FD sentinel must intentionally lack CLOEXEC")
+    let sentinelEnvironment = ["MACOP_SENTINEL_FD": "\(sentinel)"]
+    let sentinelCommand = ["/bin/sh", "-c", "test ! -e /dev/fd/$MACOP_SENTINEL_FD"]
+    let pipeSentinel: CommandResult
+    do {
+        pipeSentinel = try RunCommand.capture(argv: sentinelCommand, environment: sentinelEnvironment, limit: 1024)
+    } catch {
+        throw SelftestFailure(message: "pipe sentinel launch failed: \(error)")
+    }
+    try expect(
+        pipeSentinel.exitCode == 0,
+        "pipe child must not inherit an ambient non-CLOEXEC FD"
+    )
+
     let sessionRoot = tempRoot.appendingPathComponent("sessions", isDirectory: true)
     let sessionRegistry = try SessionRegistry(root: sessionRoot)
     let verifiedSession = try sessionRegistry.create(
@@ -1140,6 +1434,8 @@ func run() throws {
         identityLabel: "test",
         application: "macop-test",
         verification: "verified",
+        signingAuthority: "test signature",
+        cdHash: "00112233",
         fingerprint: "SHA256:test",
         sessionID: verifiedSession.id,
         expiresAt: verifiedSession.expiresAt
@@ -1516,6 +1812,10 @@ func run() throws {
 
     let configInit = app.run(argv: ["macop", "--config", configDirectory, "config", "init"], env: [:])
     try expect(configInit.exitCode == 0, "config init should exit 0")
+    let initializedConfigPath = URL(fileURLWithPath: configDirectory).appendingPathComponent("config.json").path
+    let configMode = try FileManager.default
+        .attributesOfItem(atPath: initializedConfigPath)[.posixPermissions] as? NSNumber
+    try expect(configMode?.intValue == 0o600, "config init must create the file with mode 0600")
 
     let configValidate = app.run(argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:])
     try expect(configValidate.exitCode == 0, "config validate should exit 0")
@@ -1562,6 +1862,15 @@ func run() throws {
         env: [:],
         input: Data("token=op://Local/GitHub/token\n".utf8)
     )
+    let injectReadsStdin = try InjectCommand.requiresStandardInput(args: [])
+    let injectFileReadsStdin = try InjectCommand.requiresStandardInput(args: ["--in-file", "template"])
+    try expect(injectReadsStdin, "inject without an input file must read stdin")
+    try expect(
+        !injectFileReadsStdin,
+        "inject with an input file must not read stdin"
+    )
+    let itemNamedInject = try ArgumentParser.parse(argv: ["macop", "item", "get", "inject"], env: [:])
+    try expect(itemNamedInject.command == .item, "an argument named inject must not select the inject command")
     try expect(injected.exitCode == 0, "inject stdin should succeed")
     try expect(injected.stdout == "token=test-secret\n", "inject should resolve references in memory")
     let adjacentReferences = app.run(
@@ -1621,6 +1930,27 @@ func run() throws {
     try expect(
         compositeRun.stdout == "<concealed by macop>" && compositeRun.stderr == "<concealed by macop>",
         "composite environment references must register each source secret for both streams"
+    )
+    let compositeValueRun = app.run(
+        argv: ["macop", "run", "--", "/bin/sh", "-c", "printf '%s' \"$AUTH\""],
+        env: ["AUTH": "Bearer keychain://generic/service/account"]
+    )
+    try expect(
+        compositeValueRun.stdout == "Bearer <concealed by macop>",
+        "masking must conceal only the resolved secret inside a composite value"
+    )
+    let executableDirectory = tempRoot.appendingPathComponent("child-path", isDirectory: true)
+    try FileManager.default.createDirectory(at: executableDirectory, withIntermediateDirectories: false)
+    let executable = executableDirectory.appendingPathComponent("macop-path-probe")
+    try Data("#!/bin/sh\nprintf 'child-path\\n'\n".utf8).write(to: executable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+    let childPathRun = app.run(
+        argv: ["macop", "run", "--no-masking", "--", "macop-path-probe"],
+        env: ["PATH": executableDirectory.path]
+    )
+    try expect(
+        childPathRun.exitCode == 0 && childPathRun.stdout == "child-path\n",
+        "non-interactive run must resolve executables from the child PATH"
     )
     let dotenvPath = tempRoot.appendingPathComponent(".env")
     try Data("FIRST=one\nGH_TOKEN=op://Local/GitHub/token\n".utf8).write(to: dotenvPath)
@@ -1845,11 +2175,76 @@ func run() throws {
         try expect(result.exitCode == 1, "invalid UTF-8 or NUL Keychain data should fail at runtime")
         try expect(!result.stderr.contains("secret\0value"), "invalid secret values must not leak")
     }
+    let ambiguousInternetApp = MacopApp(
+        keychainClient: FakeKeychainClient(response: .failure(.ambiguousInternetItem))
+    )
+    let ambiguousInternet = ambiguousInternetApp.run(
+        argv: ["macop", "read", "keychain://internet/server.example/account"], env: [:]
+    )
+    try expect(ambiguousInternet.exitCode == 2, "ambiguous internet items must be rejected")
+    try expect(!ambiguousInternet.stderr.contains("test-secret"), "ambiguous item errors must not leak values")
+    let ambiguousGeneric = ambiguousInternetApp.run(
+        argv: ["macop", "read", "keychain://generic/service/account"], env: [:]
+    )
+    try expect(ambiguousGeneric.exitCode == 2, "ambiguous generic items must be rejected")
+
+    let secretLikeExpansion = "do-not-print-\(UUID().uuidString)"
+    let invalidExpansion = app.run(
+        argv: ["macop", "read", "keychain://generic/$SECRET_SELECTOR/account"],
+        env: ["SECRET_SELECTOR": "\(secretLikeExpansion)?unsupported"]
+    )
+    try expect(invalidExpansion.exitCode == 3, "expanded invalid reference must fail")
+    try expect(
+        !invalidExpansion.stderr.contains(secretLikeExpansion),
+        "reference expansion errors must not echo environment values"
+    )
     let equalsOutputFlag = app.run(
         argv: ["macop", "read", "--out-file=token", "keychain://generic/service/account"],
         env: [:]
     )
     try expect(equalsOutputFlag.exitCode == 3, "persistent output equals flags should be unsupported")
+
+    let expandedSelector = "secret-like-selector-\(UUID().uuidString)"
+    struct ExpansionErrorCase {
+        let arguments: [String]
+        let expectedExitCode: Int32
+        let description: String
+    }
+    let expansionErrorCases = [
+        ExpansionErrorCase(arguments: ["macop", "read", "keychain://$SELECTOR/service/account"],
+                           expectedExitCode: 2, description: "unsupported expanded keychain kind"),
+        ExpansionErrorCase(arguments: ["macop", "--config", configDirectory, "read", "op://$SELECTOR/GitHub/token"],
+                           expectedExitCode: 6, description: "missing expanded config mapping"),
+        ExpansionErrorCase(arguments: ["macop", "--config", configDirectory, "read", "op://Local/GitHub/$SELECTOR"],
+                           expectedExitCode: 6, description: "missing expanded field"),
+        ExpansionErrorCase(
+            arguments: ["macop", "--config", configDirectory, "read", "op://Local/GitHub/$SELECTOR/token"],
+            expectedExitCode: 6,
+            description: "missing expanded section"
+        ),
+        ExpansionErrorCase(arguments: ["macop", "read", "keychain://generic/$SELECTOR?attribute=otp/account"],
+                           expectedExitCode: 3, description: "expanded query parameter")
+    ]
+    for errorCase in expansionErrorCases {
+        let arguments = errorCase.arguments
+        let expectedExitCode = errorCase.expectedExitCode
+        let description = errorCase.description
+        let environment = ["SELECTOR": expandedSelector]
+        let human = app.run(argv: arguments, env: environment)
+        try expect(human.exitCode == expectedExitCode, "\(description) should keep its typed exit code")
+        try expect(
+            !human.stderr.contains(expandedSelector),
+            "\(description) must redact expanded values in human errors"
+        )
+
+        let json = app.run(argv: arguments + ["--format=json", "--debug"], env: environment)
+        try expect(json.exitCode == expectedExitCode, "\(description) JSON should keep its typed exit code")
+        _ = try JSONSerialization.jsonObject(with: Data(json.stderr.utf8))
+        try expect(
+            !json.stderr.contains(expandedSelector),
+            "\(description) must redact expanded values in JSON/debug errors"
+        )
+    }
 
     let invalidProviderConfig = """
     {
@@ -1885,6 +2280,50 @@ func run() throws {
         unreadableConfig.stderr.contains("permissions must be owner-only"),
         "unsafe config mode should be explained"
     )
+    let linkedConfigDirectory = tempRoot.deletingLastPathComponent()
+        .appendingPathComponent("config-symlink-\(UUID().uuidString)")
+    guard symlink(tempRoot.path, linkedConfigDirectory.path) == 0 else {
+        throw SelftestFailure(message: "config directory symlink fixture requires a local symbolic link")
+    }
+    defer { _ = unlink(linkedConfigDirectory.path) }
+    let directorySymlinkConfig = app.run(
+        argv: ["macop", "--config", linkedConfigDirectory.path, "config", "validate"], env: [:]
+    )
+    try expect(directorySymlinkConfig.exitCode == 2, "config directory symlinks must be rejected")
+
+    let originalConfigPath = tempRoot.appendingPathComponent("config-original.json")
+    try fileManager.moveItem(at: configPath, to: originalConfigPath)
+    guard symlink(originalConfigPath.path, configPath.path) == 0 else {
+        throw SelftestFailure(message: "config file symlink fixture requires a local symbolic link")
+    }
+    let fileSymlinkConfig = app.run(
+        argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:]
+    )
+    try expect(fileSymlinkConfig.exitCode == 2, "config file symlinks must be rejected")
+    try fileManager.removeItem(at: configPath)
+    try fileManager.moveItem(at: originalConfigPath, to: configPath)
+
+    if ProcessInfo.processInfo.environment["MACOP_RUN_ACL_INTEGRATION"] == "1" {
+        let chmod = Process()
+        chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        chmod.arguments = ["+a", "everyone allow read", configPath.path]
+        try chmod.run()
+        chmod.waitUntilExit()
+        guard chmod.terminationStatus == 0 else {
+            throw SelftestFailure(message: "ACL integration fixture could not grant an extended ACL")
+        }
+        let aclRejected = app.run(
+            argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:]
+        )
+        try expect(aclRejected.exitCode == 2, "config file extended ACLs must be rejected")
+        guard let emptyACL = acl_init(0) else {
+            throw SelftestFailure(message: "ACL integration fixture could not construct an empty ACL")
+        }
+        defer { acl_free(UnsafeMutableRawPointer(emptyACL)) }
+        guard acl_set_file(configPath.path, ACL_TYPE_EXTENDED, emptyACL) == 0 else {
+            throw SelftestFailure(message: "ACL integration fixture could not clear the extended ACL")
+        }
+    }
 
     let unsupportedProvider = app.run(argv: ["macop", "read", "apple-passwords://example.com/me/password"], env: [:])
     try expect(unsupportedProvider.exitCode == 3, "apple-passwords should be unsupported")

@@ -102,7 +102,6 @@ public struct SecuritySessionBindingVerifier: SessionBindingVerifying {
     public init() {}
     public func verify(hostKey: Data, sessionID: Data, signature: Data) throws {
         var key = SSHCursor(hostKey); let algorithm = try text(key.string())
-        let secKey: SecKey
         switch algorithm {
         case "ssh-ed25519":
             let raw = try key.string(); guard raw.count == 32, key.isAtEnd else { throw AgentProtocolError.malformed }
@@ -121,7 +120,7 @@ public struct SecuritySessionBindingVerifier: SessionBindingVerifying {
             guard try self.text(key.string()) == "nistp256" else { throw AgentProtocolError.malformed }
             let point = try key.string(); guard point.count == 65, point.first == 4,
                                                 key.isAtEnd else { throw AgentProtocolError.malformed }
-            secKey = try self.makeKey(point, type: kSecAttrKeyTypeECSECPrimeRandom as CFString, size: 256)
+            let secKey = try self.makeKey(point, type: kSecAttrKeyTypeECSECPrimeRandom as CFString, size: 256)
             let der = try ecdsaSignatureDER(signature, expectedAlgorithm: algorithm)
             guard SecKeyVerifySignature(
                 secKey,
@@ -288,18 +287,18 @@ private func ecdsaSignatureDER(_ signature: Data, expectedAlgorithm: String) thr
     else { throw AgentProtocolError.denied }; let inner = try outer.string(); guard outer.isAtEnd
     else { throw AgentProtocolError.malformed }
     var values = SSHCursor(inner)
-    let firstCoordinate = try canonicalMPInt(values.string())
-    let secondCoordinate = try canonicalMPInt(values.string())
+    let firstCoordinate = try canonicalP256MPInt(values.string())
+    let secondCoordinate = try canonicalP256MPInt(values.string())
     guard values.isAtEnd else { throw AgentProtocolError.malformed }
-    let body = derInteger(firstCoordinate) + derInteger(secondCoordinate); guard body.count < 128
+    let body = try derInteger(firstCoordinate) + derInteger(secondCoordinate); guard body.count < 128
     else { throw AgentProtocolError.malformed }; return Data([
         0x30,
         UInt8(body.count)
     ]) + body
 }
 
-private func canonicalMPInt(_ value: Data) throws -> Data {
-    guard !value.isEmpty,
+private func canonicalP256MPInt(_ value: Data) throws -> Data {
+    guard !value.isEmpty, value.count <= 33,
           value.first != 0x00 || value.count == 1 || value
           .dropFirst().first! >= 0x80
     else { throw AgentProtocolError.malformed
@@ -308,10 +307,12 @@ private func canonicalMPInt(_ value: Data) throws -> Data {
     }; return value
 }
 
-private func derInteger(_ positive: Data) -> Data {
+private func derInteger(_ positive: Data) throws -> Data {
     let body = positive
-        .first! >= 0x80 ? Data([0]) + positive : positive; return Data([
-            0x02,
-            UInt8(body.count)
-        ]) + body
+        .first! >= 0x80 ? Data([0]) + positive : positive
+    guard let length = UInt8(exactly: body.count) else { throw AgentProtocolError.malformed }
+    return Data([
+        0x02,
+        length
+    ]) + body
 }

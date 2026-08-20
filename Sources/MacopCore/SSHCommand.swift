@@ -124,11 +124,21 @@ public enum SSHCommand {
         default: return nil
         }
         let capture = BoundedCommandCapture(limit: 65536)
-        let rawCode = try streaming.executeStreaming(
-            path: invocation.path, arguments: invocation.arguments, environment: invocation.environment,
-            stdout: { data in capture.append(data); stdout(data) },
-            stderr: { data in capture.append(data); stderr(data) }
-        )
+        let rawCode: Int32 = if let policy = invocation.trustedAgentPolicy, executor is SystemCommandExecutor {
+            try RunCommand.relayTrustedAgent(
+                argv: [invocation.path] + invocation.arguments,
+                environment: invocation.environment,
+                policy: policy,
+                stdout: { data in capture.append(data); stdout(data) },
+                stderr: { data in capture.append(data); stderr(data) }
+            )
+        } else {
+            try streaming.executeStreaming(
+                path: invocation.path, arguments: invocation.arguments, environment: invocation.environment,
+                stdout: { data in capture.append(data); stdout(data) },
+                stderr: { data in capture.append(data); stderr(data) }
+            )
+        }
         return subcommand == "test"
             ? self.normalizedTestExitCode(rawCode, output: capture.data, destination: self.testDestination(args))
             : rawCode
@@ -154,11 +164,19 @@ public enum SSHCommand {
         } else {
             nil
         }
-        let rawCode = try RunCommand.relayInteractively(
-            argv: [invocation.path] + invocation.arguments,
-            environment: invocation.environment,
-            observer: observer
-        )
+        let rawCode = if let policy = invocation.trustedAgentPolicy {
+            try RunCommand.runTrustedAgentInteractively(
+                argv: [invocation.path] + invocation.arguments,
+                environment: invocation.environment,
+                policy: policy
+            )
+        } else {
+            try RunCommand.relayInteractively(
+                argv: [invocation.path] + invocation.arguments,
+                environment: invocation.environment,
+                observer: observer
+            )
+        }
         return subcommand == "test"
             ? self.normalizedTestExitCode(rawCode, output: capture.data, destination: self.testDestination(args))
             : rawCode
@@ -226,6 +244,14 @@ public enum SSHCommand {
 private extension SSHCommand {
     private static func agent(_ args: [String], context: SSHContext) throws -> CommandResult {
         let invocation = try self.agentInvocation(args, context: context)
+        if let policy = invocation.trustedAgentPolicy, context.executor is SystemCommandExecutor {
+            return try RunCommand.captureTrustedAgent(
+                argv: [invocation.path] + invocation.arguments,
+                environment: invocation.environment,
+                policy: policy,
+                limit: 65536
+            )
+        }
         return try context.executor.execute(
             path: invocation.path,
             arguments: invocation.arguments,
@@ -253,32 +279,13 @@ private extension SSHCommand {
                     .invalidArguments(message: "Usage: macop ssh agent application <identity-label> <application-path>")
             }
         }
-        let executable = try self.resolveAgentExecutable()
-        return SSHInvocation(path: executable, arguments: args, environment: context.env)
-    }
-
-    private static func resolveAgentExecutable() throws -> String {
-        // CommandLine.arguments[0] is caller-controlled and can be merely
-        // "macop" when invoked through PATH. Resolve the running image instead.
-        let executable = try URL(fileURLWithPath: RunningExecutable.path())
-            .deletingLastPathComponent().appendingPathComponent("macop-agent").path
-        var details = stat()
-        guard lstat(executable, &details) == 0,
-              details.st_mode & S_IFMT == S_IFREG,
-              details.st_uid == getuid(),
-              details.st_mode & 0o022 == 0,
-              FileManager.default.isExecutableFile(atPath: executable)
-        else { throw CLIError.notFound(message: "macop-agent is missing or unsafe beside macop.") }
-        var staticCode: SecStaticCode?
-        var expected: SecRequirement?
-        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: executable) as CFURL, [], &staticCode) == errSecSuccess,
-              let staticCode,
-              SecRequirementCreateWithString("identifier \"macop-agent\"" as CFString, [], &expected) == errSecSuccess,
-              let expected,
-              SecStaticCodeCheckValidity(staticCode, SecCSFlags(rawValue: kSecCSStrictValidate), expected) ==
-              errSecSuccess
-        else { throw CLIError.notFound(message: "macop-agent is missing or unsafe beside macop.") }
-        return executable
+        let policy = try TrustedAgentHelperVerifier.resolveTrustedLaunch(of: RunningExecutable.path())
+        return SSHInvocation(
+            path: policy.executablePath,
+            arguments: args,
+            environment: context.env,
+            trustedAgentPolicy: policy
+        )
     }
 
     private static func create(
@@ -662,6 +669,19 @@ private struct SSHInvocation {
     let path: String
     let arguments: [String]
     let environment: CommandEnvironment
+    let trustedAgentPolicy: TrustedAgentLaunchPolicy?
+
+    init(
+        path: String,
+        arguments: [String],
+        environment: CommandEnvironment,
+        trustedAgentPolicy: TrustedAgentLaunchPolicy? = nil
+    ) {
+        self.path = path
+        self.arguments = arguments
+        self.environment = environment
+        self.trustedAgentPolicy = trustedAgentPolicy
+    }
 }
 
 private struct SSHIdentityResponse: Encodable {

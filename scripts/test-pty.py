@@ -98,7 +98,7 @@ def drain_pty(master: int, process: subprocess.Popen[bytes], timeout: float) -> 
 
 
 class PTYProcess:
-    def __init__(self, arguments: list[str], mode: str = "--pty-run"):
+    def __init__(self, arguments: list[str], mode: str = "--pty-run", pass_fds: tuple[int, ...] = (), env: dict[str, str] | None = None):
         self.master, slave = pty.openpty()
         self.initial_termios = termios.tcgetattr(slave)
         set_window_size(self.master, 24, 80)
@@ -116,6 +116,8 @@ class PTYProcess:
             # while still giving the controller an isolated process group.
             preexec_fn=establish_controlling_terminal,
             close_fds=True,
+            pass_fds=pass_fds,
+            env=env,
         )
         os.close(slave)
 
@@ -186,6 +188,23 @@ def check_basic_pty() -> None:
         require_equal(termios.tcgetattr(harness.master), initial, "outer PTY termios restoration")
     finally:
         harness.close()
+
+    sentinel = os.open("/dev/null", os.O_RDONLY)
+    try:
+        flags = fcntl.fcntl(sentinel, fcntl.F_GETFD)
+        fcntl.fcntl(sentinel, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
+        environment = os.environ | {"MACOP_SENTINEL_FD": str(sentinel)}
+        harness = PTYProcess(
+            ["run", "--", "/bin/sh", "-c", "test ! -e /dev/fd/$MACOP_SENTINEL_FD"],
+            pass_fds=(sentinel,), env=environment
+        )
+        try:
+            status, _ = harness.finish()
+            require_equal(status, 0, "PTY child must not inherit an ambient non-CLOEXEC FD")
+        finally:
+            harness.close()
+    finally:
+        os.close(sentinel)
 
 
 def check_masking() -> None:
@@ -284,6 +303,186 @@ def check_injected_stdin_on_outer_pty() -> None:
     require_equal(output, b"", "outer PTY early-close injected stdin output")
 
 
+def check_suspended_interactive_lifecycle(tmpdir: Path) -> None:
+    for signum, expected_status in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+        validation_ready = tmpdir / f"validation-ready-{signum}"
+        cancelled_side_effect = tmpdir / f"validation-side-effect-{signum}"
+        environment = os.environ.copy()
+        environment["MACOP_SUSPENDED_VALIDATION_READY"] = str(validation_ready)
+        environment["MACOP_SUSPENDED_VALIDATION_DELAY_US"] = "250000"
+        harness = PTYProcess(
+            ["/usr/bin/touch", str(cancelled_side_effect)],
+            mode="--suspended-interactive",
+            env=environment,
+        )
+        try:
+            wait_for_path(validation_ready, "delayed suspended validation")
+            os.kill(harness.process.pid, signum)
+            status, _ = harness.finish()
+            require_equal(status, expected_status, "pre-resume cancellation status")
+            if cancelled_side_effect.exists():
+                fail("interactive child cancelled during validation was resumed")
+        finally:
+            harness.close()
+
+    identity = tmpdir / "suspended-identity"
+    ready = tmpdir / "suspended-ready"
+    command = (
+        f'test -t 0 && test -t 1 || exit 90; '
+        f'printf "%s %s\\n" "$$" "$(ps -o pgid= -p $$ | tr -d " ")" > {shlex.quote(str(identity))}; '
+        f'trap "exit 130" INT; echo ready > {shlex.quote(str(ready))}; while :; do sleep 1; done'
+    )
+    harness = PTYProcess(["/bin/sh", "-c", command], mode="--suspended-interactive")
+    try:
+        wait_for_path(ready, "suspended helper readiness")
+        child_pid_text, child_group_text = identity.read_text().split()
+        child_pid = int(child_pid_text)
+        require_equal(int(child_group_text), os.getpgid(harness.process.pid), "helper inherited foreground pgrp")
+        harness.signal_group(signal.SIGINT)
+        status, _ = harness.finish()
+        require_equal(status, 130, "foreground-group SIGINT status")
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            fail("SIGINT helper child remained alive")
+    finally:
+        harness.close()
+
+    term_ready = tmpdir / "suspended-term-ready"
+    term_pid = tmpdir / "suspended-term-pid"
+    term_command = (
+        f'echo $$ > {shlex.quote(str(term_pid))}; trap "exit 143" TERM; '
+        f'echo ready > {shlex.quote(str(term_ready))}; while :; do sleep 1; done'
+    )
+    harness = PTYProcess(["/bin/sh", "-c", term_command], mode="--suspended-interactive")
+    try:
+        wait_for_path(term_ready, "direct TERM helper readiness")
+        child_pid = int(term_pid.read_text().strip())
+        os.kill(harness.process.pid, signal.SIGTERM)
+        status, _ = harness.finish()
+        require_equal(status, 143, "direct wrapper TERM forwarding status")
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            fail("direct wrapper TERM orphaned the helper child")
+    finally:
+        harness.close()
+
+    check_non_orphaned_job_control(tmpdir)
+
+
+def check_non_orphaned_job_control(tmpdir: Path) -> None:
+    """Act as a shell parent in the same session so SIGTSTP cannot be discarded."""
+    ready = tmpdir / "job-control-ready"
+    identity = tmpdir / "job-control-identity"
+    read_result, write_result = os.pipe()
+    master, slave = pty.openpty()
+    os.set_blocking(master, False)
+    initial_termios = termios.tcgetattr(slave)
+    controller = os.fork()
+    if controller == 0:
+        os.close(read_result)
+        os.close(master)
+        macop_pid = -1
+        try:
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            controller_group = os.getpgrp()
+            macop_pid = os.fork()
+            if macop_pid == 0:
+                os.setpgid(0, 0)
+                os.dup2(slave, 0)
+                os.dup2(slave, 1)
+                os.dup2(slave, 2)
+                command = (
+                    f'printf "%s %s\\n" "$$" "$(ps -o pgid= -p $$ | tr -d " ")" '
+                    f'> {shlex.quote(str(identity))}; trap "exit 143" TERM; '
+                    f'echo ready > {shlex.quote(str(ready))}; while :; do sleep 1; done'
+                )
+                os.execve(
+                    str(SELFTEST),
+                    [str(SELFTEST), "--suspended-interactive", "/bin/sh", "-c", command],
+                    os.environ,
+                )
+            try:
+                os.setpgid(macop_pid, macop_pid)
+            except PermissionError:
+                if os.getpgid(macop_pid) != macop_pid:
+                    raise
+            previous_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            os.tcsetpgrp(slave, macop_pid)
+            wait_for_path(ready, "non-orphaned job-control readiness")
+            helper_pid_text, helper_group_text = identity.read_text().split()
+            helper_pid = int(helper_pid_text)
+            require_equal(int(helper_group_text), macop_pid, "non-orphaned helper pgrp")
+            os.killpg(macop_pid, signal.SIGTSTP)
+            waited, wait_status = os.waitpid(macop_pid, os.WUNTRACED)
+            require_equal(waited, macop_pid, "stopped wrapper pid")
+            if not os.WIFSTOPPED(wait_status) or os.WSTOPSIG(wait_status) != signal.SIGTSTP:
+                fail("wrapper did not stop under shell-style SIGTSTP job control")
+            helper_state = subprocess.check_output(
+                ["/bin/ps", "-o", "state=", "-p", str(helper_pid)], text=True
+            ).strip()
+            if not helper_state.startswith("T"):
+                fail(f"helper did not stop with wrapper: state={helper_state!r}")
+            os.tcsetpgrp(slave, controller_group)
+            os.tcsetpgrp(slave, macop_pid)
+            os.killpg(macop_pid, signal.SIGCONT)
+            os.kill(macop_pid, signal.SIGTERM)
+            _, final_status = os.waitpid(macop_pid, 0)
+            require_equal(os.waitstatus_to_exitcode(final_status), 143, "fg-resumed helper TERM status")
+            os.tcsetpgrp(slave, controller_group)
+            require_equal(termios.tcgetattr(slave), initial_termios, "job-control terminal restoration")
+            signal.signal(signal.SIGTTOU, previous_ttou)
+            os.write(write_result, b"ok")
+            os._exit(0)
+        except BaseException as error:
+            if macop_pid > 0:
+                try:
+                    os.killpg(macop_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            os.write(write_result, f"error:{error}".encode())
+            os._exit(1)
+
+    os.close(write_result)
+    os.close(slave)
+    try:
+        deadline = time.monotonic() + TIMEOUT_SECONDS
+        result = b""
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([read_result], [], [], POLL_SECONDS)
+            if readable:
+                result += os.read(read_result, 4096)
+                if result:
+                    break
+            try:
+                while os.read(master, 4096):
+                    pass
+            except (BlockingIOError, OSError):
+                pass
+        waited = 0
+        controller_status = 0
+        while waited == 0 and time.monotonic() < deadline:
+            waited, controller_status = os.waitpid(controller, os.WNOHANG)
+            if waited == 0:
+                time.sleep(POLL_SECONDS)
+        if waited == 0:
+            os.kill(controller, signal.SIGKILL)
+            waited, controller_status = os.waitpid(controller, 0)
+            fail("timed out waiting for job-control controller")
+        require_equal(waited, controller, "job-control controller pid")
+        require_equal(os.waitstatus_to_exitcode(controller_status), 0, "job-control controller status")
+        require_equal(result, b"ok", "job-control controller result")
+    finally:
+        os.close(read_result)
+        os.close(master)
+
+
 def main() -> int:
     if not SELFTEST.is_file():
         fail(f"missing selftest executable: {SELFTEST}")
@@ -296,6 +495,7 @@ def main() -> int:
         check_window_size(tmpdir)
         check_delayed_inject()
         check_injected_stdin_on_outer_pty()
+        check_suspended_interactive_lifecycle(tmpdir)
     return 0
 
 

@@ -8,6 +8,7 @@ private func write(_ text: String, to handle: FileHandle) {
 
 let app = MacopApp()
 let environment = ProcessInfo.processInfo.environment
+let parsed = try? ArgumentParser.parse(argv: CommandLine.arguments, env: environment)
 let result = app.runInteractivelyIfNeeded(argv: CommandLine.arguments, env: environment) ?? {
     if let streamed = app.runStreamingIfNeeded(
         argv: CommandLine.arguments,
@@ -17,8 +18,9 @@ let result = app.runInteractivelyIfNeeded(argv: CommandLine.arguments, env: envi
     ) {
         return streamed
     }
-    let input = CommandLine.arguments.dropFirst().contains("inject") ? FileHandle.standardInput
-        .readDataToEndOfFile() : Data()
+    let readsStandardInput = parsed?.command == .inject
+        && (try? InjectCommand.requiresStandardInput(args: parsed?.commandArgs ?? [])) == true
+    let input = readsStandardInput ? FileHandle.standardInput.readDataToEndOfFile() : Data()
     return app.run(argv: CommandLine.arguments, env: environment, input: input)
 }()
 

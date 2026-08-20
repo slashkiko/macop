@@ -55,17 +55,59 @@ public enum ConfigStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         var data = try encoder.encode(document)
         data.append(contentsOf: Data("\n".utf8))
-        try data.write(to: fileURL, options: [.atomic])
-        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        try self.writeNewConfig(data, to: fileURL)
         return fileURL
+    }
+
+    private static func writeNewConfig(_ data: Data, to fileURL: URL) throws {
+        let temporaryURL = fileURL.deletingLastPathComponent()
+            .appendingPathComponent(".config-\(UUID().uuidString).tmp")
+        let descriptor = open(
+            temporaryURL.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR
+        )
+        guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer {
+            close(descriptor)
+            unlink(temporaryURL.path)
+        }
+        guard fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        var offset = 0
+        while offset < data.count {
+            let count = data.withUnsafeBytes { buffer in
+                write(descriptor, buffer.baseAddress!.advanced(by: offset), data.count - offset)
+            }
+            if count < 0, errno == EINTR {
+                continue
+            }
+            guard count > 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+            offset += count
+        }
+        guard fsync(descriptor) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard renameatx_np(
+            AT_FDCWD,
+            temporaryURL.path,
+            AT_FDCWD,
+            fileURL.path,
+            UInt32(RENAME_EXCL)
+        ) == 0 else {
+            if errno == EEXIST {
+                throw CLIError.invalidArguments(message: "Config already exists at \(fileURL.path)")
+            }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
     }
 
     public static func load(configDirectory: String?) throws -> ConfigDocument {
         let fileURL = try configFilePath(configDirectory: configDirectory)
-        try ConfigFilesystemValidator.validate(fileURL: fileURL)
         let data: Data
         do {
-            data = try Data(contentsOf: fileURL)
+            data = try ConfigFilesystemValidator.readValidated(fileURL: fileURL)
+        } catch let error as CLIError {
+            throw error
         } catch let error as NSError {
             if error.domain == NSCocoaErrorDomain, error.code == NSFileReadNoSuchFileError {
                 throw CLIError.notFound(message: "Config file not found at \(fileURL.path)")
@@ -109,7 +151,7 @@ public enum ConfigStore {
         let document = try load(configDirectory: configDirectory)
         let key = "\(namespace)/\(item)"
         guard let configItem = document.items[key] else {
-            throw CLIError.notFound(message: "No config entry for \"\(key)\"")
+            throw CLIError.notFound(message: "No config entry matches the requested reference.")
         }
         _ = try self.providerKind(for: configItem)
         return configItem
@@ -328,35 +370,5 @@ public enum ConfigStore {
     private static func decodeJSONString(_ rawValue: String) -> String? {
         let data = Data("[\"\(rawValue)\"]".utf8)
         return try? JSONDecoder().decode([String].self, from: data).first
-    }
-}
-
-private enum ConfigFilesystemValidator {
-    static func validate(fileURL: URL) throws {
-        let fileManager = FileManager.default
-        let directoryURL = fileURL.deletingLastPathComponent()
-        guard fileManager.fileExists(atPath: fileURL.path) else {
-            throw CLIError.notFound(message: "Config file not found at \(fileURL.path)")
-        }
-        for (url, description, requiredMode) in [
-            (directoryURL, "Config directory", UInt16(0o700)),
-            (fileURL, "Config file", UInt16(0o600))
-        ] {
-            let attributes = try fileManager.attributesOfItem(atPath: url.path)
-            guard let owner = attributes[.ownerAccountID] as? NSNumber, owner.uint32Value == getuid() else {
-                throw CLIError.denied(message: "\(description) must be owned by the current user.")
-            }
-            guard let permissions = attributes[.posixPermissions] as? NSNumber else {
-                throw CLIError.invalidArguments(message: "Unable to read \(description.lowercased()) permissions.")
-            }
-            let mode = permissions.uint16Value
-            guard mode == requiredMode else {
-                let expected = String(format: "%04o", requiredMode)
-                let actual = String(format: "%04o", mode)
-                throw CLIError.invalidArguments(
-                    message: "\(description) permissions must be owner-only (\(expected)). Current mode: \(actual)"
-                )
-            }
-        }
     }
 }
