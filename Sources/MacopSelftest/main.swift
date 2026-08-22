@@ -2158,10 +2158,83 @@ func run() throws {
         recordingClient.queries.last == .internet(server: "server.example", account: "account"),
         "internet URI query should preserve server/account"
     )
+
+    let persistentReference = Data([0x01, 0x02, 0x03])
+    let sharedContextAccess = RecordingKeychainSecurityAccess(
+        referenceResponses: [
+            KeychainSecurityResult(status: errSecSuccess, result: persistentReference as CFData)
+        ],
+        valueResponses: [
+            KeychainSecurityResult(status: errSecSuccess, result: Data("context-secret".utf8) as CFData)
+        ]
+    )
+    let sharedContextClient = SystemKeychainClient(securityAccess: sharedContextAccess)
+    let sharedContextRead = sharedContextClient.read(.generic(service: "service", account: "account"))
+    guard case let .success(sharedContextValue) = sharedContextRead else {
+        throw SelftestFailure(message: "exact-one Security boundary should return the unique item")
+    }
+    try expect(
+        String(data: sharedContextValue, encoding: .utf8) == "context-secret"
+            && sharedContextAccess.referenceContexts.count == 1
+            && sharedContextAccess.valueContexts.count == 1
+            && sharedContextAccess.referenceContexts[0] === sharedContextAccess.valueContexts[0],
+        "persistent-reference enumeration and value lookup must share one LAContext"
+    )
+
+    let noMatchAccess = RecordingKeychainSecurityAccess(
+        referenceResponses: [KeychainSecurityResult(status: errSecItemNotFound)]
+    )
+    guard case let .failure(noMatchFailure) = SystemKeychainClient(securityAccess: noMatchAccess)
+        .read(.generic(service: "missing", account: "account"))
+    else { throw SelftestFailure(message: "zero Keychain matches must fail") }
+    try expect(
+        noMatchFailure.status == errSecItemNotFound && noMatchAccess.valueContexts.isEmpty,
+        "zero matches must map to not found without attempting a value read"
+    )
+
+    let ambiguousAccess = RecordingKeychainSecurityAccess(
+        referenceResponses: [
+            KeychainSecurityResult(
+                status: errSecSuccess,
+                result: NSArray(array: [persistentReference, Data([0x04, 0x05])])
+            )
+        ]
+    )
+    guard case let .failure(ambiguousFailure) = SystemKeychainClient(securityAccess: ambiguousAccess)
+        .read(.internet(server: "server.example", account: "account"))
+    else { throw SelftestFailure(message: "multiple Keychain matches must fail") }
+    try expect(
+        ambiguousFailure.isAmbiguous && ambiguousAccess.valueContexts.isEmpty,
+        "multiple persistent references must be rejected before reading any secret"
+    )
+
+    let retryAccess = RecordingKeychainSecurityAccess(
+        referenceResponses: [
+            KeychainSecurityResult(status: errSecSuccess, result: persistentReference as CFData),
+            KeychainSecurityResult(status: errSecSuccess, result: persistentReference as CFData)
+        ],
+        valueResponses: [
+            KeychainSecurityResult(status: errSecAuthFailed),
+            KeychainSecurityResult(status: errSecSuccess, result: Data("retry-secret".utf8) as CFData)
+        ]
+    )
+    let retryClient = SystemKeychainClient(securityAccess: retryAccess)
+    guard case let .failure(firstRetryFailure) = retryClient.read(.generic(service: "service", account: "account")),
+          case .success = retryClient.read(.generic(service: "service", account: "account"))
+    else { throw SelftestFailure(message: "Keychain authentication must be retryable after failure") }
+    try expect(
+        firstRetryFailure.status == errSecAuthFailed
+            && retryAccess.referenceContexts[0] === retryAccess.valueContexts[0]
+            && retryAccess.referenceContexts[1] === retryAccess.valueContexts[1]
+            && retryAccess.referenceContexts[0] !== retryAccess.referenceContexts[1],
+        "each read must use one fresh, internally shared LAContext"
+    )
+
     for (status, expected) in [
         (errSecItemNotFound, Int32(6)),
         (errSecAuthFailed, Int32(5)),
         (errSecUserCanceled, Int32(5)),
+        (errSecInteractionNotAllowed, Int32(5)),
         (errSecNotAvailable, Int32(4)),
         (-9999, Int32(1))
     ] {
