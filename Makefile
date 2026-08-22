@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 .PHONY: help setup bootstrap hooks-install
-.PHONY: format format-check lint test test-agent-helper test-invocation test-no-persistence test-keychain-integration test-pty test-ssh-manual build
+.PHONY: format format-check lint test test-agent-helper test-invocation test-installation test-no-persistence test-keychain-integration test-pty test-ssh-manual build release-build install uninstall
 .PHONY: ci ci-swift ci-workflows ci-secrets
 .PHONY: pin-actions pin-actions-check
 .PHONY: workflow-lint workflow-security
@@ -15,7 +15,8 @@ GH_TOKEN ?= $(shell gh auth token 2>/dev/null || true)
 help:
 	@printf '%s\n' \
 	  'Setup:       make setup | bootstrap | hooks-install' \
-	  'Development: make format | format-check | lint | build | test | test-agent-helper | test-invocation | test-no-persistence' \
+	  'Development: make format | format-check | lint | build | release-build | test | test-agent-helper | test-invocation | test-installation | test-no-persistence' \
+	  'Install:     make install | uninstall' \
 	  'Manual:      make test-keychain-integration | test-pty | test-ssh-manual' \
 	  'CI groups:   make ci-swift | ci-workflows | ci-secrets | ci' \
 	  'Governance:  make workflow-lint | workflow-security | secret-scan | pin-actions-check'
@@ -46,6 +47,9 @@ test-agent-helper: build
 test-invocation: build
 	@bash scripts/test-invocation.sh
 
+test-installation: build
+	@bash scripts/test-installation.sh
+
 test-no-persistence: build
 	@python3 scripts/test-no-persistence.py
 
@@ -64,6 +68,15 @@ test-ssh-manual: build
 build:
 	$(SWIFTPM_GIT_SAFE_BARE) swift build
 
+release-build:
+	$(SWIFTPM_GIT_SAFE_BARE) swift build -c release
+
+install:
+	@bash scripts/build-install.sh
+
+uninstall:
+	@bash scripts/uninstall.sh
+
 workflow-lint:
 	mise exec -- actionlint
 
@@ -73,7 +86,7 @@ workflow-security:
 secret-scan:
 	mise exec -- betterleaks dir .
 
-ci-swift: format-check lint build test test-agent-helper test-invocation test-no-persistence
+ci-swift: format-check lint build test test-agent-helper test-invocation test-installation test-no-persistence
 
 ci-workflows: pin-actions-check workflow-lint workflow-security
 

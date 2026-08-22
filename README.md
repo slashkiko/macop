@@ -9,16 +9,27 @@ not a 1Password backend, vault, or Apple Passwords reader.
 
 ## Install from source
 
-Build the release binary and install it in a user-owned bin directory:
+Build, ad-hoc sign, verify, and install both executables in a user-owned bin directory:
 
 ```bash
-swift build -c release
-mkdir -p "$HOME/.local/bin"
-install -m 755 .build/release/macop "$HOME/.local/bin/macop"
-install -m 755 .build/release/macop-agent "$HOME/.local/bin/macop-agent"
-codesign --force --sign - --identifier macop "$HOME/.local/bin/macop"
-codesign --force --sign - --identifier macop-agent "$HOME/.local/bin/macop-agent"
+scripts/build-install.sh
 ```
+
+Run the full local gate before building, or safely create the optional script-compatible
+`op -> macop` symlink:
+
+```bash
+scripts/build-install.sh --check
+scripts/build-install.sh --with-op-symlink
+scripts/build-install.sh --configure-path
+```
+
+The install directory defaults to `~/.local/bin` and can be changed with
+`--bin-dir` or `MACOP_BIN_DIR`. The installer refuses to replace an existing
+`op` command or an unrelated `op` symlink. `--configure-path` adds a marked,
+installer-managed block to `~/.zprofile` or `~/.bash_profile`; use
+`--shell-profile` or `MACOP_SHELL_PROFILE` to select another file. Profile
+editing is opt-in and refuses symlinks.
 
 Ensure `$HOME/.local/bin` is on `PATH`. The source-build commands above are
 appropriate for the ordinary Keychain and `ssh` wrapper commands, but ad-hoc
@@ -51,8 +62,26 @@ already invoke `op`, install a sibling symlink instead; this intentionally makes
 ln -s macop "$HOME/.local/bin/op"
 ```
 
+The installer can create this symlink with `--with-op-symlink`; the manual form
+is retained here to make the PATH behavior explicit.
+
 macop never falls back to a separately installed 1Password `op` binary. Check
 the supported boundary with `macop compatibility` before switching scripts.
+
+## Uninstall
+
+Remove the installed executables and an installer-owned `op -> macop` symlink:
+
+```bash
+scripts/uninstall.sh
+```
+
+The uninstaller verifies the code-signing identifiers before removing the two
+executables. It deliberately preserves the install directory, macop
+configuration, Keychain items, CTK identities, and unrelated `op` commands.
+It removes only its marked PATH block by default; pass `--keep-path` to retain
+that block. Use the same `--bin-dir`, `MACOP_BIN_DIR`, `--shell-profile`, or
+`MACOP_SHELL_PROFILE` value that was used to install.
 
 ## Keychain and configuration
 
