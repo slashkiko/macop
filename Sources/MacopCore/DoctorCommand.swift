@@ -1,7 +1,23 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 public enum DoctorCommand {
+    private static func keychainAPIStatus() -> OSStatus {
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: "com.slashkiko.macop.doctor",
+            kSecAttrAccount: UUID().uuidString,
+            kSecReturnAttributes: true,
+            kSecMatchLimit: kSecMatchLimitOne,
+            kSecUseAuthenticationContext: authenticationContext
+        ]
+        var result: CFTypeRef?
+        return SecItemCopyMatching(query as CFDictionary, &result)
+    }
+
     public static func run(options: GlobalOptions, context: DoctorContext) throws -> CommandResult {
         var checks = [DoctorCheck]()
         func add(_ name: String, _ status: DoctorStatus, _ detail: String) {
@@ -41,12 +57,13 @@ public enum DoctorCommand {
         ] {
             add(name, FileManager.default.fileExists(atPath: path) ? .pass : .fail, path)
         }
-        var defaultKeychain: SecKeychain?
-        let keychainStatus = SecKeychainCopyDefault(&defaultKeychain)
+        let keychainStatus = self.keychainAPIStatus()
+        let keychainAvailable = keychainStatus == errSecSuccess || keychainStatus == errSecItemNotFound
         add(
             "keychain_api",
-            keychainStatus == errSecSuccess ? .pass : .warn,
-            keychainStatus == errSecSuccess ? "Keychain API available" : "Keychain API unavailable (status \(keychainStatus))"
+            keychainAvailable ? .pass : .warn,
+            keychainAvailable ? "Keychain API available without secret access"
+                : "Keychain API unavailable without interaction (status \(keychainStatus))"
         )
 
         if FileManager.default.fileExists(atPath: SSHCommand.scAuth) {
