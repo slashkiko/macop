@@ -24,6 +24,35 @@ public protocol SSHStreamingExecuting: CommandExecuting {
 public typealias CommandExecutor = any CommandExecuting
 public typealias CommandEnvironment = [String: String]
 
+public enum BiometricAvailability: Sendable, Equatable {
+    case available
+    case unavailable(reason: String)
+}
+
+public protocol BiometricAvailabilityChecking: Sendable {
+    func checkAvailability() -> BiometricAvailability
+}
+
+public struct SystemBiometricAvailabilityChecker: BiometricAvailabilityChecking {
+    public init() {}
+
+    public func checkAvailability() -> BiometricAvailability {
+        let context = LAContext()
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+            let code = error.map { LAError.Code(rawValue: $0.code) }
+            let reason = switch code {
+            case .biometryNotAvailable: "Touch ID is unavailable in this login session."
+            case .biometryNotEnrolled: "Touch ID has no enrolled fingerprints."
+            case .biometryLockout: "Touch ID is locked; authenticate locally before retrying."
+            default: "Touch ID cannot be evaluated in this login session."
+            }
+            return .unavailable(reason: reason)
+        }
+        return .available
+    }
+}
+
 public struct SystemCommandExecutor: SSHStreamingExecuting {
     public init() {}
 
@@ -82,13 +111,19 @@ public enum SSHCommand {
         args: [String],
         options: GlobalOptions,
         env: [String: String],
-        executor: CommandExecutor
+        executor: CommandExecutor,
+        biometricChecker: any BiometricAvailabilityChecking = SystemBiometricAvailabilityChecker()
     ) throws -> CommandResult {
         let context = SSHContext(env: env, executor: executor)
         guard let subcommand = args.first
         else { throw CLIError.invalidArguments(message: "ssh requires a subcommand.") }
         switch subcommand {
-        case "create": return try self.create(Array(args.dropFirst()), options: options, context: context)
+        case "create": return try self.create(
+                Array(args.dropFirst()),
+                options: options,
+                context: context,
+                biometricChecker: biometricChecker
+            )
         case "list":
             guard args.count == 1
             else { throw CLIError.invalidArguments(message: "ssh list does not accept arguments.") }
@@ -291,7 +326,8 @@ private extension SSHCommand {
     private static func create(
         _ args: [String],
         options: GlobalOptions,
-        context: SSHContext
+        context: SSHContext,
+        biometricChecker: any BiometricAvailabilityChecking
     ) throws -> CommandResult {
         guard args.count == 1 || args.count == 2,
               let label = args.first
@@ -304,6 +340,12 @@ private extension SSHCommand {
         guard !before.contains(where: { $0.label == label }) else {
             throw CLIError.invalidArguments(message: "A CTK identity named \"\(label)\" already exists.")
         }
+        if case let .unavailable(reason) = biometricChecker.checkAvailability() {
+            throw CLIError.providerUnavailable(
+                provider: "Touch ID",
+                reason: "\(reason) No identity creation was attempted."
+            )
+        }
         // Touch ID is the secure default; --touch-id remains an explicit, compatible spelling.
         let result = try apple(
             context.executor,
@@ -311,15 +353,47 @@ private extension SSHCommand {
             ["create-ctk-identity", "-l", label, "-k", "p-256-ne", "-t", "bio"],
             context.env
         )
-        try self.requireSuccess(result, provider: "CryptoTokenKit", operation: "create identity")
-        let matches = try self.identities(context: context).filter { $0.label == label }
-        guard matches.count == 1, let created = matches.first else {
+        let matches: [Identity]
+        do {
+            matches = try self.identities(context: context).filter { $0.label == label }
+        } catch {
             throw CLIError.providerUnavailable(
                 provider: "CryptoTokenKit",
-                reason: "Identity creation may have completed, but macop could not verify exactly one public hash. Inspect CTK identities before retrying."
+                reason: "Identity creation may have completed, but post-create verification failed. Inspect CTK identities before retrying."
+            )
+        }
+        if result.exitCode != 0 {
+            if matches.isEmpty, self.isUserInterruptExit(result.exitCode) {
+                throw CLIError.denied(
+                    message: "Identity creation was interrupted by the user. No matching CTK identity was found; inspect CTK identities before retrying."
+                )
+            }
+            if matches.isEmpty {
+                throw CLIError.providerUnavailable(
+                    provider: "CryptoTokenKit",
+                    reason: "Apple tooling did not create a matching identity (exit \(result.exitCode)). "
+                        + "Touch ID cancellation and session availability are not exposed as structured sc_auth errors; "
+                        + "inspect CTK identities before retrying."
+                )
+            }
+            throw CLIError.providerUnavailable(
+                provider: "CryptoTokenKit",
+                reason: "Apple tooling failed (exit \(result.exitCode)), but \(matches.count) matching identity item(s) "
+                    + "exist. Identity creation may have completed; inspect CTK identities before retrying."
+            )
+        }
+        guard matches.count == 1, let created = matches.first else {
+            let resultDescription = matches.isEmpty ? "no matching identity" : "multiple matching identities"
+            throw CLIError.providerUnavailable(
+                provider: "CryptoTokenKit",
+                reason: "Apple tooling reported success, but post-create verification found \(resultDescription). Inspect CTK identities before retrying."
             )
         }
         return self.render([created], action: "created", options)
+    }
+
+    private static func isUserInterruptExit(_ exitCode: Int32) -> Bool {
+        exitCode == 128 + SIGINT
     }
 
     private static func list(options: GlobalOptions, context: SSHContext) throws -> CommandResult {

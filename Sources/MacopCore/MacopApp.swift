@@ -48,13 +48,16 @@ private func rawDebugEnabled(argv: [String], env: [String: String]) -> Bool {
 public struct MacopApp {
     private let keychainClient: any KeychainClient
     private let commandExecutor: CommandExecutor
+    private let biometricChecker: any BiometricAvailabilityChecking
 
     public init(
         keychainClient: any KeychainClient = SystemKeychainClient(),
-        commandExecutor: CommandExecutor = SystemCommandExecutor()
+        commandExecutor: CommandExecutor = SystemCommandExecutor(),
+        biometricChecker: any BiometricAvailabilityChecking = SystemBiometricAvailabilityChecker()
     ) {
         self.keychainClient = keychainClient
         self.commandExecutor = commandExecutor
+        self.biometricChecker = biometricChecker
     }
 
     public func run(argv: [String], env: [String: String], input: Data = Data()) -> CommandResult {
@@ -223,7 +226,8 @@ public struct MacopApp {
                 args: parsed.commandArgs,
                 options: parsed.options,
                 env: agentHelperEnvironment(env, options: parsed.options),
-                executor: self.commandExecutor
+                executor: self.commandExecutor,
+                biometricChecker: self.biometricChecker
             )
         // macop-agent owns debug rendering so its JSON error stream stays
         // one object even when this command is relayed by macop.

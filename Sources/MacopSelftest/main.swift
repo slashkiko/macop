@@ -1255,9 +1255,11 @@ final class SequencedSSHExecutor: CommandExecuting, @unchecked Sendable {
     struct Invocation { let path: String; let arguments: [String] }
     var invocations = [Invocation]()
     var lists: [String]
+    let createResult: CommandResult
 
-    init(lists: [String]) {
+    init(lists: [String], createResult: CommandResult = CommandResult(exitCode: 0)) {
         self.lists = lists
+        self.createResult = createResult
     }
 
     func execute(path: String, arguments: [String], environment _: CommandEnvironment) throws -> CommandResult {
@@ -1268,7 +1270,23 @@ final class SequencedSSHExecutor: CommandExecuting, @unchecked Sendable {
         if path == SSHCommand.sshKeygen {
             return CommandResult(exitCode: 0, stdout: "ecdsa-sha2-nistp256 AAAA My SSH Key\n")
         }
+        if path == SSHCommand.scAuth, arguments.first == "create-ctk-identity" {
+            return self.createResult
+        }
         return CommandResult(exitCode: 0)
+    }
+}
+
+struct AvailableBiometricChecker: BiometricAvailabilityChecking {
+    func checkAvailability() -> BiometricAvailability {
+        .available
+    }
+}
+
+struct UnavailableBiometricChecker: BiometricAvailabilityChecking {
+    let reason: String
+    func checkAvailability() -> BiometricAvailability {
+        .unavailable(reason: self.reason)
     }
 }
 
@@ -1538,7 +1556,11 @@ func run() throws {
     )
 
     let sshExecutor = RecordingSSHExecutor()
-    let sshApp = MacopApp(keychainClient: FakeKeychainClient(response: .success(Data())), commandExecutor: sshExecutor)
+    let sshApp = MacopApp(
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: sshExecutor,
+        biometricChecker: AvailableBiometricChecker()
+    )
     let createdIdentity = sshApp.run(argv: ["macop", "ssh", "create", "github", "--touch-id"], env: [:])
     try expect(createdIdentity.exitCode == 0, "ssh create should use the injectable Apple command executor")
     let createdJSONExecutor = SequencedSSHExecutor(lists: [
@@ -1546,7 +1568,9 @@ func run() throws {
         appleTableHeader + appleTableRow("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "new-github")
     ])
     let createdJSONApp = MacopApp(
-        keychainClient: FakeKeychainClient(response: .success(Data())), commandExecutor: createdJSONExecutor
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: createdJSONExecutor,
+        biometricChecker: AvailableBiometricChecker()
     )
     let createdJSON = createdJSONApp.run(
         argv: ["macop", "ssh", "create", "new-github", "--touch-id", "--format=json"], env: [:]
@@ -1643,7 +1667,8 @@ func run() throws {
     let missingPostExecutor = SequencedSSHExecutor(lists: [emptyTable, emptyTable])
     let missingPostApp = MacopApp(
         keychainClient: FakeKeychainClient(response: .success(Data())),
-        commandExecutor: missingPostExecutor
+        commandExecutor: missingPostExecutor,
+        biometricChecker: AvailableBiometricChecker()
     )
     let missingPostCreate = missingPostApp.run(argv: ["macop", "ssh", "create", "new-key"], env: [:])
     try expect(
@@ -1655,12 +1680,83 @@ func run() throws {
         + appleTableRow("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "new-key")
     let duplicatePostExecutor = SequencedSSHExecutor(lists: [emptyTable, duplicatePost])
     let duplicatePostApp = MacopApp(
-        keychainClient: FakeKeychainClient(response: .success(Data())), commandExecutor: duplicatePostExecutor
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: duplicatePostExecutor,
+        biometricChecker: AvailableBiometricChecker()
     )
     let duplicatePostCreate = duplicatePostApp.run(argv: ["macop", "ssh", "create", "new-key"], env: [:])
     try expect(
         duplicatePostCreate.exitCode == 4,
         "ssh create must fail when post-create identity verification is ambiguous"
+    )
+    let failedCreateExecutor = SequencedSSHExecutor(
+        lists: [emptyTable, emptyTable],
+        createResult: CommandResult(exitCode: 1)
+    )
+    let failedCreateApp = MacopApp(
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: failedCreateExecutor,
+        biometricChecker: AvailableBiometricChecker()
+    )
+    let failedCreate = failedCreateApp.run(argv: ["macop", "ssh", "create", "failed-key"], env: [:])
+    try expect(
+        failedCreate.exitCode == 4
+            && failedCreate.stderr.contains("did not create a matching identity")
+            && !failedCreate.stderr.contains("may have completed"),
+        "a nonzero create with a verified-empty post-list must report a definite failure"
+    )
+    let cancelledCreateExecutor = SequencedSSHExecutor(
+        lists: [emptyTable, emptyTable],
+        createResult: CommandResult(exitCode: 128 + SIGINT)
+    )
+    let cancelledCreateApp = MacopApp(
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: cancelledCreateExecutor,
+        biometricChecker: AvailableBiometricChecker()
+    )
+    let cancelledCreate = cancelledCreateApp.run(
+        argv: ["macop", "ssh", "create", "cancelled-key", "--format=json"], env: [:]
+    )
+    try expect(
+        cancelledCreate.exitCode == 5
+            && cancelledCreate.stderr.contains("\"code\" : \"denied\"")
+            && cancelledCreate.stderr.contains("interrupted by the user")
+            && !cancelledCreate.stderr.contains("Touch ID identity creation was cancelled"),
+        "an identifiable user interrupt must return denied without claiming a Touch ID UI outcome"
+    )
+    let terminatedCreateExecutor = SequencedSSHExecutor(
+        lists: [emptyTable, emptyTable],
+        createResult: CommandResult(exitCode: 128 + SIGTERM)
+    )
+    let terminatedCreateApp = MacopApp(
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: terminatedCreateExecutor,
+        biometricChecker: AvailableBiometricChecker()
+    )
+    let terminatedCreate = terminatedCreateApp.run(
+        argv: ["macop", "ssh", "create", "terminated-key", "--format=json"], env: [:]
+    )
+    try expect(
+        terminatedCreate.exitCode == 4
+            && terminatedCreate.stderr.contains("\"code\" : \"provider_unavailable\"")
+            && terminatedCreate.stderr.contains("exit 143")
+            && !terminatedCreate.stderr.contains("interrupted by the user"),
+        "SIGTERM must remain an unclassified provider failure rather than a user cancellation"
+    )
+    let unavailableCreateExecutor = SequencedSSHExecutor(lists: [emptyTable])
+    let unavailableCreateApp = MacopApp(
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: unavailableCreateExecutor,
+        biometricChecker: UnavailableBiometricChecker(reason: "Touch ID is unavailable in this test session.")
+    )
+    let unavailableCreate = unavailableCreateApp.run(
+        argv: ["macop", "ssh", "create", "unavailable-key"], env: [:]
+    )
+    try expect(
+        unavailableCreate.exitCode == 4
+            && unavailableCreate.stderr.contains("Touch ID is unavailable")
+            && !unavailableCreateExecutor.invocations.contains { $0.arguments.first == "create-ctk-identity" },
+        "unavailable biometrics must fail before CTK mutation with an actionable reason"
     )
     let publicKeyJSON = try JSONSerialization.jsonObject(with: Data(publicKey.stdout.utf8)) as? [String: Any]
     try expect(
