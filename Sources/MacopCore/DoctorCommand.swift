@@ -23,9 +23,17 @@ public enum DoctorCommand {
         func add(_ name: String, _ status: DoctorStatus, _ detail: String) {
             checks.append(DoctorCheck(name: name, status: status, detail: detail))
         }
-        func diagnostic(_ path: String, _ arguments: [String]) -> CommandResult? {
+        func diagnostic(
+            _ path: String,
+            _ arguments: [String],
+            environment: CommandEnvironment? = nil
+        ) -> CommandResult? {
             do {
-                return try context.executor.execute(path: path, arguments: arguments, environment: context.env)
+                return try context.executor.execute(
+                    path: path,
+                    arguments: arguments,
+                    environment: environment ?? context.env
+                )
             } catch {
                 return nil
             }
@@ -66,6 +74,7 @@ public enum DoctorCommand {
                 : "Keychain API unavailable without interaction (status \(keychainStatus))"
         )
 
+        var ctkIdentityHashes: [String]?
         if FileManager.default.fileExists(atPath: SSHCommand.scAuth) {
             let ctk = diagnostic(SSHCommand.scAuth, ["list-ctk-identities", "-t", "sha1", "-e", "hex"])
             do {
@@ -75,8 +84,14 @@ public enum DoctorCommand {
                         reason: "identity enumeration failed"
                     )
                 }
-                try SSHCommand.validateIdentityTable(ctk.stdout)
-                add("cryptotokenkit", .pass, "CTK identity enumeration available")
+                let hashes = try SSHCommand.validatedIdentityHashes(ctk.stdout)
+                ctkIdentityHashes = hashes
+                add(
+                    "cryptotokenkit",
+                    .pass,
+                    hashes.isEmpty ? "CTK identity enumeration available; no identities found"
+                        : "CTK identity enumeration available (\(hashes.count) identities)"
+                )
             } catch {
                 add("cryptotokenkit", .fail, "CTK identity enumeration returned an invalid table")
             }
@@ -89,32 +104,62 @@ public enum DoctorCommand {
         } catch let error as CLIError { add("config", .warn, "\(error)")
         } catch { add("config", .warn, "configuration validation unavailable") }
 
-        let sshG = diagnostic(
-            SSHCommand.ssh,
-            [
-                "-G",
-                "-o",
-                "ForwardAgent=no",
-                "-o",
-                "PKCS11Provider=\(SSHCommand.provider)",
-                "-o",
-                "IdentitiesOnly=yes",
-                "example.invalid"
-            ]
-        )
+        if let hashes = ctkIdentityHashes {
+            if hashes.isEmpty {
+                add("ssh_provider_keys", .warn, "No CTK identity is available for an Apple SSH provider check")
+            } else {
+                var unusable = 0
+                for hash in hashes {
+                    var environment = context.env
+                    environment["KEYCHAIN_CERTIFICATES"] = hash
+                    let result = diagnostic(
+                        SSHCommand.sshKeygen,
+                        ["-D", SSHCommand.provider],
+                        environment: environment
+                    )
+                    guard let result, result.exitCode == 0 else {
+                        unusable += 1
+                        continue
+                    }
+                    do {
+                        try SSHCommand.validateSingleProviderKey(result.stdout)
+                    } catch {
+                        unusable += 1
+                    }
+                }
+                add(
+                    "ssh_provider_keys",
+                    unusable == 0 ? .pass : .fail,
+                    unusable == 0
+                        ? "Apple SSH provider exposes exactly one key for every CTK identity"
+                        : "Apple SSH provider cannot expose exactly one key for \(unusable) CTK identity item(s)"
+                )
+            }
+        } else {
+            add("ssh_provider_keys", .fail, "Skipped because CTK identity enumeration was invalid")
+        }
+
+        let sshG = diagnostic(SSHCommand.ssh, ["-G"] + SSHCommand.isolatedSSHOptions() + ["example.invalid"])
         let effective = Set((sshG?.stdout ?? "").split(whereSeparator: \.isNewline).map { $0.lowercased() })
         let forward = effective.contains("forwardagent no")
         let provider = effective.contains("pkcs11provider \(SSHCommand.provider)")
         let identities = effective.contains("identitiesonly yes")
+        let identityFile = effective.contains("identityfile none")
+        let identityAgent = effective.contains("identityagent none")
+        let publicKeyOnly = effective.contains("preferredauthentications publickey")
+        let sshConfigResolved = sshG?.exitCode == 0
         add(
             "forward_agent",
-            forward ? .pass : .fail,
-            forward ? "effective ForwardAgent=no" : "unable to verify ForwardAgent=no"
+            sshConfigResolved && forward ? .pass : .fail,
+            sshConfigResolved && forward ? "effective ForwardAgent=no" : "unable to verify ForwardAgent=no"
         )
         add(
             "ssh_identity_selection",
-            provider && identities ? .pass : .fail,
-            provider && identities ? "effective PKCS11Provider and IdentitiesOnly=yes" : "unable to verify SSH identity selection"
+            sshConfigResolved && provider && identities && identityFile && identityAgent && publicKeyOnly ? .pass :
+                .fail,
+            sshConfigResolved && provider && identities && identityFile && identityAgent && publicKeyOnly
+                ? "effective PKCS11Provider, publickey-only authentication, IdentitiesOnly=yes, IdentityFile=none, and IdentityAgent=none"
+                : "unable to verify isolated SSH identity selection"
         )
         let sshVersion = diagnostic(SSHCommand.ssh, ["-V"])
         add(

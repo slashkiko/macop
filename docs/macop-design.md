@@ -327,7 +327,7 @@ macop ssh run github -- git clone git@github.com:owner/repo.git
 macop ssh delete github
 ```
 
-`macop`が設定へ保存するのはidentity label、公開鍵、公開鍵ハッシュなどの非機密metadataだけであり、secret値やprivate keyは保存しない。`run`と`test`はApple純正`ssh`へ対象identityと`PKCS11Provider=/usr/lib/ssh-keychain.dylib`を指定し、同時に`ForwardAgent=no`を明示する。`create`は`p-256-ne -t bio`を標準にする。
+`macop`が設定へ保存するのはidentity label、公開鍵、公開鍵ハッシュなどの非機密metadataだけであり、secret値やprivate keyは保存しない。`run`と`test`はApple純正`ssh`へ`-F /dev/null`、対象identity、`PKCS11Provider=/usr/lib/ssh-keychain.dylib`、`IdentitiesOnly=yes`、`IdentityFile=none`、`IdentityAgent=none`、`PreferredAuthentications=publickey`、`ForwardAgent=no`を固定指定する。ユーザーSSH設定、既定identity file、ssh-agent、非公開鍵認証へfallbackして成功する経路はfail closedで禁止する。`create`は`p-256-ne -t bio`を標準にし、作成後にApple SSH providerが選択hashから公開鍵を正確に1件列挙できることまで検証する。
 
 verified-session agentは`macop ssh agent shell <identity-label> -- <program> [arguments...]`と`macop ssh agent application <identity-label> <application-path>`で起動する。いずれも新規に起動した協調rootだけを対象とし、既存application、外部relay、実CTK/Touch ID/GitHub/Sourcetree/TerminalのE2E互換性は保証しない。Phase 4ではprovider wrapperとverified-session agentを内部的に分離し、既存のApple純正`op`互換commandには影響させない。
 

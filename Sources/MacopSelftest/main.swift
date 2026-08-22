@@ -75,7 +75,11 @@ final class RecordingSSHExecutor: SSHStreamingExecuting, @unchecked Sendable {
             return CommandResult(
                 exitCode: 0,
                 stdout: "forwardagent no\npkcs11provider /usr/lib/ssh-keychain.dylib\nidentitiesonly yes\n"
+                    + "identityfile none\nidentityagent none\npreferredauthentications publickey\n"
             )
+        }
+        if path == "/usr/bin/codesign" {
+            return CommandResult(exitCode: 0, stderr: "Signature=adhoc\n")
         }
         return CommandResult(exitCode: 0)
     }
@@ -1252,23 +1256,32 @@ private func agentSelftests() throws {
 }
 
 final class SequencedSSHExecutor: CommandExecuting, @unchecked Sendable {
-    struct Invocation { let path: String; let arguments: [String] }
+    struct Invocation { let path: String; let arguments: [String]; let environment: CommandEnvironment }
     var invocations = [Invocation]()
     var lists: [String]
     let createResult: CommandResult
+    let providerResult: CommandResult
 
-    init(lists: [String], createResult: CommandResult = CommandResult(exitCode: 0)) {
+    init(
+        lists: [String],
+        createResult: CommandResult = CommandResult(exitCode: 0),
+        providerResult: CommandResult = CommandResult(
+            exitCode: 0,
+            stdout: "ecdsa-sha2-nistp256 AAAA My SSH Key\n"
+        )
+    ) {
         self.lists = lists
         self.createResult = createResult
+        self.providerResult = providerResult
     }
 
-    func execute(path: String, arguments: [String], environment _: CommandEnvironment) throws -> CommandResult {
-        self.invocations.append(Invocation(path: path, arguments: arguments))
+    func execute(path: String, arguments: [String], environment: CommandEnvironment) throws -> CommandResult {
+        self.invocations.append(Invocation(path: path, arguments: arguments, environment: environment))
         if path == SSHCommand.scAuth, arguments.first == "list-ctk-identities" {
             return CommandResult(exitCode: 0, stdout: self.lists.isEmpty ? "" : self.lists.removeFirst())
         }
         if path == SSHCommand.sshKeygen {
-            return CommandResult(exitCode: 0, stdout: "ecdsa-sha2-nistp256 AAAA My SSH Key\n")
+            return self.providerResult
         }
         if path == SSHCommand.scAuth, arguments.first == "create-ctk-identity" {
             return self.createResult
@@ -1293,11 +1306,13 @@ struct UnavailableBiometricChecker: BiometricAvailabilityChecking {
 final class GitHubTestExecutor: SSHStreamingExecuting, @unchecked Sendable {
     let output: String
     let code: Int32
+    var invocations = [(path: String, arguments: [String])]()
     init(output: String, code: Int32) {
         self.output = output; self.code = code
     }
 
     func execute(path: String, arguments: [String], environment _: CommandEnvironment) throws -> CommandResult {
+        self.invocations.append((path: path, arguments: arguments))
         if path == SSHCommand.scAuth, arguments.first == "list-ctk-identities" {
             return CommandResult(exitCode: 0, stdout: appleTableHeader
                 + appleTableRow("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "github"))
@@ -1306,9 +1321,10 @@ final class GitHubTestExecutor: SSHStreamingExecuting, @unchecked Sendable {
     }
 
     func executeStreaming(
-        path _: String, arguments _: [String], environment _: CommandEnvironment,
+        path: String, arguments: [String], environment _: CommandEnvironment,
         stdout _: @escaping @Sendable (Data) -> Void, stderr: @escaping @Sendable (Data) -> Void
     ) throws -> Int32 {
+        self.invocations.append((path: path, arguments: arguments))
         stderr(Data(self.output.utf8)); return self.code
     }
 }
@@ -1672,7 +1688,10 @@ func run() throws {
     )
     let missingPostCreate = missingPostApp.run(argv: ["macop", "ssh", "create", "new-key"], env: [:])
     try expect(
-        missingPostCreate.exitCode == 4,
+        missingPostCreate.exitCode == 4
+            && missingPostCreate.stderr.contains("returned exit 0")
+            && missingPostCreate.stderr.contains("cancelled, unavailable")
+            && !missingPostCreate.stderr.contains("reported success"),
         "ssh create must fail when post-create identity verification is missing"
     )
     let duplicatePost = appleTableHeader
@@ -1688,6 +1707,27 @@ func run() throws {
     try expect(
         duplicatePostCreate.exitCode == 4,
         "ssh create must fail when post-create identity verification is ambiguous"
+    )
+    let unusableProviderExecutor = SequencedSSHExecutor(
+        lists: [
+            emptyTable,
+            appleTableHeader + appleTableRow("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "unsupported-key")
+        ],
+        providerResult: CommandResult(exitCode: 0)
+    )
+    let unusableProviderApp = MacopApp(
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: unusableProviderExecutor,
+        biometricChecker: AvailableBiometricChecker()
+    )
+    let unusableProviderCreate = unusableProviderApp.run(
+        argv: ["macop", "ssh", "create", "unsupported-key"], env: [:]
+    )
+    try expect(
+        unusableProviderCreate.exitCode == 4
+            && unusableProviderCreate.stderr.contains("identity was created")
+            && unusableProviderCreate.stderr.contains("cannot expose exactly one usable public key"),
+        "ssh create must report a persisted identity that the Apple SSH provider cannot use"
     )
     let failedCreateExecutor = SequencedSSHExecutor(
         lists: [emptyTable, emptyTable],
@@ -1786,8 +1826,13 @@ func run() throws {
     try expect(
         sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?
             .contains("PKCS11Provider=/usr/lib/ssh-keychain.dylib") == true
-            && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?.contains("ForwardAgent=no") == true,
-        "ssh run must force the Apple provider and disable forwarding"
+            && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?.contains("ForwardAgent=no") == true
+            && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?.contains("-F /dev/null") == true
+            && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?.contains("IdentityFile=none") == true
+            && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?.contains("IdentityAgent=none") == true
+            && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?
+            .contains("PreferredAuthentications=publickey") == true,
+        "ssh run must isolate the Apple provider from user config, identity files, and agents"
     )
     try expect(
         sshExecutor.invocations.last?
@@ -1805,9 +1850,10 @@ func run() throws {
         "ssh run should use the streaming executor and preserve the child exit status"
     )
     let greeting = "Hi user! You've successfully authenticated, but GitHub does not provide shell access.\n"
+    let greetingExecutor = GitHubTestExecutor(output: greeting, code: 1)
     let greetingApp = MacopApp(
         keychainClient: FakeKeychainClient(response: .success(Data())),
-        commandExecutor: GitHubTestExecutor(output: greeting, code: 1)
+        commandExecutor: greetingExecutor
     )
     let greetingResult = greetingApp.run(argv: ["macop", "ssh", "test", "github", "--format=json"], env: [:])
     let greetingJSON = try JSONSerialization.jsonObject(with: Data(greetingResult.stdout.utf8)) as? [String: Any]
@@ -1815,6 +1861,19 @@ func run() throws {
         greetingResult.exitCode == 0 && greetingJSON?["raw_exit_code"] as? Int == 1
             && greetingJSON?["status"] as? String == "authenticated",
         "GitHub's documented authenticated greeting at raw exit 1 must normalize to success"
+    )
+    try expect(
+        greetingExecutor.invocations.last?.arguments == [
+            "-F", "/dev/null",
+            "-o", "PKCS11Provider=/usr/lib/ssh-keychain.dylib",
+            "-o", "ForwardAgent=no",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "IdentityFile=none",
+            "-o", "IdentityAgent=none",
+            "-o", "PreferredAuthentications=publickey",
+            "-T", "git@github.com"
+        ],
+        "ssh test must ignore user config and disable file and agent identities"
     )
     let greetingStream = StreamCollector()
     let streamedGreeting = greetingApp.runStreamingIfNeeded(
@@ -1844,6 +1903,15 @@ func run() throws {
     try expect(doctorJSON?["schema_version"] as? Int == 1 && doctorJSON?["status"] is String
         && doctorJSON?["checks"] is [[String: Any]] && !doctor.stdout.contains("test-secret"),
         "doctor JSON must be typed and secret-free")
+    let doctorResultChecks = doctorJSON?["checks"] as? [[String: Any]]
+    try expect(
+        doctorResultChecks?
+            .first(where: { $0["name"] as? String == "code_signature" })?["status"] as? String == "warn"
+            && doctorResultChecks?
+            .first(where: { $0["name"] as? String == "code_signature" })?["detail"] as? String
+            == "ad-hoc signature; Keychain ACL and XARA authorization may repeat after rebuilds",
+        "doctor must identify ad-hoc signing as a repeat-authorization risk"
+    )
     let resolvedSelftestExecutable = try RunningExecutable.path()
     let doctorLink = tempRoot.appendingPathComponent("doctor-via-symlink")
     try fileManager.createSymbolicLink(atPath: doctorLink.path, withDestinationPath: resolvedSelftestExecutable)
@@ -1875,6 +1943,28 @@ func run() throws {
             && brokenChecks?.first(where: { $0["name"] as? String == "cryptotokenkit" })?["status"] as? String == "fail"
             && brokenCTKExecutor.invocations.contains { $0.path == "/usr/bin/codesign" },
         "doctor must reject exit-zero CTK error text and continue later checks"
+    )
+    let unusableDoctorExecutor = SequencedSSHExecutor(
+        lists: [appleTableHeader + appleTableRow("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "github")],
+        providerResult: CommandResult(exitCode: 0)
+    )
+    let unusableDoctor = MacopApp(
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: unusableDoctorExecutor
+    ).run(argv: ["macop", "doctor", "--format=json"], env: [:])
+    let unusableDoctorJSON = try JSONSerialization.jsonObject(
+        with: Data(unusableDoctor.stdout.utf8)
+    ) as? [String: Any]
+    let unusableDoctorChecks = unusableDoctorJSON?["checks"] as? [[String: Any]]
+    try expect(
+        unusableDoctor.exitCode == 4
+            && unusableDoctorChecks?
+            .first(where: { $0["name"] as? String == "ssh_provider_keys" })?["status"] as? String == "fail"
+            && unusableDoctorExecutor.invocations.contains {
+                $0.path == SSHCommand.sshKeygen
+                    && $0.environment["KEYCHAIN_CERTIFICATES"] == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            },
+        "doctor must fail when a CTK identity produces no selected Apple SSH provider key"
     )
 
     let compatibilityEquals = app.run(argv: ["macop", "compatibility", "--format=json"], env: [:])
@@ -2274,7 +2364,7 @@ func run() throws {
             && sharedContextAccess.referenceContexts.count == 1
             && sharedContextAccess.valueContexts.count == 1
             && sharedContextAccess.referenceContexts[0] === sharedContextAccess.valueContexts[0],
-        "persistent-reference enumeration and value lookup must share one LAContext"
+        "an exact-one read must enumerate once and perform one data read with the shared context"
     )
 
     let noMatchAccess = RecordingKeychainSecurityAccess(

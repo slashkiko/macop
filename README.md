@@ -171,7 +171,12 @@ macop ssh test github
 
 `create` uses a Secure Enclave `p-256-ne` identity with Touch ID. The private
 key is non-exportable: it is not written under `~/.ssh`, cannot be exported as
-an OpenSSH key, and cannot be moved or synchronized to another Mac.
+an OpenSSH key, and cannot be moved or synchronized to another Mac. After
+creation, macop also requires Apple's SSH provider to expose exactly one public
+key for the new identity. Some macOS/provider combinations create the CTK
+identity but reject its algorithm; that returns exit 4 and leaves the identity
+visible for inspection and explicit `macop ssh delete <label>` cleanup rather
+than claiming a usable SSH setup.
 
 For the Apple provider in a normal SSH configuration, use the macOS provider
 and turn forwarding off for that host. Select a host-specific stanza rather
@@ -185,10 +190,19 @@ Host github.com
   ForwardAgent no
 ```
 
-Alternatively, `macop ssh run` and `macop ssh test` invoke Apple SSH with the
-provider, selected identity, `IdentitiesOnly=yes`, and `ForwardAgent=no`.
+Alternatively, `macop ssh run` and `macop ssh test` invoke Apple SSH with an
+empty config (`-F /dev/null`), the provider, selected identity,
+`IdentitiesOnly=yes`, `IdentityFile=none`, `IdentityAgent=none`, and
+`PreferredAuthentications=publickey`, plus `ForwardAgent=no`. They fail rather
+than authenticating with a key from the user's SSH config, a default identity
+file, an ssh-agent, or a non-public-key fallback.
 Direct use of `/usr/lib/ssh-keychain.dylib` remains possible for the current
 user and is outside macop's agent-level controls.
+
+`macop doctor` enumerates each CTK identity by its public hash and requires the
+Apple provider to return exactly one selected key. An identity that exists in
+CryptoTokenKit but is unusable by `ssh-keychain.dylib` is therefore a failed
+diagnostic, not a passing provider check.
 
 The verified-session agent is a separate, deliberately constrained path. It
 may present application- and key-specific approval only for a cooperating

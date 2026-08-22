@@ -221,6 +221,47 @@ public enum SSHCommand {
         _ = try self.parseIdentities(output)
     }
 
+    static func validatedIdentityHashes(_ output: String) throws -> [String] {
+        let identities = try self.parseIdentities(output)
+        let hashes = identities.compactMap(\.hash)
+        guard hashes.count == identities.count, hashes.allSatisfy(self.isSHA1Hash) else {
+            throw CLIError.providerUnavailable(
+                provider: "CryptoTokenKit",
+                reason: "One or more CTK identities have no unambiguous public-key hash."
+            )
+        }
+        return hashes
+    }
+
+    static func validateSingleProviderKey(_ output: String) throws {
+        let keys = output.split(whereSeparator: \.isNewline).compactMap { ProviderKey(line: String($0)) }
+        guard keys.count == 1 else {
+            throw CLIError.providerUnavailable(
+                provider: "ssh-keychain",
+                reason: "The selected CTK identity must expose exactly one SSH public key."
+            )
+        }
+    }
+
+    static func isolatedSSHOptions() -> [String] {
+        [
+            "-F",
+            "/dev/null",
+            "-o",
+            "PKCS11Provider=\(self.provider)",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "IdentityFile=none",
+            "-o",
+            "IdentityAgent=none",
+            "-o",
+            "PreferredAuthentications=publickey"
+        ]
+    }
+
     /// Selects one CTK identity without exporting private material.  The label
     /// is resolved through `sc_auth`; its application-label hash and the SSH
     /// public blob must agree in the Keychain query performed by the signer.
@@ -386,7 +427,30 @@ private extension SSHCommand {
             let resultDescription = matches.isEmpty ? "no matching identity" : "multiple matching identities"
             throw CLIError.providerUnavailable(
                 provider: "CryptoTokenKit",
-                reason: "Apple tooling reported success, but post-create verification found \(resultDescription). Inspect CTK identities before retrying."
+                reason: "Apple tooling returned exit 0, but post-create verification found \(resultDescription). "
+                    + "Creation may have been cancelled, unavailable, or otherwise produced no usable identity; "
+                    + "inspect CTK identities before retrying."
+            )
+        }
+        guard let hash = created.hash else {
+            throw CLIError.providerUnavailable(
+                provider: "CryptoTokenKit",
+                reason: "The created identity has no unambiguous public-key hash. Inspect CTK identities before retrying."
+            )
+        }
+        do {
+            let keys = try self.providerKeys(context: context.restricted(to: hash))
+            guard keys.count == 1 else {
+                throw CLIError.providerUnavailable(
+                    provider: "ssh-keychain",
+                    reason: "The selected identity did not expose exactly one provider key."
+                )
+            }
+        } catch {
+            throw CLIError.providerUnavailable(
+                provider: "ssh-keychain",
+                reason: "The CTK identity was created, but Apple's SSH provider cannot expose exactly one usable public key. "
+                    + "Inspect the identity and remove it with `macop ssh delete \(label)` before retrying."
             )
         }
         return self.render([created], action: "created", options)
@@ -492,7 +556,7 @@ private extension SSHCommand {
             )
         }
         var childEnv = context.restricted(to: identity.hash).env
-        childEnv["GIT_SSH_COMMAND"] = ([self.ssh] + self.sshOptions()).joined(separator: " ")
+        childEnv["GIT_SSH_COMMAND"] = ([self.ssh] + self.isolatedSSHOptions()).joined(separator: " ")
         let executable = try self.resolveExecutable(command[0], environment: childEnv)
         return SSHInvocation(path: executable, arguments: Array(command.dropFirst()), environment: childEnv)
     }
@@ -507,7 +571,7 @@ private extension SSHCommand {
         let selected = context.restricted(to: identity.hash)
         return SSHInvocation(
             path: self.ssh,
-            arguments: self.sshOptions() + ["-T", destination],
+            arguments: self.isolatedSSHOptions() + ["-T", destination],
             environment: selected.env
         )
     }
@@ -526,17 +590,6 @@ private extension SSHCommand {
 
     private static func isGitHub(destination: String) -> Bool {
         destination.split(separator: "@").last.map(String.init)?.lowercased() == "github.com"
-    }
-
-    private static func sshOptions() -> [String] {
-        [
-            "-o",
-            "PKCS11Provider=\(self.provider)",
-            "-o",
-            "ForwardAgent=no",
-            "-o",
-            "IdentitiesOnly=yes"
-        ]
     }
 
     private static func apple(
