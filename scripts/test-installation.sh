@@ -8,10 +8,12 @@ trap cleanup EXIT
 bin_dir="$fixture_root/bin"
 test_home="$fixture_root/home"
 shell_profile="$test_home/.zprofile"
-config_marker="$fixture_root/Library/Application Support/macop/config.json"
+config_marker="$test_home/Library/Application Support/macop/config.json"
 mkdir -p "$(dirname "$config_marker")" "$test_home"
 printf '%s\n' '{"version":1}' >"$config_marker"
 printf '%s\n' 'export EXISTING_SETTING=preserved' >"$shell_profile"
+export HOME="$test_home"
+export SHELL=/bin/zsh
 
 # An existing unrelated `op` must be detected before either binary is
 # installed, so opting into compatibility never replaces another CLI.
@@ -88,7 +90,7 @@ fi
 grep -Fqx 'export EXISTING_SETTING=preserved' "$shell_profile"
 
 ln -s /usr/bin/true "$bin_dir/op"
-bash scripts/uninstall.sh --bin-dir "$bin_dir"
+bash scripts/uninstall.sh --bin-dir "$bin_dir" --shell-profile "$shell_profile"
 test "$(readlink "$bin_dir/op")" = "/usr/bin/true"
 
 printf '%s\n' 'build/install/uninstall fixture passed'
