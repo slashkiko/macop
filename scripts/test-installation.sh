@@ -59,6 +59,22 @@ test ! -e "$bin_dir/macop-agent"
 grep -Fqx 'export MUST_NOT_BE_REMOVED=yes' "$shell_profile"
 printf '%s\n' 'export EXISTING_SETTING=preserved' >"$shell_profile"
 
+# A request for stable signing must name a real identity rather than silently
+# falling back to an ad-hoc signature.
+set +e
+bash scripts/build-install.sh \
+  --configuration debug \
+  --skip-build \
+  --bin-dir "$bin_dir" \
+  --signing-identity - \
+  >"$fixture_root/invalid-signing.stdout" 2>"$fixture_root/invalid-signing.stderr"
+invalid_signing_status=$?
+set -e
+test "$invalid_signing_status" -ne 0
+grep -F 'requires a named or hash codesigning identity' "$fixture_root/invalid-signing.stderr"
+test ! -e "$bin_dir/macop"
+test ! -e "$bin_dir/macop-agent"
+
 bash scripts/build-install.sh \
   --configuration debug \
   --skip-build \

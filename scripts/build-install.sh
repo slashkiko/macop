@@ -10,12 +10,13 @@ skip_build=false
 with_op_symlink=false
 configure_path=false
 shell_profile="${MACOP_SHELL_PROFILE:-}"
+signing_identity="${MACOP_SIGNING_IDENTITY:-}"
 
 usage() {
   cat <<'EOF'
 Usage: scripts/build-install.sh [options]
 
-Build, ad-hoc sign, verify, and install macop and macop-agent.
+Build, sign, verify, and install macop and macop-agent.
 
 Options:
   --bin-dir <directory>       Install directory (default: ~/.local/bin)
@@ -25,9 +26,11 @@ Options:
   --with-op-symlink          Create an op -> macop symlink if no op exists
   --configure-path           Add the install directory to the shell PATH
   --shell-profile <file>     Profile to manage (default: shell-specific)
+  --signing-identity <name>  Use a stable codesigning identity instead of ad-hoc signing
   --help                     Show this help
 
-MACOP_BIN_DIR and MACOP_SHELL_PROFILE may be used instead of their options.
+MACOP_BIN_DIR, MACOP_SHELL_PROFILE, and MACOP_SIGNING_IDENTITY may be used
+instead of their options.
 EOF
 }
 
@@ -69,6 +72,11 @@ while [[ $# -gt 0 ]]; do
       shell_profile="$2"
       shift 2
       ;;
+    --signing-identity)
+      [[ $# -ge 2 ]] || fail "--signing-identity requires a value."
+      signing_identity="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -89,6 +97,10 @@ fi
 [[ "$bin_dir" == /* ]] || fail "the install directory must be an absolute path."
 [[ "$bin_dir" != "/" && "$bin_dir" != "$HOME" ]] \
   || fail "refusing to use a broad install directory."
+if [[ -n "$signing_identity" ]]; then
+  [[ "$signing_identity" != "-" && "$signing_identity" != -* ]] \
+    || fail "--signing-identity requires a named or hash codesigning identity, not ad-hoc signing."
+fi
 
 for command in awk chmod codesign dirname grep id install make mktemp mv readlink rm stat; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is unavailable: $command"
@@ -223,8 +235,9 @@ trap cleanup EXIT
 
 install -m 755 "$source_macop" "$staged_macop"
 install -m 755 "$source_agent" "$staged_agent"
-codesign --force --sign - --identifier macop "$staged_macop"
-codesign --force --sign - --identifier macop-agent "$staged_agent"
+codesign_identity="${signing_identity:--}"
+codesign --force --sign "$codesign_identity" --identifier macop "$staged_macop"
+codesign --force --sign "$codesign_identity" --identifier macop-agent "$staged_agent"
 codesign --verify --strict "$staged_macop"
 codesign --verify --strict "$staged_agent"
 
@@ -247,7 +260,12 @@ if [[ "$with_op_symlink" == true ]]; then
 else
   printf 'The op symlink was not changed; use --with-op-symlink to create it safely.\n'
 fi
-printf '%s\n' 'Installed binaries are ad-hoc signed; verified-session agent mode requires a production same-Team signed pair.'
+if [[ -n "$signing_identity" ]]; then
+  printf 'Installed binaries were signed with %s. Reuse the same identity after updates to preserve their designated requirements.\n' \
+    "$signing_identity"
+else
+  printf '%s\n' 'Installed binaries are ad-hoc signed; Keychain ACL trust can change after every rebuild, and verified-session agent mode requires a production same-Team signed pair.'
+fi
 if [[ "$configure_path" == true ]]; then
   printf 'Restart the shell or run: source %q\n' "$shell_profile"
 fi

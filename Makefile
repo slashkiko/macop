@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 .PHONY: help setup bootstrap hooks-install
-.PHONY: format format-check lint test test-agent-helper test-invocation test-installation test-no-persistence test-keychain-integration test-pty test-ssh-manual build release-build install uninstall
+.PHONY: format format-check lint test test-agent-helper test-invocation test-installation test-no-persistence test-keychain-integration test-keychain-auth-ui test-pty test-ssh-manual build release-build install uninstall
 .PHONY: ci ci-swift ci-workflows ci-secrets
 .PHONY: pin-actions pin-actions-check
 .PHONY: workflow-lint workflow-security
@@ -17,7 +17,7 @@ help:
 	  'Setup:       make setup | bootstrap | hooks-install' \
 	  'Development: make format | format-check | lint | build | release-build | test | test-agent-helper | test-invocation | test-installation | test-no-persistence' \
 	  'Install:     make install | uninstall' \
-	  'Manual:      make test-keychain-integration | test-pty | test-ssh-manual' \
+	  'Manual:      make test-keychain-integration | test-keychain-auth-ui | test-pty | test-ssh-manual' \
 	  'CI groups:   make ci-swift | ci-workflows | ci-secrets | ci' \
 	  'Governance:  make workflow-lint | workflow-security | secret-scan | pin-actions-check'
 
@@ -55,6 +55,9 @@ test-no-persistence: build
 
 test-keychain-integration:
 	MACOP_RUN_KEYCHAIN_INTEGRATION=1 swift run macop-selftest
+
+test-keychain-auth-ui: build
+	@bash scripts/test-keychain-auth-ui.sh
 
 test-pty: build
 	@python3 scripts/test-pty.py

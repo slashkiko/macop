@@ -110,7 +110,10 @@ public struct SystemKeychainClient: KeychainClient {
     ) -> Result<Data, KeychainFailure> {
         // Both generic and internet selectors can match more than one item in
         // an accessible search list. Enumerate opaque persistent references,
-        // then dereference exactly one item only after the count is known.
+        // then dereference exactly one item only after the count is known. The
+        // second query is the only secret-data read. A shared LAContext can
+        // reuse Data Protection Keychain authentication, but legacy login
+        // Keychain ACL dialogs are managed independently by macOS.
         let referenceResult = self.securityAccess.persistentReferences(
             for: query,
             authenticationContext: authenticationContext

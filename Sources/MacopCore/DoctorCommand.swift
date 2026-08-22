@@ -125,12 +125,19 @@ public enum DoctorCommand {
         if executable.isEmpty {
             add("code_signature", .warn, "Skipped because the running executable could not be resolved")
         } else {
-            let signature = diagnostic("/usr/bin/codesign", ["-dv", "--verbose=1", executable])
-            add(
-                "code_signature",
-                signature?.exitCode == 0 ? .pass : .warn,
-                signature?.exitCode == 0 ? "codesign metadata available" : "codesign metadata unavailable"
-            )
+            let signature = diagnostic("/usr/bin/codesign", ["-dv", "--verbose=4", executable])
+            let signatureText = (signature?.stdout ?? "") + (signature?.stderr ?? "")
+            if signature?.exitCode != 0 {
+                add("code_signature", .warn, "codesign metadata unavailable")
+            } else if signatureText.contains("Signature=adhoc") {
+                add(
+                    "code_signature",
+                    .warn,
+                    "ad-hoc signature; Keychain ACL and XARA authorization may repeat after rebuilds"
+                )
+            } else {
+                add("code_signature", .pass, "non-ad-hoc codesign metadata available")
+            }
         }
 
         let status: DoctorStatus = checks

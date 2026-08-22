@@ -9,7 +9,7 @@ not a 1Password backend, vault, or Apple Passwords reader.
 
 ## Install from source
 
-Build, ad-hoc sign, verify, and install both executables in a user-owned bin directory:
+Build, sign, verify, and install both executables in a user-owned bin directory:
 
 ```bash
 scripts/build-install.sh
@@ -23,6 +23,21 @@ scripts/build-install.sh --check
 scripts/build-install.sh --with-op-symlink
 scripts/build-install.sh --configure-path
 ```
+
+The default remains an ad-hoc source install. For an existing macOS
+code-signing identity, use the same identity for every update:
+
+```bash
+scripts/build-install.sh --signing-identity 'Developer ID Application: Example (TEAMID)'
+```
+
+`MACOP_SIGNING_IDENTITY` is the equivalent environment setting. Stable signing
+keeps the binary identifiers and designated requirements stable across updates,
+which lets a Keychain item retain an operator-approved ACL decision. It does
+not rewrite Keychain ACLs, suppress system authentication, or grant access by
+itself; inspect the signature and approve the intended binary in Keychain
+Access. The installer rejects `-` as an explicitly requested stable identity
+instead of silently falling back to ad-hoc signing.
 
 The install directory defaults to `~/.local/bin` and can be changed with
 `--bin-dir` or `MACOP_BIN_DIR`. The installer refuses to replace an existing
@@ -44,8 +59,12 @@ the live process image against the fixed helper identifier and the already
 validated Team ID, then resumes it; the helper also re-validates itself as
 defense in depth. Re-run the production signing step for both files after
 replacing them.
-Keychain authorization prompts can change after a binary update; use
-`macop doctor` to inspect the local prerequisites without printing secrets.
+Keychain authorization prompts can change after an ad-hoc binary update. A
+legacy login-Keychain ACL may also show its item authorization dialog followed
+by an XARA partition dialog for an ad-hoc client, even though macop performs
+only one exact secret-data query. Use a stable signing identity and an explicit
+item ACL decision for repeatable local authorization; use `macop doctor` to
+inspect prerequisites without printing secrets.
 
 For daily interactive use, an alias is the least surprising option:
 
@@ -284,6 +303,16 @@ Focused/manual checks:
   instead.
 - `make test-keychain-integration` creates and removes a dedicated local test
   Keychain item; it may prompt for Keychain access.
+- `MACOP_KEYCHAIN_AUTH_REFERENCE='keychain://generic/service/account' make test-keychain-auth-ui`
+  performs a read against an existing ACL-protected item, discards the secret,
+  and requires the operator to confirm that exactly one authentication dialog
+  appeared. It does not create, update, or delete Keychain items. Legacy login
+  Keychain ACLs can present two system-managed dialogs inside the single exact
+  value lookup; the fixture intentionally fails in that case. macop does not
+  weaken exact-one selection, retrieve multiple candidate secrets, or rewrite
+  an item's ACL to hide those dialogs. Set
+  `MACOP_KEYCHAIN_AUTH_EXECUTABLE="$HOME/.local/bin/macop"` to validate a
+  stably signed installed binary instead of the default debug build.
 - `make test-pty` verifies interactive relay and signal behavior.
 - `make test-invocation` exercises the documented `alias op=macop` and sibling
   `op -> macop` symlink installation modes in a temporary PATH.

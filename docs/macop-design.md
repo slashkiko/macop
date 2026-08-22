@@ -474,7 +474,7 @@ Swiftの通常メモリを完全にzeroizeできるとは主張しない。secre
 
 ### 12.4 code signingと導入
 
-MVPの通常CLIは本人のMacでのsource buildを対象とし、`swift build -c release`後に`~/.local/bin/macop`へ配置する。script互換用の`op`は同directoryのsymlinkとする。通常CLIはad-hoc signature（`codesign --sign -`）を使える。ただしverified-session agentはsame-UIDのad-hoc binary replacementを防げないため、ad-hoc source buildではfail closedとする。production verified modeにはApple anchor付きの同一Developer Team署名と、`macop`/`macop-agent`の固定identifierを要求する。helperは`POSIX_SPAWN_START_SUSPENDED`でexec後・user code実行前に停止し、親がlive `SecCode`を固定identifier/Team/Apple anchor要件で検証してから再開する。Developer ID signing、notarization、installerはこのproduction配布境界を満たす後続スコープとする。
+MVPの通常CLIは本人のMacでのsource buildを対象とし、`swift build -c release`後に`~/.local/bin/macop`へ配置する。script互換用の`op`は同directoryのsymlinkとする。通常CLIはad-hoc signature（`codesign --sign -`）を使えるが、更新ごとにdesignated requirementが変わり得るため、legacy login Keychainではitem ACL確認に加えてad-hoc clientのXARA partition確認が表示されることがある。installerは既存のcodesigning identityを明示して同一identityを更新後も再利用する導線を提供するが、Keychain ACLを自動変更しない。ただしverified-session agentはsame-UIDのad-hoc binary replacementを防げないため、ad-hoc source buildではfail closedとする。production verified modeにはApple anchor付きの同一Developer Team署名と、`macop`/`macop-agent`の固定identifierを要求する。helperは`POSIX_SPAWN_START_SUSPENDED`でexec後・user code実行前に停止し、親がlive `SecCode`を固定identifier/Team/Apple anchor要件で検証してから再開する。Developer ID signing、notarizationはこのproduction配布境界を満たす後続スコープとする。
 
 Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain設定に依存するため、MVPの実機integration testで確認する。`doctor`はinstall path、code signature、Keychain / CTK access結果、`ssh-keychain.dylib`の存在、選択されるSSH client、実効`ForwardAgent`設定を表示する。`doctor`自身はsecret値を表示しない。
 
