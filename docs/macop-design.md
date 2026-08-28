@@ -89,9 +89,8 @@ op item list
 
 ### 4.2 MVP対象外
 
-- Apple Passwordsアプリ内のpassword、OTP、passkeyの取得
-- `op read`によるOTP取得、SSH秘密鍵のOpenSSH形式export
-- Keychain itemの作成、編集、削除
+- Apple Passwordsアプリ内のOTP、passkeyの直接取得
+- SSH秘密鍵のOpenSSH形式export
 - 独自vault
 - cloud backend
 - 複数端末でのSecure Enclave秘密鍵同期
@@ -146,18 +145,18 @@ shell aliasは対話shellだけに適用され、通常のshell scriptでは展�
 - 意味が異なるcommandやflagを互換と見なさない。たとえば1Password accountを返す`whoami`はローカルmacOS user情報で代用しない。
 - 本物の`op`へ暗黙に処理を転送しない。
 
-`ssh`、`config`、`doctor`、`compatibility`と`item import/acquire/create/edit/delete`は`macop`固有のextensionであり、1Password CLI互換とは主張しない。alias経由で`op ssh`などと起動された場合も、`macop` extensionとして同じ動作をする。
+`ssh`、`config`、`doctor`、`compatibility`、`generate password`、`profile`と`item import/acquire/create/edit/generate/otp/delete`は`macop`固有のextensionであり、1Password CLI互換とは主張しない。alias経由で`op ssh`などと起動された場合も、`macop` extensionとして同じ動作をする。
 
 ### 6.3 互換対象
 
 | 1Password CLI | macop | MVP |
 | --- | --- | --- |
 | `op --help`, `--version`, `--format`, `--no-color`, `--debug`, `--config` | 同名 | 対応。`--debug`でもsecretはredactする |
-| `op read` | `macop read` | 対応: text field、`--no-newline`。`--out-file`、OTP、SSH private key exportは未対応 |
+| `op read` | `macop read` | 対応: username/password/token、managed OTP query、`--no-newline`。`--out-file`、SSH private key exportは未対応 |
 | `op run` | `macop run` | 対応: shell/env-file、複数`--env-file`、デフォルトmask、`--no-masking`。1Password Environmentsは未対応 |
 | `op inject` | `macop inject` | 対応: stdin / `--in-file`、reference置換、stdout出力。`--out-file`は未対応 |
 | `op item list` | `macop item list` | 部分対応: config登録済みitemのみ、`--long`と`--format=json` |
-| `op item get` | `macop item get` | 部分対応: item名、`--fields label=…`、`--reveal`、`--format=json`。ID、stdin、OTP、share linkは未対応 |
+| `op item get` | `macop item get` | 部分対応: item名、`--fields label=…`、`--reveal`、`--format=json`。設定済みOTPは`label=otp`で取得できるが、1Password固有`--otp` flag、ID、stdin、share linkは未対応 |
 | `op completion` | `macop completion` | 対応: bash / zsh / fish。PowerShellはmacOS MVP外 |
 | `op whoami` | 同名 | 未対応。1Password accountという概念がないため |
 | `op signin`, `op signout`, `op update` | 同名 | 未対応。account backend・自動updateを持たないため |
@@ -165,7 +164,7 @@ shell aliasは対話shellだけに適用され、通常のshell scriptでは展�
 | `op item move/share/template` | 同名 | 未対応。vault/share/templateのデータモデルを持たないため |
 | `op vault/account/user/group/service-account/connect/events-api/document/environment/plugin` | 同名 | 未対応。vault/cloud backendを持たないため |
 | `--account`, `--session`, `--cache`, `--iso-timestamps`、UTF-8以外の`--encoding` | 同名 | 未対応。無視やno-opにはしない |
-| — | `macop ssh`, `config`, `doctor`, `compatibility`, `item import/acquire/create/edit/delete` | macop extensionとして対応。1Password CLI互換の機能ではない |
+| — | `macop ssh`, `config`, `doctor`, `compatibility`, `generate password`, `profile`, `item import/acquire/create/edit/generate/otp/delete` | macop extensionとして対応。1Password CLI互換の機能ではない |
 
 ### 6.4 互換性の境界
 
@@ -193,7 +192,7 @@ op://$APP_ENV/GitHub/token
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "items": {
     "Local/GitHub": {
       "provider": "keychain-generic",
@@ -209,7 +208,7 @@ op://$APP_ENV/GitHub/token
 
 読み込み時はconfig directoryと`config.json`を最終pathのsymbolic linkを辿らずにopenし、owner/mode/typeを検証した同じfile descriptorから読む。`keychain://internet/<server>/<account>`はpath/protocolなどで複数itemに一致し得るため、ちょうど1件でなければ値を選ばずにエラーにする。
 
-referenceの各path segmentはpercent decodeする。`$NAME`はreference解決前に現在の環境変数から展開できる。未定義変数、循環参照、query parameter（`?attribute=otp`、`?ssh-format=openssh`など）は構文または未対応エラーにする。
+referenceの各path segmentはpercent decodeする。`$NAME`はreference解決前に現在の環境変数から展開できる。未定義変数、循環参照、未対応query parameter（`?ssh-format=openssh`など）は構文または未対応エラーにする。config v2の`?attribute=otp`は設定されたOTP seedから現在のRFC 6238 codeを返す。
 
 ### 7.2 provider固有形式
 
@@ -228,7 +227,7 @@ macop read 'op://Local/GitHub/token'
 macop read --no-newline 'keychain://generic/github-token/me@example.com'
 ```
 
-`op read`互換として`--no-newline`を受け付ける。`--out-file`、`--file-mode`、`--force`は、secretをファイルへ残さない要件に反するためMVPでは拒否する。OTP属性と`ssh-format=openssh` query parameterも、Apple Passwords/SSH private key exportを必要とするため拒否する。
+`op read`互換として`--no-newline`を受け付ける。`--out-file`、`--file-mode`、`--force`は、secretをファイルへ残さない要件に反するため拒否する。`?attribute=otp`は設定済みの別managed Keychain itemに保存したseedだけをRFC 6238で解決する。`ssh-format=openssh`は秘密鍵exportを必要とするため拒否する。
 
 ```console
 $ op read --out-file token.txt 'op://Local/GitHub/token'
@@ -286,13 +285,25 @@ macop item delete LegacyGitHub
 
 `item create/edit`は設定済みのlegacy generic/internet passwordをstdinだけから作成・更新する。`edit/delete`はsecretを読む前にopaque persistent referenceを列挙してexact-oneを要求し、曖昧selectorで複数itemを変更しない。`item delete`はlegacy itemまたは1件のmanaged itemを削除し、`--all-managed`はmacop access group内のlocal/synchronizable generic passwordだけを対象にする。
 
-1Password固有のitem ID、stdin入力、`--vault`、`--categories`、`--tags`、`--favorite`、`--include-archive`、`--otp`、`--share-link`は、vault/category/archive/share/OTPという対応するデータモデルがないため未対応エラーにする。
+1Password固有のitem ID、stdin selector、`--vault`、`--categories`、`--tags`、`--favorite`、`--include-archive`、`--share-link`は、対応するデータモデルがないため未対応エラーにする。OTPはApple Passwordsを読むのではなく、別managed Keychain itemのseedと非secret metadataに限定する。
+
+`account`はwell-known `username` field、Keychain secret dataは`password` fieldとして解決する。従来の`token`と明示設定されたcustom fieldはsecret dataへ後方互換で解決する。Passwords AutoFillはusername/passwordの両方を確認し、username欠落時は明示入力、設定accountとの不一致は拒否する。
+
+Passwords AutoFillのusernameはbroker protocol v4の専用capabilityとresponse fieldで返す。read/run/inject/profile/item acquireと生成保存の承認用途はclosed wire enumとしてoperationとの一致を検証し、任意文字列をnative UIへ表示しない。managed mutationはcommitted/failed/indeterminateをwire上で区別し、AutoFill保存結果も不明時に`save_failed`と断定しない。送信後はresponse ID/type、username、save outcome、OSStatusの組合せをclosed contractとして検証し、矛盾・decode失敗・応答喪失は選択または保存済みの可能性を保つtyped indeterminateとしてcredentialを使用しない。native UIは既知の保存状態とCLIへのresponse delivery確認を分けて表示する。旧protocol companionはhandshakeで拒否し、CLI側でconfig accountをusernameとして捏造しない。
+
+`generate password`は`SecRandomCopyBytes`とrejection samplingを使う。legacyの`item generate`はselectorのzero-match preflight、追加時persistent reference、exact-one postflightを要求し、競合時は追加したreferenceだけをrollbackする。reference欠落またはrollback未確認はorphanの可能性を含むindeterminate stateとして、broad deleteをせずreconciliationを案内する。`item generate --replace`はexact-one updateとして、生成値をstdoutへ返さずKeychain mutationまたはmanaged authorization境界へ直接渡す。
+
+設定version 1は従来のcustom field semanticsを固定し、`username`や`password`も通常のsecret fieldとして扱う。legacy generic/internet selectorのv1受付契約も維持するが、全操作がbrokerを通る`keychain-managed` selectorはversionにかかわらずboundedかつdisplay-safeなwire metadataを必須とする。well-known username/password、OTP、profile、SSH hostの意味はversion 2でのみ有効にし、古いstrict readerへ新schemaをversion 1として渡さない。OTP seed selectorは全itemで一意かつmanaged password selectorと異なる必要がある。OTPはauthenticated import/edit/deleteを提供する。関連OTPを持つitemの削除はprimaryを先にexact deleteする。primaryの確定failure時はseedを保持し、broker応答喪失時はprimary結果をindeterminateとしてseedへ触れない。primary削除後のseed削除が確定failureならseed残存、応答喪失ならseed状態indeterminateとして、secret-freeの再試行・not-found reconciliationを案内する。managed import/updateもmutation後の応答喪失をtyped indeterminate stateとしてcreate/update別に案内する。
+
+credential profileはowner-only configにcanonical absolute executableとenv key→static referenceだけを持ち、`profile run`はexact executableを検証して`RunCommand`からshellなしで起動する。SSH host profileはalias→hostname/user/port/identityだけを持ち、`ssh connect`はApple OpenSSHを1 identityの短命verified session下で起動する。暗号、OS認証、host key検証、known_hostsは再実装しない。
 
 ### 8.5 global flag
 
 `--help`、`--version`、`--format human-readable|json`、`--no-color`、`--debug`を受け付ける。`OP_FORMAT`と`OP_DEBUG`も同じ意味で受け付ける。`--config <directory>`は、そのdirectory内の`config.json`を使用する。`--debug`はquery・provider・exit codeだけを出し、secret値や子プロセス環境を出さない。
 
 `--account`、`--session`、`--cache`、`--iso-timestamps`、UTF-8以外の`--encoding`は明示的な未対応エラーにする。
+
+`profile shell-init`はzsh/bashとfishを別々のUnicode scalar単位argument encoderで生成する。custom `--config`、profile executable、profile名をwrapperへ保持し、全shellのliteral apostropheとfishのbackslashを1引数としてround-tripする。自動検証はadversarial path/argumentを含むzsh/bash wrapperを実行し、fish未導入環境でも生成parser契約を検証する。fishは固定install pathを仮定せず、安全なabsolute `PATH` entry（Nix/MacPortsを含む）から見つかった場合に生成wrapperも実行する。
 
 ### 8.6 macop extension
 
@@ -476,6 +487,7 @@ flowchart TD
 - `AuthorizationStore`: session ID・process identity・鍵fingerprint・期限をkeyに、実行時メモリだけへ承認をcacheする
 - `AuthBroker`: owner-onlyの一時Unix socket、同一Team・peer UID・code identityを検証するversioned protocol。要求元rootを保護操作の直前にも再検証する
 - `MacopAuth`: application icon・検証状態・鍵・要求内容を表示し、`LocalAuthenticationView`と同じ`LAContext`でTouch ID承認、Secure Enclave署名、managed Keychain操作を行うon-demand app
+- macOS認証は`deviceOwnerAuthentication`を中心とするOS所有のTouch ID・Apple Watch・Macパスワード動線を使い、macopは成功・取消・失敗だけを受け取る。生体認証結果そのものは保存・再利用せず、既存の短命verified session authorizationだけをprocess/session境界で保持する
 - `ManagedKeychain`: Data Protection Keychainと`userPresence` access controlを使うcreate-only import / exact read。matching provisioning profileがないbuildではcapabilityを広告しない
 - `ErrorRenderer`: text / JSON形式の構造化エラー
 - `Doctor`: OS、純正バイナリ、Security.framework公開鍵解決、code signature、設定permissionの診断
@@ -611,8 +623,12 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 
 ## 16. MVP後の実装状態
 
-- Keychain itemの作成、編集、削除: legacy generic/internetとmanaged削除を実装済み
+- credential field: config v2でusername/password/tokenと別managed OTPを実装済み。各password/OTP readはclosed broker purposeで要求元操作を表示する
+- password生成: `generate password`と、直接Keychainへ保存・rotationする`item generate [--replace]`を実装済み
+- Keychain item lifecycle: legacy generic/internet create/edit/delete、managed import/update/delete、OTP import/edit/deleteを実装済み。応答喪失はindeterminate reconciliationを返す
 - `kSecAttrSynchronizable`を使ったgeneric secret同期: managed itemの項目単位opt-inとして実装済み。2台目Macでの伝播acceptanceは未実施
+- credential profile: exact canonical executable、env reference、zsh/bash/fish wrapper生成を実装済み。実Terminalでのdogfoodは未実施
+- SSH host routing: aliasごとのhostname/user/port/1 identity、`ssh connect`、public host configを実装済み。実CTK host routing acceptanceは未実施
 - shell plugin: zsh/bash/fish向け生成とtab root終了時のregistry失効を実装済み。実Terminal tab dogfoodは未実施
 - Git SSH署名: GitのSSH signing program互換adapterと設定生成を実装済み。OpenSSHによるSSHSIG検証済み、実CTK/Touch ID commit署名dogfoodは未実施
 - Apple Passwords provider: user-initiated AutoFill adapterは実装済み。公式direct providerは公開APIが提供された場合だけ差し替える

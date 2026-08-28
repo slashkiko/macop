@@ -137,8 +137,9 @@ delete them while the signed CLI and companion are still installed:
 scripts/uninstall.sh --delete-managed-keychain
 ```
 
-This opt-in path displays the native macop approval window and requires Touch ID
-or the Mac login password before deleting the items. It does not delete legacy
+This opt-in path displays the native macop approval window and requires Touch ID,
+Apple Watch, or the Mac login password before deleting the items. It also removes
+separately stored macop-managed OTP seeds. It does not delete legacy
 generic/internet Keychain entries, configuration, or Secure Enclave identities.
 
 ## Keychain and configuration
@@ -160,16 +161,18 @@ requires the directory to be owned by the current user with mode `0700`, and
 the file to be current-user owned with mode `0600`, with no extended ACL grants. It opens both without
 following a final-path symlink and reads the already-validated file descriptor,
 rejecting weaker or different permissions rather than attempting to repair them
-silently. A generic or internet-password mapping is intentionally valid only
-when its selector matches exactly one accessible Keychain item; use distinct
-service/account or server/account metadata for items that must coexist.
+silently. Reads, edits, and deletes for generic or internet-password mappings
+require selectors that match exactly one accessible Keychain item. Creates and
+non-replacing generation instead require zero matches before adding, followed
+by exact postflight verification. Use distinct service/account or
+server/account metadata for items that must coexist.
 
 Only lookup metadata belongs in the file. For example, this is safe because it
 contains no secret value:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "items": {
     "Local/GitHub": {
       "provider": "keychain-generic",
@@ -181,6 +184,17 @@ contains no secret value:
 }
 ```
 
+`config init` now creates schema version 2. Version 1 remains readable with its
+original custom-field behavior: names such as `username` and `password` still
+resolve the stored secret. Version 2 opts into well-known username/password
+fields, OTP metadata, credential profiles, and SSH host aliases. Add or migrate
+those entries only after changing the document version to 2; macop rejects v2
+keys in a v1 document instead of silently changing their meaning.
+Legacy generic/internet selectors keep the v1 acceptance contract. A v1
+`keychain-managed` selector must still fit the broker's bounded, display-safe
+wire metadata because every managed operation crosses that authenticated
+boundary.
+
 Set `"synchronization": "icloud"` on an individual `keychain-managed` item
 to store it as a synchronizable Data Protection Keychain item. The default
 (`null` or `"local"`) remains device-local. An iCloud item uses
@@ -191,12 +205,12 @@ group. Updates and deletions affect the synchronized copies. Cross-Mac
 propagation still requires acceptance on a second Mac; local add/read/update/delete
 and the synchronizable query contract are covered by the implementation tests.
 
-For a Touch ID-protected managed item, use the same non-secret selector shape
+For a user-presence-protected managed item, use the same non-secret selector shape
 with `"provider": "keychain-managed"`, then pass the secret only over stdin:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "items": {
     "Local/GitHub": {
       "provider": "keychain-managed",
@@ -229,21 +243,112 @@ printf %s "$REPLACEMENT_FROM_A_SAFE_SOURCE" | macop item edit GitHub
 macop item delete GitHub
 ```
 
-`create` refuses an existing selector. `edit` and `delete` enumerate opaque
+`create` requires a zero-match preflight, captures the persistent reference
+returned by the add, and postflight-verifies that it is the selector's only
+match. If a concurrent add makes the selector ambiguous, macop rolls back only
+its returned reference, never every broad selector match. A missing returned
+reference or unconfirmed targeted rollback is reported as indeterminate with
+manual selector-reconciliation guidance. `edit` and `delete` enumerate opaque
 persistent references first and refuse zero or multiple matches, so an
 ambiguous service/account or server/account selector never modifies several
 Keychain items.
 
+The well-known `username` field resolves the configured `account` metadata
+without reading secret data. `password` resolves Keychain secret data, while
+the existing `token` spelling remains backward-compatible:
+
+```bash
+macop read op://Local/GitHub/username
+macop read op://Local/GitHub/password
+macop read op://Local/GitHub/token
+```
+
+Generate a password explicitly to stdout, or generate and save it without
+returning the value to the shell. Generation uses `SecRandomCopyBytes` and
+rejection sampling:
+
+```bash
+macop generate password --length 40 --exclude 'O0l1'
+macop item generate GitHub --length 40
+macop item generate --replace GitHub --length 40
+```
+
 For an interactive credential, `read`, `run`, and `inject` first try the
 configured managed Keychain item. If it is missing, macOS opens its Passwords
 AutoFill chooser; after selection, macop shows the verified requesting app again
-and requires Touch ID or the Mac login password before returning the credential
+and requires Touch ID, Apple Watch, or the Mac login password before returning the credential
 to the requesting command. The approval window lets you save or update the
 selected password in the managed Keychain. Cancellation, authentication errors,
 and other Keychain failures never trigger the fallback.
 The system chooser is intentionally user-initiated: macop cannot enumerate or
 silently query the Passwords database through a public macOS API, and the
-current AutoFill workaround obtains the password field but not the username.
+AutoFill can populate both fields. If it does not return a username, the user
+must enter the configured account explicitly; a different username is rejected
+instead of being silently saved under the configured account.
+The CLI requires broker protocol v4, its closed operation-specific approval-purpose enum,
+username attestation, and explicit committed/failed/indeterminate mutation outcomes;
+an older companion cannot satisfy the handshake and is never allowed to
+substitute the configured account for an unverified username.
+After request transmission, response ID/type, username, save outcome, and
+OSStatus combinations are validated as one closed contract. A malformed or
+lost response is reported as indeterminate because selection or saving may
+have occurred; the credential is never used. The native result UI separately
+reports the known Keychain save state and whether delivery to the CLI was
+confirmed.
+
+An optional `otp` object stores only non-secret TOTP metadata. Its seed is a
+separate managed Keychain item and is imported from unpadded Base32 or a strict
+`otpauth://totp/` URI over stdin:
+
+```json
+"otp": {
+  "service": "example-github-otp",
+  "account": "example-user",
+  "algorithm": "SHA1",
+  "digits": 6,
+  "period": 30,
+  "label": "Example:example-user",
+  "issuer": "Example"
+}
+```
+
+```bash
+secure-source-command | macop item otp import GitHub
+secure-source-command | macop item otp edit GitHub
+macop item otp delete GitHub
+macop item otp GitHub
+macop read 'op://Local/GitHub/password?attribute=otp'
+```
+
+Only SHA-1, SHA-256, and SHA-512 RFC 6238 TOTP are accepted. macop emits only
+the current code after authorization. Base32 must be canonical, unpadded RFC
+4648. For an `otpauth` import, algorithm, digits, period, label, and issuer must
+exactly match the non-secret config metadata before any Keychain operation.
+
+Top-level `profiles` bind an exact canonical executable to an explicit mapping
+of environment variable names to static secret references. macop never invokes
+a shell:
+
+```json
+"profiles": {
+  "example": {
+    "executable": "/usr/bin/example-cli",
+    "environment": { "EXAMPLE_TOKEN": "op://Local/GitHub/token" }
+  }
+}
+```
+
+```bash
+macop profile run example -- /usr/bin/example-cli status
+eval "$(macop profile shell-init example zsh)"
+```
+
+`profile shell-init` emits zsh, bash, or fish syntax and preserves an explicit
+`--config` directory in the generated wrapper. All three shells escape literal
+apostrophe Unicode scalars; Fish uses its own encoder for both apostrophes and
+backslashes. Selftest executes adversarial zsh/bash wrappers, always checks the
+Fish parsing contract, and executes Fish when a safe absolute executable is
+found through `PATH` (including Nix or MacPorts-style locations).
 
 `item acquire` performs the same lookup and writes the credential to stdout.
 Pass `--from-passwords` to bypass a known-bad cached item explicitly; macop does
@@ -259,7 +364,13 @@ macop item delete --all-managed
 
 `item delete GitHub` uses the configured exact selector. Managed items require
 the native macop approval and macOS authentication; legacy items use their
-system Keychain access policy.
+system Keychain access policy. When an item has a separate OTP seed, macop
+deletes the primary item first so a missing, ambiguous, cancelled, or failed
+primary operation cannot destroy the seed. If the later OTP deletion is
+definitively denied, the error reports primary-deleted/seed-retained. If its
+broker response is lost, macop reports the seed state as indeterminate and
+gives an idempotent `item otp delete` reconciliation action without including
+the item name or seed.
 `--all-managed` is intentionally limited to generic-password items in macop's
 private access group and includes local and synchronizable copies. Deleting an
 already-missing individual item reports not found.
@@ -271,6 +382,18 @@ The supported secret boundary is deliberately narrow:
   stdout/stderr by default, unless `--no-masking` is explicitly selected.
 - `inject` reads a template from stdin or an input file and writes the expanded
   result only to stdout; persistent secret output files are rejected.
+- `generate password` is the explicit stdout-producing generator. `item
+  generate` creates a new exact item; `item generate --replace` rotates an
+  existing exact item. Both send the value directly to the selected Keychain
+  mutation boundary. Legacy create uses zero-match preflight plus a
+  persistent-reference postflight, including broad internet-password selectors
+  whose existing items differ only by path or protocol. Concurrent ambiguity
+  rolls back only the item created by that operation.
+- `item otp` and `?attribute=otp` expose only the current code; OTP seed import
+  and edit are stdin-only, deletion is explicit, and the seed is stored as a
+  separate managed Keychain item. OTP reads never use Passwords AutoFill.
+- `profile run` accepts only its configured canonical absolute executable and
+  resolves only the profile's declared secret-reference environment keys.
 - `item list` and `item get` return macop metadata. `item import` accepts exact
   UTF-8 secret bytes from stdin for a configured managed item; `item acquire`
   returns a managed or interactively selected credential; `item create/edit`
@@ -322,6 +445,22 @@ Git remains suspended through registry activation and approval, and receives
 without allowing its first instruction to run.
 It accepts only the `git` and `/usr/bin/git` entry points; renamed or alternate
 executables are rejected rather than receiving the verified-session socket.
+
+The optional top-level `ssh_hosts` object maps a safe alias to public connection
+metadata and one Secure Enclave identity label:
+
+```json
+"ssh_hosts": {
+  "example": {
+    "hostname": "example.com", "user": "git", "port": 22, "identity": "github"
+  }
+}
+```
+
+`macop ssh connect example` launches Apple OpenSSH under the same one-shot
+verified session and exposes only that identity. Extra SSH options are not
+accepted, so forwarding cannot override `ForwardAgent=no`. `macop ssh
+host-config [example]` renders only public host metadata.
 
 Generate repository-local Git commit/tag SSH-signing configuration for the same
 Secure Enclave identity:
