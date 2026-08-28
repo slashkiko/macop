@@ -360,7 +360,7 @@ private func run(mode: String, label: String, target: [String], signals: SignalC
                 inspector: SystemRequesterInspector()
             )
         },
-        prompt: LocalAuthenticationSessionPrompt(),
+        prompt: CompanionAuthenticationSessionPrompt(),
         makeSigner: { try SSHCommand.makeVerifiedSessionSigner(label: $0, authenticationContext: $1) },
         makeAgent: { registry, sessionID, connections in
             VerifiedSessionAgent(registry: registry, sessionID: sessionID, connections: connections)

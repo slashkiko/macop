@@ -130,12 +130,22 @@ public final class VerifiedSessionRuntime: @unchecked Sendable {
             signingAuthority: launchedIdentity.signatureSummary,
             cdHash: Self.abbreviatedCDHash(launchedIdentity.cdHash),
             fingerprint: session.keyFingerprint,
+            rootPID: session.rootPID,
+            rootStartTime: session.rootStartTime,
+            rootIdentifier: session.bundleID,
+            rootCodeRequirement: session.codeRequirement,
             sessionID: session.id,
             expiresAt: session.expiresAt
         ))
-        guard !self.dependencies.isCancellationRequested(), result.approved,
-              let context = result.authenticationContext else { throw AgentProtocolError.denied }
-        let signer = try self.dependencies.makeSigner(label, context)
+        guard !self.dependencies.isCancellationRequested(), result.approved else { throw AgentProtocolError.denied }
+        let signer: any AgentKeySigning
+        if let remote = result.signer {
+            signer = remote
+        } else if let context = result.authenticationContext {
+            signer = try self.dependencies.makeSigner(label, context)
+        } else {
+            throw AgentProtocolError.denied
+        }
         guard constantTimeEqual(Data(signer.fingerprint.utf8), Data(session.keyFingerprint.utf8)) else {
             throw AgentProtocolError.denied
         }

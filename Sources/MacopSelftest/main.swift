@@ -380,6 +380,132 @@ private func runtimeSelftests() throws {
                "cancellation after launch must revoke the pending session")
 }
 
+private func authBrokerSelftests() throws {
+    let nonce = Data(repeating: 0xA5, count: 32)
+    let hello = AuthBrokerMessage.hello(AuthBrokerHello(
+        minimumVersion: 1,
+        maximumVersion: 1,
+        capabilities: AuthBrokerCapability.approvalUI.rawValue | AuthBrokerCapability.sshSigning.rawValue,
+        nonce: nonce
+    ))
+    var helloFrame = try AuthBrokerWire.frame(hello)
+    let decodedHello = try AuthBrokerWire.takeFrame(from: &helloFrame)
+    try expect(
+        decodedHello == hello && helloFrame.isEmpty,
+        "auth broker hello must round-trip exactly"
+    )
+
+    let request = AuthBrokerApprovalRequest(
+        requestID: UUID(),
+        issuedAtMilliseconds: 1000,
+        expiresAtMilliseconds: 2000,
+        operation: .sshSession,
+        rootPID: 42,
+        rootStartTime: 7,
+        rootIdentifier: "test.agent",
+        rootCodeRequirement: "anchor test",
+        rootExecutablePath: "/tmp/test-agent",
+        command: "ssh -T git@github.com",
+        credentialLabel: "github",
+        credentialFingerprint: "SHA256:test",
+        host: "github.com"
+    )
+    var requestFrame = try AuthBrokerWire.frame(.approvalRequest(request))
+    let decodedRequest = try AuthBrokerWire.takeFrame(from: &requestFrame, nowMilliseconds: 1500)
+    try expect(
+        decodedRequest == .approvalRequest(request),
+        "auth broker request must round-trip exactly"
+    )
+    let managedImport = AuthBrokerManagedKeychainImportRequest(
+        authorizationID: request.requestID,
+        secret: Data("secret".utf8)
+    )
+    var managedImportFrame = try AuthBrokerWire.frame(.managedKeychainImportRequest(managedImport))
+    let decodedManagedImport = try AuthBrokerWire.takeFrame(from: &managedImportFrame)
+    try expect(
+        decodedManagedImport == .managedKeychainImportRequest(managedImport),
+        "managed Keychain import messages must round-trip exactly"
+    )
+    var expiredFrame = try AuthBrokerWire.frame(.approvalRequest(request))
+    do {
+        _ = try AuthBrokerWire.takeFrame(from: &expiredFrame, nowMilliseconds: 2000)
+        throw SelftestFailure(message: "expired auth broker requests must fail closed")
+    } catch AuthBrokerProtocolError.expired {}
+
+    do {
+        _ = try AuthBrokerWire.frame(.approvalRequest(AuthBrokerApprovalRequest(
+            requestID: UUID(),
+            issuedAtMilliseconds: 1,
+            expiresAtMilliseconds: 2,
+            operation: .sshSession,
+            rootPID: 42,
+            rootStartTime: 7,
+            rootIdentifier: "test.agent",
+            rootCodeRequirement: "anchor test",
+            rootExecutablePath: "/tmp/test-agent",
+            command: "ssh\u{001B}[31m trusted",
+            credentialLabel: "key",
+            credentialFingerprint: "SHA256:test",
+            host: "github.com"
+        )))
+        throw SelftestFailure(message: "ANSI control sequences must be rejected")
+    } catch AuthBrokerProtocolError.tooLarge {}
+
+    var unsupportedVersion = try AuthBrokerWire.frame(hello)
+    unsupportedVersion[9] = 2
+    do {
+        _ = try AuthBrokerWire.takeFrame(from: &unsupportedVersion)
+        throw SelftestFailure(message: "unknown auth broker versions must fail closed")
+    } catch AuthBrokerProtocolError.unsupportedVersion {}
+
+    let peerIdentity = LiveCodeIdentity(
+        canonicalPath: "/usr/local/bin/macop",
+        identifier: "macop",
+        teamID: "TEAM123456",
+        signingAuthority: "Developer ID Application",
+        cdHash: "00112233",
+        hasTrustedPublisher: true
+    )
+    let shellIdentity = LiveCodeIdentity(
+        canonicalPath: "/bin/zsh",
+        identifier: "com.apple.zsh",
+        teamID: "APPLE",
+        signingAuthority: "Software Signing",
+        cdHash: "11223344",
+        hasTrustedPublisher: true
+    )
+    let appIdentity = LiveCodeIdentity(
+        canonicalPath: "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+        identifier: "com.apple.Terminal",
+        teamID: "APPLE",
+        signingAuthority: "Software Signing",
+        cdHash: "22334455",
+        hasTrustedPublisher: true
+    )
+    let snapshots = SnapshotInspector(snapshots: [
+        50: ProcessSnapshot(pid: 50, parentPID: 40, startTime: 500),
+        40: ProcessSnapshot(pid: 40, parentPID: 30, startTime: 400),
+        30: ProcessSnapshot(pid: 30, parentPID: 1, startTime: 300)
+    ], valid: true)
+    let identities: [Int32: LiveCodeIdentity] = [50: peerIdentity, 40: shellIdentity, 30: appIdentity]
+    let verifier = AuthBrokerPeerVerifier(expectedTeamID: "TEAM123456", currentUID: 501)
+    let verified = try verifier.verify(
+        peer: RequesterPeer(pid: 50, uid: 501),
+        inspector: snapshots,
+        identityInspector: { pid in
+            guard let identity = identities[pid] else { throw AgentProtocolError.denied }
+            return identity
+        }
+    )
+    try expect(
+        verified.peerIdentity.identifier == "macop"
+            && verified.requestingApplication?.identifier == "com.apple.Terminal",
+        "broker must attribute a trusted peer to a live ancestor app"
+    )
+    let wrongTeam = AuthBrokerPeerVerifier(expectedTeamID: "OTHERTEAM", currentUID: 501)
+    try expect(!wrongTeam.acceptsPeerIdentity(peerIdentity), "broker must reject a different signing team")
+}
+
 // swiftlint:enable large_tuple opening_brace statement_position
 
 private func agentSelftests() throws {
@@ -1418,6 +1544,7 @@ private func runHarnessIfRequested() -> Never? {
 func run() throws {
     do { try agentSelftests() } catch { throw SelftestFailure(message: "agent selftests: \(error)") }
     do { try runtimeSelftests() } catch { throw SelftestFailure(message: "runtime selftests: \(error)") }
+    do { try authBrokerSelftests() } catch { throw SelftestFailure(message: "auth broker selftests: \(error)") }
     try runKeychainIntegrationIfRequested()
     let app = MacopApp(keychainClient: FakeKeychainClient(response: .success(Data("test-secret".utf8))))
     let fileManager = FileManager.default
@@ -1476,6 +1603,10 @@ func run() throws {
         signingAuthority: "test signature",
         cdHash: "00112233",
         fingerprint: "SHA256:test",
+        rootPID: 123,
+        rootStartTime: 456,
+        rootIdentifier: "com.example.macop-test",
+        rootCodeRequirement: "anchor test",
         sessionID: verifiedSession.id,
         expiresAt: verifiedSession.expiresAt
     )

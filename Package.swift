@@ -12,6 +12,7 @@ let package = Package(
         .library(name: "MacopCore", targets: ["MacopCore"]),
         .executable(name: "macop", targets: ["MacopCLI"]),
         .executable(name: "macop-agent", targets: ["MacopAgent"]),
+        .executable(name: "MacopAuth", targets: ["MacopAuth"]),
         .executable(name: "macop-selftest", targets: ["MacopSelftest"])
     ],
     targets: [
@@ -19,6 +20,7 @@ let package = Package(
         .target(name: "MacopCore", dependencies: ["MacopPTY"]),
         .executableTarget(name: "MacopCLI", dependencies: ["MacopCore"]),
         .executableTarget(name: "MacopAgent", dependencies: ["MacopCore", "MacopPTY"]),
+        .executableTarget(name: "MacopAuth", dependencies: ["MacopCore"]),
         .executableTarget(name: "MacopSelftest", dependencies: ["MacopCore"])
     ]
 )

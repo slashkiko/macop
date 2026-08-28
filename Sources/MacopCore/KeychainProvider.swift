@@ -5,6 +5,7 @@ import Security
 public enum KeychainQuery: Sendable, Equatable {
     case generic(service: String, account: String)
     case internet(server: String, account: String)
+    case managed(service: String, account: String)
 }
 
 public struct KeychainFailure: Error, Sendable {
@@ -65,6 +66,11 @@ public struct SystemKeychainSecurityAccess: KeychainSecurityAccess {
             securityQuery[kSecClass] = kSecClassInternetPassword
             securityQuery[kSecAttrServer] = server
             securityQuery[kSecAttrAccount] = account
+        case let .managed(service, account):
+            securityQuery[kSecClass] = kSecClassGenericPassword
+            securityQuery[kSecAttrService] = service
+            securityQuery[kSecAttrAccount] = account
+            securityQuery[kSecUseDataProtectionKeychain] = true
         }
         securityQuery[kSecReturnPersistentRef] = true
         securityQuery[kSecMatchLimit] = kSecMatchLimitAll
@@ -87,6 +93,22 @@ public struct SystemKeychainSecurityAccess: KeychainSecurityAccess {
         var result: CFTypeRef?
         let status = SecItemCopyMatching(securityQuery as CFDictionary, &result)
         return KeychainSecurityResult(status: status, result: result)
+    }
+}
+
+public struct DefaultKeychainClient: KeychainClient {
+    private let system = SystemKeychainClient()
+    private let managed = CompanionManagedKeychainClient()
+
+    public init() {}
+
+    public func read(_ query: KeychainQuery) -> Result<Data, KeychainFailure> {
+        switch query {
+        case .managed:
+            self.managed.read(query)
+        case .generic, .internet:
+            self.system.read(query)
+        }
     }
 }
 

@@ -9,6 +9,10 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
     public let signingAuthority: String
     public let cdHash: String
     public let fingerprint: String
+    public let rootPID: Int32
+    public let rootStartTime: UInt64
+    public let rootIdentifier: String
+    public let rootCodeRequirement: String
     public let sessionID: UUID
     public let expiresAt: Date
 
@@ -19,6 +23,10 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
         signingAuthority: String,
         cdHash: String,
         fingerprint: String,
+        rootPID: Int32,
+        rootStartTime: UInt64,
+        rootIdentifier: String,
+        rootCodeRequirement: String,
         sessionID: UUID,
         expiresAt: Date
     ) {
@@ -28,6 +36,10 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
         self.signingAuthority = signingAuthority
         self.cdHash = cdHash
         self.fingerprint = fingerprint
+        self.rootPID = rootPID
+        self.rootStartTime = rootStartTime
+        self.rootIdentifier = rootIdentifier
+        self.rootCodeRequirement = rootCodeRequirement
         self.sessionID = sessionID
         self.expiresAt = expiresAt
     }
@@ -45,9 +57,15 @@ public protocol SessionAuthorizationResultPrompting: Sendable {
 public final class SessionAuthorizationResult: @unchecked Sendable {
     public let approved: Bool
     public let authenticationContext: LAContext?
-    public init(approved: Bool, authenticationContext: LAContext?) {
+    public let signer: (any AgentKeySigning)?
+    public init(
+        approved: Bool,
+        authenticationContext: LAContext?,
+        signer: (any AgentKeySigning)? = nil
+    ) {
         self.approved = approved
         self.authenticationContext = authenticationContext
+        self.signer = signer
     }
 }
 
