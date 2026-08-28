@@ -4,6 +4,7 @@ set -euo pipefail
 bin_dir="${MACOP_BIN_DIR:-$HOME/.local/bin}"
 shell_profile="${MACOP_SHELL_PROFILE:-}"
 keep_path=false
+delete_managed_keychain=false
 
 usage() {
   cat <<'EOF'
@@ -15,11 +16,15 @@ Options:
   --bin-dir <directory>  Install directory (default: ~/.local/bin)
   --shell-profile <file> Profile containing the managed PATH block
   --keep-path            Preserve the managed PATH block
+  --delete-managed-keychain
+                         Delete all macop-managed Keychain items before uninstalling
   --help                 Show this help
 
 The script preserves configuration, Keychain items, CTK identities, and the
-install directory. An op symlink is removed only when it targets macop. The
-managed PATH block is removed unless --keep-path is passed.
+install directory by default. --delete-managed-keychain requires the installed,
+signed macop and MacopAuth.app and interactive macOS authentication. An op
+symlink is removed only when it targets macop. The managed PATH block is removed
+unless --keep-path is passed.
 MACOP_BIN_DIR and MACOP_SHELL_PROFILE may be used instead of their options.
 EOF
 }
@@ -43,6 +48,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --keep-path)
       keep_path=true
+      shift
+      ;;
+    --delete-managed-keychain)
+      delete_managed_keychain=true
       shift
       ;;
     --help|-h)
@@ -141,6 +150,9 @@ validate_managed_path_removal() {
 validate_managed_path_removal
 
 if [[ ! -e "$bin_dir" ]]; then
+  if [[ "$delete_managed_keychain" == true ]]; then
+    fail "cannot delete managed Keychain items because $bin_dir does not exist."
+  fi
   remove_managed_path
   printf 'Nothing to uninstall: %s does not exist.\n' "$bin_dir"
   exit 0
@@ -148,6 +160,29 @@ fi
 [[ -d "$bin_dir" ]] || fail "install path is not a directory: $bin_dir"
 [[ "$(stat -f '%u' "$bin_dir")" == "$(id -u)" ]] \
   || fail "install directory must be owned by the current user."
+
+delete_managed_keychain_items() {
+  if [[ "$delete_managed_keychain" != true ]]; then
+    return
+  fi
+  local macop_path="$bin_dir/macop"
+  local auth_app_path="$bin_dir/MacopAuth.app"
+  [[ ! -L "$macop_path" && -f "$macop_path" && -x "$macop_path" ]] \
+    || fail "managed Keychain deletion requires the installed macop executable."
+  [[ ! -L "$auth_app_path" && -d "$auth_app_path" ]] \
+    || fail "managed Keychain deletion requires the installed MacopAuth.app."
+  local macop_identifier auth_identifier
+  macop_identifier="$(codesign -d --verbose=4 "$macop_path" 2>&1 | sed -n 's/^Identifier=//p' | head -n 1)"
+  auth_identifier="$(codesign -d --verbose=4 "$auth_app_path" 2>&1 | sed -n 's/^Identifier=//p' | head -n 1)"
+  [[ "$macop_identifier" == "macop" ]] \
+    || fail "refusing Keychain deletion because the macop code-signing identifier is unexpected."
+  [[ "$auth_identifier" == "io.github.slashkiko.macop.auth" ]] \
+    || fail "refusing Keychain deletion because the MacopAuth.app identifier is unexpected."
+  "$macop_path" item delete --all-managed
+  printf '%s\n' 'Deleted all macop-managed Keychain items.'
+}
+
+delete_managed_keychain_items
 
 op_path="$bin_dir/op"
 if [[ -L "$op_path" ]]; then
@@ -193,4 +228,8 @@ if [[ -e "$auth_app" ]]; then
 fi
 remove_managed_path
 
-printf '%s\n' 'Preserved macop configuration, Keychain items, CTK identities, and the install directory.'
+if [[ "$delete_managed_keychain" == true ]]; then
+  printf '%s\n' 'Preserved macop configuration, CTK identities, and the install directory.'
+else
+  printf '%s\n' 'Preserved macop configuration, Keychain items, CTK identities, and the install directory.'
+fi

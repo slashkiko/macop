@@ -122,6 +122,14 @@ if grep -Fq '# >>> macop PATH >>>' "$shell_profile"; then
 fi
 grep -Fqx 'export EXISTING_SETTING=preserved' "$shell_profile"
 
+bash scripts/uninstall.sh --help | grep -Fq -- '--delete-managed-keychain'
+if bash scripts/uninstall.sh \
+  --bin-dir "$bin_dir" \
+  --shell-profile "$shell_profile" \
+  --delete-managed-keychain >/dev/null 2>&1; then
+  exit 1
+fi
+
 ln -s /usr/bin/true "$bin_dir/op"
 bash scripts/uninstall.sh --bin-dir "$bin_dir" --shell-profile "$shell_profile"
 test "$(readlink "$bin_dir/op")" = "/usr/bin/true"
