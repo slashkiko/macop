@@ -44,6 +44,25 @@ name, or profile is stored in the repository. The installer rejects `-` as an
 explicitly requested stable identity instead of silently falling back to
 ad-hoc signing.
 
+For managed Keychain dogfooding with an Apple Development identity, Xcode can
+create or renew a matching development profile without storing its Team ID in
+the repository:
+
+```bash
+scripts/create-development-profile.sh \
+  --signing-identity 'Apple Development: Example (IDENTIFIER)'
+
+MACOP_PROVISIONING_PROFILE="$HOME/Library/Application Support/macop/MacopAuth.provisionprofile" \
+  scripts/build-install.sh \
+  --signing-identity 'Apple Development: Example (IDENTIFIER)'
+```
+
+The profile helper uses Xcode automatic signing and may register the fixed
+`io.github.slashkiko.macop.auth` bundle ID and the current Mac with the selected
+team. The default output is outside the repository with mode `0600`. Personal
+Team profiles normally need periodic renewal; the helper prints the exact
+expiration returned by Xcode.
+
 The install directory defaults to `~/.local/bin` and can be changed with
 `--bin-dir` or `MACOP_BIN_DIR`. The installer refuses to replace an existing
 `op` command or an unrelated `op` symlink. `--configure-path` adds a marked,

@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 .PHONY: help setup bootstrap hooks-install
-.PHONY: format format-check lint test test-agent-helper test-invocation test-installation test-no-persistence test-keychain-integration test-keychain-auth-ui test-pty test-ssh-manual build release-build install uninstall
+.PHONY: format format-check lint test test-agent-helper test-invocation test-installation test-profile-helper test-no-persistence test-keychain-integration test-keychain-auth-ui test-pty test-ssh-manual build release-build install uninstall
 .PHONY: ci ci-swift ci-workflows ci-secrets
 .PHONY: pin-actions pin-actions-check
 .PHONY: workflow-lint workflow-security
@@ -15,7 +15,7 @@ GH_TOKEN ?= $(shell gh auth token 2>/dev/null || true)
 help:
 	@printf '%s\n' \
 	  'Setup:       make setup | bootstrap | hooks-install' \
-	  'Development: make format | format-check | lint | build | release-build | test | test-agent-helper | test-invocation | test-installation | test-no-persistence' \
+	  'Development: make format | format-check | lint | build | release-build | test | test-agent-helper | test-invocation | test-installation | test-profile-helper | test-no-persistence' \
 	  'Install:     make install | uninstall' \
 	  'Manual:      make test-keychain-integration | test-keychain-auth-ui | test-pty | test-ssh-manual' \
 	  'CI groups:   make ci-swift | ci-workflows | ci-secrets | ci' \
@@ -49,6 +49,15 @@ test-invocation: build
 
 test-installation: build
 	@bash scripts/test-installation.sh
+
+test-profile-helper:
+	@bash -n scripts/create-development-profile.sh scripts/build-auth-app.sh
+	@plutil -lint Resources/ProfileBootstrap/MacopProfileBootstrap.xcodeproj/project.pbxproj >/dev/null
+	@plutil -lint Resources/ProfileBootstrap/MacopProfileBootstrap/MacopProfileBootstrap.entitlements >/dev/null
+	@scripts/create-development-profile.sh --help >/dev/null
+	@output="$$(scripts/create-development-profile.sh --signing-identity - 2>&1)"; status=$$?; \
+		test $$status -ne 0; printf '%s\n' "$$output" \
+		| grep -F 'an Apple Development identity name or SHA-1 hash is required.' >/dev/null
 
 test-no-persistence: build
 	@python3 scripts/test-no-persistence.py
@@ -89,7 +98,7 @@ workflow-security:
 secret-scan:
 	mise exec -- betterleaks dir .
 
-ci-swift: format-check lint build test test-agent-helper test-invocation test-installation test-no-persistence
+ci-swift: format-check lint build test test-agent-helper test-invocation test-installation test-profile-helper test-no-persistence
 
 ci-workflows: pin-actions-check workflow-lint workflow-security
 

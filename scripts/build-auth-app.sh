@@ -20,9 +20,10 @@ if [[ "$signing_identity" != "-" ]]; then
     || fail "MACOP_SIGNING_IDENTITY must name a certificate-backed identity or be unset."
 fi
 
-for command in awk codesign cp head install mktemp mv openssl plutil rm rmdir security sed tr; do
+for command in awk codesign cp date head install mktemp mv openssl plutil rm rmdir security sed tr; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is unavailable: $command"
 done
+[[ -x /usr/libexec/PlistBuddy ]] || fail "required command is unavailable: /usr/libexec/PlistBuddy"
 
 resolve_team_id() {
   local requested_identity="$1"
@@ -78,6 +79,7 @@ staged="$(mktemp -d "$build_dir/.MacopAuth.app.XXXXXX")"
 backup=""
 generated_entitlements=""
 entitlements_readback=""
+decoded_profile=""
 team_id=""
 cleanup() {
   if [[ -n "$backup" && -e "$backup" && ! -e "$destination" ]]; then
@@ -88,6 +90,7 @@ cleanup() {
   [[ -z "$backup" || ! -e "$backup" ]] || rm -rf "$backup"
   [[ -z "$generated_entitlements" || ! -e "$generated_entitlements" ]] || rm -f "$generated_entitlements"
   [[ -z "$entitlements_readback" || ! -e "$entitlements_readback" ]] || rm -f "$entitlements_readback"
+  [[ -z "$decoded_profile" || ! -e "$decoded_profile" ]] || rm -f "$decoded_profile"
 }
 trap cleanup EXIT
 
@@ -102,6 +105,27 @@ fi
 codesign --remove-signature "$staged" >/dev/null 2>&1 || true
 if [[ "$signing_identity" != "-" && -n "$provisioning_profile" ]]; then
   team_id="$(resolve_team_id "$signing_identity")"
+  decoded_profile="$(mktemp "$build_dir/.MacopAuth.profile.XXXXXX")"
+  security cms -D -i "$provisioning_profile" >"$decoded_profile" \
+    || fail "MACOP_PROVISIONING_PROFILE is not a valid signed profile."
+  profile_team="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$decoded_profile")"
+  profile_app_identifier="$(/usr/libexec/PlistBuddy \
+    -c 'Print :Entitlements:com.apple.application-identifier' "$decoded_profile")"
+  profile_access_group="$(/usr/libexec/PlistBuddy \
+    -c 'Print :Entitlements:keychain-access-groups:0' "$decoded_profile")"
+  profile_platform="$(/usr/libexec/PlistBuddy -c 'Print :Platform:0' "$decoded_profile")"
+  profile_expiration="$(plutil -extract ExpirationDate raw "$decoded_profile")"
+  profile_expiration_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$profile_expiration" '+%s')"
+  [[ "$profile_team" == "$team_id" ]] || fail "provisioning profile Team ID does not match the identity."
+  [[ "$profile_app_identifier" == "$team_id.$bundle_identifier" ]] \
+    || fail "provisioning profile does not authorize the MacopAuth application identifier."
+  [[ "$profile_access_group" == "$profile_app_identifier" || "$profile_access_group" == "$team_id.*" ]] \
+    || fail "provisioning profile does not authorize the MacopAuth Keychain access group."
+  [[ "$profile_platform" == "OSX" || "$profile_platform" == "macOS" ]] \
+    || fail "provisioning profile is not for macOS."
+  [[ "$profile_expiration_epoch" -gt "$(date -u '+%s')" ]] || fail "provisioning profile is expired."
+  rm -f "$decoded_profile"
+  decoded_profile=""
   generated_entitlements="$(mktemp "$build_dir/.MacopAuth.entitlements.XXXXXX")"
   sed "s/__TEAM_ID__/$team_id/g" "$entitlements_template" >"$generated_entitlements"
   plutil -lint "$generated_entitlements" >/dev/null

@@ -12,3 +12,5 @@ Package.resolved
 
 # Optional generated Xcode project
 *.xcodeproj
+!Resources/ProfileBootstrap/MacopProfileBootstrap.xcodeproj/
+!Resources/ProfileBootstrap/MacopProfileBootstrap.xcodeproj/project.pbxproj
