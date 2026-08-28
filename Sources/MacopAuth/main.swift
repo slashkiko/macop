@@ -36,9 +36,14 @@ private final class AuthApprovalCoordinator: ObservableObject {
         case starting
         case pending(PendingApproval)
         case processing
-        case completed(String)
+        case completed(Completion)
         case cancelled
         case failed(String)
+    }
+
+    struct Completion {
+        let message: String
+        let isSuccess: Bool
     }
 
     struct PendingApproval {
@@ -52,6 +57,7 @@ private final class AuthApprovalCoordinator: ObservableObject {
         let status: AuthBrokerApprovalStatus
         let context: LAContext?
         let credential: Data?
+        let username: String?
         let saveToKeychain: Bool
     }
 
@@ -147,6 +153,7 @@ private final class AuthApprovalCoordinator: ObservableObject {
     }
 
     func submitCredential(
+        username: String,
         _ password: String,
         saveToKeychain: Bool,
         passwordOnly: Bool,
@@ -154,6 +161,7 @@ private final class AuthApprovalCoordinator: ObservableObject {
     ) {
         guard case let .pending(current) = self.state,
               current.request.requestID == pending.request.requestID,
+              username == pending.request.keychainAccount,
               !password.isEmpty,
               let credential = password.data(using: .utf8),
               credential.count <= ManagedKeychainStore.maximumSecretLength,
@@ -172,6 +180,7 @@ private final class AuthApprovalCoordinator: ObservableObject {
                 self.finish(
                     success ? .approved : .denied,
                     credential: success ? credential : nil,
+                    username: success ? username : nil,
                     saveToKeychain: success && saveToKeychain,
                     pending: pending
                 )
@@ -196,13 +205,14 @@ private final class AuthApprovalCoordinator: ObservableObject {
             status: .denied,
             context: nil,
             credential: nil,
+            username: nil,
             saveToKeychain: false
         ))
         self.continuation = nil
     }
 
-    func complete(_ message: String) {
-        self.state = .completed(message)
+    func complete(_ message: String, isSuccess: Bool = true) {
+        self.state = .completed(Completion(message: message, isSuccess: isSuccess))
     }
 
     func terminateSoon(after delay: Duration = .milliseconds(250)) {
@@ -215,6 +225,7 @@ private final class AuthApprovalCoordinator: ObservableObject {
     private func finish(
         _ status: AuthBrokerApprovalStatus,
         credential: Data? = nil,
+        username: String? = nil,
         saveToKeychain: Bool = false,
         pending: PendingApproval
     ) {
@@ -233,6 +244,7 @@ private final class AuthApprovalCoordinator: ObservableObject {
             status: status,
             context: context,
             credential: credential,
+            username: username,
             saveToKeychain: saveToKeychain
         ))
     }
@@ -246,7 +258,13 @@ private final class AuthApprovalCoordinator: ObservableObject {
         case .sshSign:
             "Secure EnclaveのSSH鍵で署名します。"
         case .managedKeychainImport:
-            "Touch IDで保護するKeychain項目を登録します。"
+            request.purpose.concernsOTP
+                ? "OTP seedをTouch ID、Apple Watch、またはMacパスワードで保護して登録します。"
+                : "Touch ID、Apple Watch、またはMacパスワードで保護するKeychain項目を登録します。"
+        case .managedKeychainUpdate:
+            request.purpose.concernsOTP
+                ? "OTP seedをTouch ID、Apple Watch、またはMacパスワードで更新します。"
+                : "macop管理のKeychain項目を更新します。"
         case .passwordAutoFill:
             "Passwordsから選んだ資格情報をmacopで使用します。"
         case .managedKeychainDelete:
@@ -284,6 +302,7 @@ private enum AuthBrokerRuntimeCapabilities {
         if AuthBrokerRuntimeCapabilities.hasManagedKeychainEntitlements() {
             capabilities |= AuthBrokerCapability.managedKeychain.rawValue
                 | AuthBrokerCapability.passwordAutoFill.rawValue
+                | AuthBrokerCapability.passwordAutoFillUsername.rawValue
         }
         return capabilities
     }()
@@ -308,6 +327,7 @@ private enum AuthBrokerRuntimeCapabilities {
     }
 }
 
+// swiftlint:disable:next type_body_length
 private enum AuthBrokerAppServer {
     static func run(socketPath: String, coordinator: AuthApprovalCoordinator) async throws {
         try self.validateSocketParent(socketPath)
@@ -344,11 +364,14 @@ private enum AuthBrokerAppServer {
             timeout: 10,
             nowMilliseconds: now
         ) else { throw AgentProtocolError.denied }
-        guard request.operation != .sshSign else { throw AgentProtocolError.denied }
+        guard request.operation != .sshSign,
+              request.purpose.isValid(for: request.operation)
+        else { throw AgentProtocolError.denied }
         let requiredCapability = switch request.operation {
         case .sshSession, .sshSign, .gitSSHSign:
             AuthBrokerCapability.sshSigning.rawValue
-        case .managedKeychainRead, .managedKeychainImport, .passwordAutoFill, .managedKeychainDelete:
+        case .managedKeychainRead, .managedKeychainImport, .managedKeychainUpdate,
+             .passwordAutoFill, .managedKeychainDelete:
             AuthBrokerCapability.managedKeychain.rawValue
         }
         guard capabilities & requiredCapability == requiredCapability else {
@@ -356,12 +379,16 @@ private enum AuthBrokerAppServer {
         }
         let isKeychainRequest = request.operation == .managedKeychainRead
             || request.operation == .managedKeychainImport
+            || request.operation == .managedKeychainUpdate
             || request.operation == .passwordAutoFill
             || request.operation == .managedKeychainDelete
         if isKeychainRequest {
             let isDeleteAll = request.operation == .managedKeychainDelete
                 && request.keychainService.isEmpty
                 && request.keychainAccount.isEmpty
+            guard isDeleteAll == (request.purpose == .managedKeychainDeleteAll) else {
+                throw AgentProtocolError.denied
+            }
             guard isDeleteAll || (!request.keychainService.isEmpty && !request.keychainAccount.isEmpty) else {
                 throw AgentProtocolError.denied
             }
@@ -412,14 +439,15 @@ private enum AuthBrokerAppServer {
             try self.validateRoot(request)
             resultData = credential
             if outcome.saveToKeychain {
-                resultStatus = ManagedKeychainStore.upsertSecret(
+                let mutation = ManagedKeychainStore.upsertSecret(
                     credential,
                     service: request.keychainService,
                     account: request.keychainAccount,
                     synchronizable: request.keychainSynchronizable,
                     authenticationContext: context
                 )
-                resultMessage = resultStatus == errSecSuccess ? "saved" : "save_failed"
+                resultStatus = mutation.status
+                resultMessage = PasswordAutoFillSaveStatus(mutationOutcome: mutation).rawValue
             } else {
                 resultMessage = "not_requested"
             }
@@ -444,27 +472,61 @@ private enum AuthBrokerAppServer {
         } else {
             signer = nil
         }
-        try AuthBrokerSocketIO.writeMessage(.approvalResponse(AuthBrokerApprovalResponse(
-            requestID: request.requestID,
-            status: outcome.status,
-            message: resultMessage,
-            resultStatus: resultStatus,
-            resultData: resultData
-        )), to: client, timeout: 5)
-        let completionMessage = if request.operation == .passwordAutoFill {
-            switch resultMessage {
-            case "saved": "Keychainに保存しました"
-            case "not_requested": "今回のみ使用しました"
-            default: "資格情報を受け取りましたが、Keychainへの保存に失敗しました"
-            }
-        } else if request.operation == .managedKeychainDelete {
+        let completionMessage = if request.operation == .managedKeychainDelete {
             resultStatus == errSecSuccess ? "Keychainから削除しました" : "Keychain項目の削除に失敗しました"
+        } else if request.operation == .managedKeychainUpdate {
+            "Keychain項目の更新を許可しました"
         } else if request.operation == .gitSSHSign {
             "Git SSH署名を許可しました"
         } else {
             "許可しました"
         }
-        await coordinator.complete(completionMessage)
+        do {
+            try AuthBrokerSocketIO.writeMessage(.approvalResponse(AuthBrokerApprovalResponse(
+                requestID: request.requestID,
+                status: outcome.status,
+                message: resultMessage,
+                resultStatus: resultStatus,
+                resultData: resultData,
+                verifiedUsername: request.operation == .passwordAutoFill ? (outcome.username ?? "") : ""
+            )), to: client, timeout: 5)
+        } catch {
+            if request.operation == .passwordAutoFill {
+                if outcome.status == .approved,
+                   let saveStatus = PasswordAutoFillSaveStatus(rawValue: resultMessage)
+                // swiftlint:disable:next opening_brace
+                {
+                    let presentation = PasswordAutoFillCompletionPresentation(
+                        saveStatus: saveStatus,
+                        delivery: .unknown
+                    )
+                    await coordinator.complete(presentation.message, isSuccess: false)
+                } else {
+                    let presentation = PasswordAutoFillRejectionPresentation(
+                        status: outcome.status,
+                        delivery: .unknown
+                    )
+                    await coordinator.complete(presentation.message, isSuccess: false)
+                }
+                await coordinator.terminateSoon(after: .seconds(2))
+                return
+            }
+            throw error
+        }
+        if request.operation == .passwordAutoFill {
+            if outcome.status == .approved,
+               let saveStatus = PasswordAutoFillSaveStatus(rawValue: resultMessage)
+            // swiftlint:disable:next opening_brace
+            {
+                let presentation = PasswordAutoFillCompletionPresentation(
+                    saveStatus: saveStatus,
+                    delivery: .delivered
+                )
+                await coordinator.complete(presentation.message, isSuccess: presentation.isSuccess)
+            }
+        } else {
+            await coordinator.complete(completionMessage)
+        }
         if let signer {
             try self.serveSigning(
                 client: client,
@@ -473,7 +535,7 @@ private enum AuthBrokerAppServer {
             )
         } else if outcome.status == .approved,
                   let context = outcome.context,
-                  request.operation == .managedKeychainImport
+                  request.operation == .managedKeychainImport || request.operation == .managedKeychainUpdate
         // swiftlint:disable:next opening_brace
         {
             try self.serveManagedKeychainImport(client: client, request: request, context: context)
@@ -493,17 +555,28 @@ private enum AuthBrokerAppServer {
             timeout: 30
         ), importRequest.authorizationID == request.requestID else { throw AgentProtocolError.denied }
         try self.validateRoot(request)
-        let status = ManagedKeychainStore.importSecret(
-            importRequest.secret,
-            service: request.keychainService,
-            account: request.keychainAccount,
-            synchronizable: request.keychainSynchronizable,
-            authenticationContext: context
-        )
+        let mutation = if request.operation == .managedKeychainUpdate {
+            ManagedKeychainStore.updateSecret(
+                importRequest.secret,
+                service: request.keychainService,
+                account: request.keychainAccount,
+                synchronizable: request.keychainSynchronizable,
+                authenticationContext: context
+            )
+        } else {
+            ManagedKeychainStore.importSecret(
+                importRequest.secret,
+                service: request.keychainService,
+                account: request.keychainAccount,
+                synchronizable: request.keychainSynchronizable,
+                authenticationContext: context
+            )
+        }
         try AuthBrokerSocketIO.writeMessage(.managedKeychainImportResponse(
             AuthBrokerManagedKeychainImportResponse(
                 authorizationID: request.requestID,
-                status: status
+                outcome: mutation.brokerOutcome,
+                status: mutation.status
             )
         ), to: client, timeout: 30)
     }
@@ -580,8 +653,9 @@ private struct AuthApprovalView: View {
                 if pending.request.operation == .passwordAutoFill {
                     PasswordAutoFillRequestView(
                         pending: pending,
-                        submit: { password, save, passwordOnly in
+                        submit: { username, password, save, passwordOnly in
                             self.coordinator.submitCredential(
+                                username: username,
                                 password,
                                 saveToKeychain: save,
                                 passwordOnly: passwordOnly,
@@ -600,8 +674,11 @@ private struct AuthApprovalView: View {
                 }
             case .processing:
                 ProgressView("処理しています…")
-            case let .completed(message):
-                ResultView(symbol: "checkmark.circle.fill", title: message)
+            case let .completed(completion):
+                ResultView(
+                    symbol: completion.isSuccess ? "checkmark.circle.fill" : "exclamationmark.triangle",
+                    title: completion.message
+                )
             case .cancelled:
                 ResultView(symbol: "xmark.circle", title: "キャンセルしました")
             case let .failed(message):
@@ -614,9 +691,10 @@ private struct AuthApprovalView: View {
 
 private struct PasswordAutoFillRequestView: View {
     let pending: AuthApprovalCoordinator.PendingApproval
-    let submit: (String, Bool, Bool) -> Void
+    let submit: (String, String, Bool, Bool) -> Void
     let cancel: () -> Void
     @State private var password = ""
+    @State private var username = ""
     @State private var saveToKeychain = true
 
     var body: some View {
@@ -644,17 +722,32 @@ private struct PasswordAutoFillRequestView: View {
             }
             VStack(alignment: .leading, spacing: 12) {
                 AutoFillTextField(
+                    text: self.$username,
+                    placeholder: "ユーザー名（\(self.pending.request.keychainAccount)）",
+                    contentType: .username,
+                    secure: false
+                )
+                AutoFillTextField(
                     text: self.$password,
                     placeholder: "パスワード",
                     contentType: .password,
                     secure: true
                 )
             }
+            if !self.username.isEmpty, self.username != self.pending.request.keychainAccount {
+                Text("選択したユーザー名が設定済みアカウントと一致しません。")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            } else if self.username.isEmpty, !self.password.isEmpty {
+                Text("Passwordsがユーザー名を返さなかった場合は、設定済みアカウントを入力して確認してください。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Toggle("選んだパスワードをmacop管理のKeychainに保存・更新する", isOn: self.$saveToKeychain)
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
                 self.row("サービス", self.pending.request.keychainService)
                 self.row("保存先", self.pending.request.keychainAccount)
-                self.row("コマンド", self.pending.request.command)
+                self.row("操作", self.pending.request.purpose.displayName)
             }
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -668,19 +761,21 @@ private struct PasswordAutoFillRequestView: View {
                         .keyboardShortcut(.cancelAction)
                     Spacer(minLength: 24)
                     HStack(spacing: 10) {
-                        Button("Macのパスワードで使用") {
-                            self.submit(self.password, self.saveToKeychain, true)
+                        Button("Macパスワード") {
+                            self.submit(self.username, self.password, self.saveToKeychain, true)
+                            self.username = ""
                             self.password = ""
                         }
-                        Button("Touch IDで使用") {
-                            self.submit(self.password, self.saveToKeychain, false)
+                        Button("Touch ID／Apple Watch") {
+                            self.submit(self.username, self.password, self.saveToKeychain, false)
+                            self.username = ""
                             self.password = ""
                         }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
                     }
                     .fixedSize(horizontal: true, vertical: false)
-                    .disabled(self.password.isEmpty)
+                    .disabled(self.password.isEmpty || self.username != self.pending.request.keychainAccount)
                 }
             }
         }
@@ -779,7 +874,7 @@ private struct ApprovalRequestView: View {
                 Spacer()
             }
             Divider()
-            LocalAuthenticationView("Touch IDで許可", context: self.pending.context)
+            LocalAuthenticationView("Touch ID／Apple Watchで許可", context: self.pending.context)
                 .controlSize(.large)
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
                 if self.isManagedKeychainRequest {
@@ -795,7 +890,7 @@ private struct ApprovalRequestView: View {
                     self.row("使用する鍵", self.pending.request.credentialLabel)
                     self.row("フィンガープリント", self.pending.request.credentialFingerprint)
                 }
-                self.row("コマンド", self.pending.request.command)
+                self.row("操作", self.pending.request.purpose.displayName)
             }
             .padding(14)
             .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
@@ -825,6 +920,7 @@ private struct ApprovalRequestView: View {
     private var isManagedKeychainRequest: Bool {
         self.pending.request.operation == .managedKeychainRead
             || self.pending.request.operation == .managedKeychainImport
+            || self.pending.request.operation == .managedKeychainUpdate
             || self.pending.request.operation == .managedKeychainDelete
     }
 
@@ -837,8 +933,9 @@ private struct ApprovalRequestView: View {
     private var managedKeychainAction: String {
         switch self.pending.request.operation {
         case .managedKeychainRead: "読み取り"
+        case .managedKeychainUpdate: self.pending.request.purpose.concernsOTP ? "OTP seedの更新" : "更新"
         case .managedKeychainDelete: "削除"
-        default: "登録"
+        default: self.pending.request.purpose.concernsOTP ? "OTP seedの登録" : "登録"
         }
     }
 

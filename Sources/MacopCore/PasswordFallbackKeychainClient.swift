@@ -7,18 +7,18 @@ import Security
 final class PasswordFallbackKeychainClient: KeychainClient, @unchecked Sendable {
     private let primary: any KeychainClient
     private let passwordAutoFillProvider: any PasswordAutoFillProviding
-    private let command: String
+    private let purpose: PasswordAutoFillPurpose
     private let lock = NSLock()
     private var cache = [KeychainQuery: Data]()
 
     init(
         primary: any KeychainClient,
         passwordAutoFillProvider: any PasswordAutoFillProviding,
-        command: String
+        purpose: PasswordAutoFillPurpose
     ) {
         self.primary = primary
         self.passwordAutoFillProvider = passwordAutoFillProvider
-        self.command = command
+        self.purpose = purpose
     }
 
     func read(_ query: KeychainQuery) -> Result<Data, KeychainFailure> {
@@ -40,13 +40,27 @@ final class PasswordFallbackKeychainClient: KeychainClient, @unchecked Sendable 
                     service: service,
                     account: account,
                     synchronizable: synchronizable,
-                    command: self.command
+                    purpose: self.purpose
                 )
+                if let saveFailure = credential.saveFailure {
+                    return .failure(KeychainFailure(
+                        errSecInternalComponent,
+                        autoFillFailure: saveFailure
+                    ))
+                }
+                guard credential.username == account else {
+                    return .failure(KeychainFailure(errSecAuthFailed))
+                }
                 guard !credential.secret.isEmpty,
                       credential.secret.count <= ManagedKeychainStore.maximumSecretLength
                 else { return .failure(KeychainFailure(errSecDecode)) }
                 self.cache[query] = credential.secret
                 return .success(credential.secret)
+            } catch let failure as PasswordAutoFillFailure {
+                return .failure(KeychainFailure(
+                    errSecInternalComponent,
+                    autoFillFailure: failure
+                ))
             } catch let error as CLIError {
                 return .failure(KeychainFailure(self.status(for: error)))
             } catch {

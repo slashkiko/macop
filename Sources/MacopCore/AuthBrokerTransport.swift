@@ -347,7 +347,9 @@ public final class AuthBrokerClientConnection: @unchecked Sendable {
             maximumVersion: AuthBrokerWire.currentVersion,
             capabilities: AuthBrokerCapability.approvalUI.rawValue
                 | AuthBrokerCapability.managedKeychain.rawValue
-                | AuthBrokerCapability.sshSigning.rawValue,
+                | AuthBrokerCapability.sshSigning.rawValue
+                | AuthBrokerCapability.passwordAutoFill.rawValue
+                | AuthBrokerCapability.passwordAutoFillUsername.rawValue,
             nonce: nonce
         )), to: self.descriptor, timeout: 5)
         guard case let .helloReply(reply) = try AuthBrokerSocketIO.readMessage(

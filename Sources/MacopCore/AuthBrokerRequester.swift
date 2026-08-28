@@ -4,7 +4,7 @@ import Foundation
 public enum AuthBrokerRequester {
     public static func approvalRequest(
         operation: AuthBrokerOperation,
-        command: String,
+        purpose: AuthBrokerPurpose,
         credentialLabel: String,
         service: String,
         account: String,
@@ -13,6 +13,7 @@ public enum AuthBrokerRequester {
         host: String = "",
         rootPID: Int32 = getpid()
     ) throws -> AuthBrokerApprovalRequest {
+        guard purpose.isValid(for: operation) else { throw AuthBrokerProtocolError.malformed }
         let executable = try RunningExecutable.path()
         let expectedPath = rootPID == getpid() ? executable : try self.executablePath(pid: rootPID)
         let inspection = try LiveCodeIdentityInspector.inspect(pid: rootPID, expectedPath: expectedPath)
@@ -31,7 +32,7 @@ public enum AuthBrokerRequester {
             rootIdentifier: inspection.identity.identifier,
             rootCodeRequirement: inspection.codeRequirement,
             rootExecutablePath: inspection.identity.canonicalPath,
-            command: command,
+            purpose: purpose,
             credentialLabel: credentialLabel,
             credentialFingerprint: credentialFingerprint,
             host: host,

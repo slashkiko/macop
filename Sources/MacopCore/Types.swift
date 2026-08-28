@@ -60,6 +60,8 @@ public enum TopLevelCommand: String {
     case read
     case run
     case inject
+    case generate
+    case profile
     case item
     case ssh
     case config

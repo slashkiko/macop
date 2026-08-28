@@ -5,7 +5,8 @@ public enum ReadCommand {
         args: [String],
         options: GlobalOptions,
         env: [String: String],
-        client: any KeychainClient = DefaultKeychainClient()
+        client: any KeychainClient = DefaultKeychainClient(),
+        otpClient: any KeychainClient = CompanionManagedKeychainClient()
     ) throws -> CommandResult {
         let parsed = try parseArgs(args)
         let reference = try ReferenceResolver.parse(parsed.reference, env: env)
@@ -17,9 +18,17 @@ public enum ReadCommand {
                 item: item,
                 configDirectory: options.configDirectory
             )
-            try self.validateFieldAccess(configItem: configItem, section: section, field: field)
-            let text = try KeychainProvider.readText(self.query(for: configItem), client: client)
+            let text = try CredentialFieldResolver.read(
+                item: configItem, section: section, field: field, client: client, otpClient: otpClient
+            )
             return CommandResult(exitCode: 0, stdout: text + (parsed.noNewline ? "" : "\n"))
+        case let .opOTP(namespace, item):
+            let configItem = try ConfigStore.resolveItem(
+                namespace: namespace, item: item, configDirectory: options.configDirectory
+            )
+            return try self.output(
+                CredentialFieldResolver.otp(item: configItem, client: otpClient), noNewline: parsed.noNewline
+            )
         case let .keychainGeneric(service, account):
             return try self.output(
                 KeychainProvider.readText(.generic(service: service, account: account), client: client),
@@ -52,7 +61,10 @@ public enum ReadCommand {
                     reason: "Writing secrets to persistent files is disabled by the macop security policy."
                 )
             case "--otp":
-                throw CLIError.unsupportedFlag(flag: arg, reason: "OTP retrieval is not supported by macop.")
+                throw CLIError.unsupportedFlag(
+                    flag: arg,
+                    reason: "Use an op reference with ?attribute=otp for configured OTP."
+                )
             case "--ssh-format":
                 throw CLIError.unsupportedFlag(
                     flag: arg,
@@ -69,8 +81,7 @@ public enum ReadCommand {
                 }
                 if arg.hasPrefix("--otp=") {
                     throw CLIError.unsupportedFlag(
-                        flag: "--otp",
-                        reason: "OTP retrieval is not supported by macop."
+                        flag: "--otp", reason: "Use an op reference with ?attribute=otp for configured OTP."
                     )
                 }
                 if arg.hasPrefix("--ssh-format=") {

@@ -24,7 +24,7 @@ public struct CompanionAuthenticationSessionPrompt: SessionAuthorizationResultPr
                     rootIdentifier: presentation.rootIdentifier,
                     rootCodeRequirement: presentation.rootCodeRequirement,
                     rootExecutablePath: presentation.application,
-                    command: presentation.application,
+                    purpose: .sshSession,
                     credentialLabel: presentation.identityLabel,
                     credentialFingerprint: presentation.fingerprint,
                     host: ""

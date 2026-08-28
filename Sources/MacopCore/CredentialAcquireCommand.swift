@@ -63,12 +63,23 @@ enum CredentialAcquireCommand {
                 throw self.keychainError(failure)
             }
         }
-        let credential = try passwordAutoFillProvider.acquire(
-            service: service,
-            account: account,
-            synchronizable: item.value.managedKeychainSynchronizable,
-            command: forcePasswords ? "macop item acquire --from-passwords" : "macop item acquire"
-        )
+        let credential: PasswordAutoFillCredential
+        do {
+            credential = try passwordAutoFillProvider.acquire(
+                service: service,
+                account: account,
+                synchronizable: item.value.managedKeychainSynchronizable,
+                purpose: .itemAcquire
+            )
+        } catch let failure as PasswordAutoFillFailure {
+            throw failure.cliError
+        }
+        if let saveFailure = credential.saveFailure {
+            throw saveFailure.cliError
+        }
+        guard credential.username == account else {
+            throw CLIError.denied(message: "Passwords username did not match the configured account.")
+        }
         return try self.render(credential.secret, options: options)
     }
 

@@ -2,7 +2,7 @@ import Foundation
 
 public enum HelpText {
     public static let main = """
-    macop - Apple-native op-compatible CLI (MVP scaffold)
+    macop - Apple-native local credential CLI
 
     Usage:
       macop [global-options] <command> [args]
@@ -19,7 +19,18 @@ public enum HelpText {
       read
       run
       inject
-      item
+      generate password
+      item list [--long]
+      item get <item> [--fields label=<field>] [--reveal]
+      item create <item>
+      item edit <item>
+      item import <item>
+      item acquire <item> [--from-passwords]
+      item generate [--replace] <item> [generation-options]
+      item otp <item>
+      item otp <import|edit|delete> <item>
+      item delete <item>|--all-managed
+      profile
       completion
       compatibility
       ssh
@@ -34,14 +45,38 @@ public enum CompletionText {
         case "zsh":
             """
             #compdef macop op
+            __macop_zsh_next_positional_index() {
+              local index=$1
+              while (( index <= ${#words[@]} )); do
+                local word=${words[$index]}
+                case $word in
+                  --config|--format|--encoding) (( index += 2 )) ;;
+                  --config=*|--format=*|--encoding=*|--no-color|--debug|--help|-h|--version|-v)
+                    (( index += 1 )) ;;
+                  *) print -r -- $index; return 0 ;;
+                esac
+              done
+              return 1
+            }
             _macop() {
               local -a commands
-              commands=(read run inject item completion compatibility ssh config doctor)
-            _arguments '1:command:(${commands})' '*::argument:->args'
-              case $words[2] in
-                item) _values 'item command' list get create edit import acquire delete ;;
+              local command_index command subcommand_index
+              commands=(read run inject generate item profile completion compatibility ssh config doctor)
+              _arguments '1:command:(${commands})' '*::argument:->args'
+              command_index=$(__macop_zsh_next_positional_index 2)
+              command=${words[$command_index]}
+              case $command in
+                item)
+                  subcommand_index=$(__macop_zsh_next_positional_index $(( command_index + 1 )))
+                  if [[ ${words[$subcommand_index]} == otp ]]; then
+                    _values 'otp command' import edit delete
+                  else
+                    _values 'item command' list get create edit import acquire generate otp delete
+                  fi ;;
+                generate) _values 'generate command' password ;;
+                profile) _values 'profile command' run shell-init ;;
                 config) _values 'config command' init validate ;;
-                ssh) _values 'ssh command' create list public-key delete test run agent shell-init git-signing-config ;;
+                ssh) _values 'ssh command' create list public-key delete test run agent shell-init git-signing-config connect host-config ;;
                 completion) _values 'shell' bash zsh fish ;;
               esac
             }
@@ -49,14 +84,39 @@ public enum CompletionText {
             """
         case "bash":
             """
+            __macop_bash_next_positional_index() {
+              local index="$1"
+              while (( index < ${#COMP_WORDS[@]} )); do
+                local word="${COMP_WORDS[index]}"
+                case "$word" in
+                  --config|--format|--encoding) (( index += 2 )) ;;
+                  --config=*|--format=*|--encoding=*|--no-color|--debug|--help|-h|--version|-v)
+                    (( index += 1 )) ;;
+                  *) printf '%s\n' "$index"; return 0 ;;
+                esac
+              done
+              return 1
+            }
             _macop_complete() {
               local cur="${COMP_WORDS[COMP_CWORD]}"
-              local commands="read run inject item completion compatibility ssh config doctor"
+              local commands="read run inject generate item profile completion compatibility ssh config doctor"
               local flags="--help --version --format --config --no-color --debug --encoding"
-              case "${COMP_WORDS[1]}" in
-                item) COMPREPLY=( $(compgen -W "list get create edit import acquire delete ${flags}" -- "$cur") ) ;;
+              local ssh_commands="create list public-key delete test run agent shell-init git-signing-config connect host-config"
+              local command_index subcommand_index command
+              command_index="$(__macop_bash_next_positional_index 1)"
+              command="${COMP_WORDS[command_index]}"
+              case "$command" in
+                item)
+                  subcommand_index="$(__macop_bash_next_positional_index "$(( command_index + 1 ))")"
+                  if [[ "${COMP_WORDS[subcommand_index]}" == "otp" ]]; then
+                    COMPREPLY=( $(compgen -W "import edit delete ${flags}" -- "$cur") )
+                  else
+                    COMPREPLY=( $(compgen -W "list get create edit import acquire generate otp delete ${flags}" -- "$cur") )
+                  fi ;;
+                generate) COMPREPLY=( $(compgen -W "password ${flags}" -- "$cur") ) ;;
+                profile) COMPREPLY=( $(compgen -W "run shell-init ${flags}" -- "$cur") ) ;;
                 config) COMPREPLY=( $(compgen -W "init validate ${flags}" -- "$cur") ) ;;
-                ssh) COMPREPLY=( $(compgen -W "create list public-key delete test run agent shell-init git-signing-config ${flags}" -- "$cur") ) ;;
+                ssh) COMPREPLY=( $(compgen -W "${ssh_commands} ${flags}" -- "$cur") ) ;;
                 completion) COMPREPLY=( $(compgen -W "bash zsh fish ${flags}" -- "$cur") ) ;;
                 *) COMPREPLY=( $(compgen -W "${commands} ${flags}" -- "$cur") ) ;;
               esac
@@ -65,16 +125,65 @@ public enum CompletionText {
             """
         case "fish":
             """
-            complete -c macop -f -a 'read run inject item completion compatibility ssh config doctor'
-            complete -c op -f -a 'read run inject item completion compatibility ssh config doctor'
+            complete -c macop -f -a 'read run inject generate item profile completion compatibility ssh config doctor'
+            complete -c op -f -a 'read run inject generate item profile completion compatibility ssh config doctor'
             complete -c macop -l format -a 'human-readable json'
             complete -c op -l format -a 'human-readable json'
-            complete -c macop -n '__fish_seen_subcommand_from item' -a 'list get create edit import acquire delete'
-            complete -c op -n '__fish_seen_subcommand_from item' -a 'list get create edit import acquire delete'
-            complete -c macop -n '__fish_seen_subcommand_from config' -a 'init validate'
-            complete -c op -n '__fish_seen_subcommand_from config' -a 'init validate'
-            complete -c macop -n '__fish_seen_subcommand_from ssh' -a 'create list public-key delete test run agent shell-init git-signing-config'
-            complete -c op -n '__fish_seen_subcommand_from ssh' -a 'create list public-key delete test run agent shell-init git-signing-config'
+            function __macop_next_positional_index
+              set -l words (commandline -opc)
+              set -l index $argv[1]
+              while test $index -le (count $words)
+                set -l word $words[$index]
+                switch $word
+                  case --config --format --encoding
+                    set index (math $index + 2)
+                  case '--config=*' '--format=*' '--encoding=*' --no-color --debug
+                    set index (math $index + 1)
+                  case --help -h --version -v
+                    set index (math $index + 1)
+                  case '*'
+                    echo $index
+                    return 0
+                end
+              end
+              return 1
+            end
+            function __macop_command_index
+              __macop_next_positional_index 2
+            end
+            function __macop_command
+              set -l words (commandline -opc)
+              set -l index (__macop_command_index)
+              test -n "$index"; and echo $words[$index]
+            end
+            function __macop_command_position
+              string match -q -- $argv[1] (__macop_command)
+            end
+            function __macop_item_position
+              __macop_command_position item
+            end
+            function __macop_otp_position
+              set -l words (commandline -opc)
+              set -l command_index (__macop_command_index)
+              test -n "$command_index"; or return 1
+              set -l otp_index (__macop_next_positional_index (math $command_index + 1))
+              test -n "$otp_index"; and string match -q -- otp $words[$otp_index]
+            end
+            complete -c macop -n '__macop_item_position; and not __macop_otp_position' \\
+              -a 'list get create edit import acquire generate otp delete'
+            complete -c op -n '__macop_item_position; and not __macop_otp_position' \\
+              -a 'list get create edit import acquire generate otp delete'
+            complete -c macop -n '__macop_item_position; and __macop_otp_position' -a 'import edit delete'
+            complete -c op -n '__macop_item_position; and __macop_otp_position' -a 'import edit delete'
+            complete -c macop -n '__macop_command_position generate' -a 'password'
+            complete -c op -n '__macop_command_position generate' -a 'password'
+            complete -c macop -n '__macop_command_position profile' -a 'run shell-init'
+            complete -c op -n '__macop_command_position profile' -a 'run shell-init'
+            complete -c macop -n '__macop_command_position config' -a 'init validate'
+            complete -c op -n '__macop_command_position config' -a 'init validate'
+            set -l macop_ssh_commands 'create list public-key delete test run agent shell-init git-signing-config connect host-config'
+            complete -c macop -n '__macop_command_position ssh' -a "$macop_ssh_commands"
+            complete -c op -n '__macop_command_position ssh' -a "$macop_ssh_commands"
             """
         default:
             "macop: unsupported shell for completion: \(shell)\n"

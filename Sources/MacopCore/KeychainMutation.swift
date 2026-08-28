@@ -16,10 +16,75 @@ public struct SystemKeychainMutator: KeychainMutating {
     }
 
     public func create(_ secret: Data, query: KeychainQuery) throws {
+        let context = self.authenticationContext(reason: "Check that the Keychain selector is unused for macop.")
+        defer { context.invalidate() }
+        try self.requireNoMatches(for: query, authenticationContext: context)
         var attributes = try self.selector(for: query)
         attributes[kSecValueData] = secret
-        let status = SecItemAdd(attributes as CFDictionary, nil)
-        try self.check(status, operation: "creation")
+        let creation = self.securityAccess.add(
+            attributes: attributes,
+            authenticationContext: context
+        )
+        try self.check(creation.status, operation: "creation")
+        guard let createdReference = creation.result as? Data else {
+            throw CLIError.runtimeError(
+                message: "Keychain creation succeeded but returned no persistent reference, so its outcome is "
+                    + "indeterminate and a newly created item may remain. No broad deletion was attempted. "
+                    + "Inspect the configured selector in Keychain settings before retrying create."
+            )
+        }
+
+        let verification = self.securityAccess.persistentReferences(
+            for: query, authenticationContext: context
+        )
+        let verifiedReferences = verification.status == errSecSuccess
+            ? try? self.references(from: verification.result)
+            : nil
+        let creationIsUnique = verifiedReferences?.count == 1
+            && verifiedReferences?.first.map { constantTimeEqual($0, createdReference) } == true
+        if creationIsUnique {
+            return
+        }
+
+        // A concurrent add can make a broad internet-password selector
+        // ambiguous between preflight and SecItemAdd. Roll back only the item
+        // returned by our add, never every item matching the broad selector.
+        let rollback = self.securityAccess.delete(
+            persistentReference: createdReference,
+            authenticationContext: context
+        )
+        guard rollback == errSecSuccess || rollback == errSecItemNotFound else {
+            throw CLIError.runtimeError(
+                message: "Keychain creation verification failed and targeted rollback could not be confirmed "
+                    + "(OSStatus \(rollback)); the newly created item may remain. No broad deletion was attempted. "
+                    + "Inspect the configured selector in Keychain settings before retrying create."
+            )
+        }
+        if verification.status == errSecSuccess {
+            throw CLIError.invalidArguments(
+                message: "Keychain selector became ambiguous during creation; the newly created item was rolled back."
+            )
+        }
+        throw self.error(for: verification.status, operation: "creation verification")
+    }
+
+    private func requireNoMatches(
+        for query: KeychainQuery,
+        authenticationContext: LAContext
+    ) throws {
+        let result = self.securityAccess.persistentReferences(
+            for: query, authenticationContext: authenticationContext
+        )
+        switch result.status {
+        case errSecItemNotFound:
+            return
+        case errSecSuccess:
+            throw CLIError.invalidArguments(
+                message: "Keychain selector already matches an item; create requires zero matches."
+            )
+        default:
+            throw self.error(for: result.status, operation: "creation preflight")
+        }
     }
 
     public func edit(_ secret: Data, query: KeychainQuery) throws {
@@ -81,24 +146,27 @@ public struct SystemKeychainMutator: KeychainMutating {
         guard result.status == errSecSuccess, let value = result.result else {
             throw self.error(for: result.status, operation: "selection")
         }
-        let references: [Data]
-        if let reference = value as? Data {
-            references = [reference]
-        } else if let array = value as? NSArray {
-            let values = array.compactMap { $0 as? Data }
-            guard values.count == array.count else {
-                throw CLIError.runtimeError(message: "Keychain selection returned invalid metadata.")
-            }
-            references = values
-        } else {
-            throw CLIError.runtimeError(message: "Keychain selection returned invalid metadata.")
-        }
+        let references = try self.references(from: value)
         guard references.count == 1, let reference = references.first else {
             throw CLIError.invalidArguments(
                 message: "Keychain selector is ambiguous; configure a unique item before modifying it."
             )
         }
         return reference
+    }
+
+    private func references(from value: CFTypeRef?) throws -> [Data] {
+        if let reference = value as? Data {
+            return [reference]
+        } else if let array = value as? NSArray {
+            let values = array.compactMap { $0 as? Data }
+            guard values.count == array.count else {
+                throw CLIError.runtimeError(message: "Keychain selection returned invalid metadata.")
+            }
+            return values
+        } else {
+            throw CLIError.runtimeError(message: "Keychain selection returned invalid metadata.")
+        }
     }
 
     private func authenticationContext(reason: String) -> LAContext {

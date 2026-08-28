@@ -151,6 +151,10 @@ public enum SSHCommand {
         case "git-signing-config": return try self.gitSigningConfig(
                 Array(args.dropFirst()), options: options, context: context
             )
+        case "connect": return try self.execute(
+                self.connectInvocation(Array(args.dropFirst()), options: options, context: context), context: context
+            )
+        case "host-config": return try self.hostConfig(Array(args.dropFirst()), options: options)
         default: throw CLIError.invalidArguments(message: "Unknown ssh subcommand: \(subcommand)")
         }
     }
@@ -158,11 +162,12 @@ public enum SSHCommand {
     /// Streams only the child-producing SSH operations.  Setup (identity
     /// lookup) stays bounded; output from ssh/git is never retained by macop.
     public static func runStreaming(
-        args: [String], env: [String: String], executor: CommandExecutor,
+        args: [String], options: GlobalOptions = GlobalOptions(), env: [String: String], executor: CommandExecutor,
         stdout: @escaping @Sendable (Data) -> Void, stderr: @escaping @Sendable (Data) -> Void
     ) throws -> Int32? {
         guard let streaming = executor as? any SSHStreamingExecuting,
-              let subcommand = args.first, subcommand == "test" || subcommand == "run" || subcommand == "agent"
+              let subcommand = args.first,
+              subcommand == "test" || subcommand == "run" || subcommand == "agent" || subcommand == "connect"
         else { return nil }
         let context = SSHContext(env: env, executor: executor)
         let invocation: SSHInvocation
@@ -170,6 +175,7 @@ public enum SSHCommand {
         case "test": invocation = try testInvocation(Array(args.dropFirst()), context: context)
         case "run": invocation = try runInvocation(Array(args.dropFirst()), context: context)
         case "agent": invocation = try agentInvocation(Array(args.dropFirst()), context: context)
+        case "connect": invocation = try connectInvocation(Array(args.dropFirst()), options: options, context: context)
         default: return nil
         }
         let capture = BoundedCommandCapture(limit: 65536)
@@ -194,10 +200,10 @@ public enum SSHCommand {
     }
 
     public static func runInteractively(
-        args: [String], env: [String: String], executor: CommandExecutor
+        args: [String], options: GlobalOptions = GlobalOptions(), env: [String: String], executor: CommandExecutor
     ) throws -> Int32? {
         guard executor is SystemCommandExecutor, let subcommand = args.first,
-              subcommand == "test" || subcommand == "run" || subcommand == "agent"
+              subcommand == "test" || subcommand == "run" || subcommand == "agent" || subcommand == "connect"
         else {
             return nil
         }
@@ -206,7 +212,9 @@ public enum SSHCommand {
             ? self.testInvocation(Array(args.dropFirst()), context: context)
             : subcommand == "run"
             ? self.runInvocation(Array(args.dropFirst()), context: context)
-            : self.agentInvocation(Array(args.dropFirst()), context: context)
+            : subcommand == "agent"
+            ? self.agentInvocation(Array(args.dropFirst()), context: context)
+            : self.connectInvocation(Array(args.dropFirst()), options: options, context: context)
         let capture = BoundedCommandCapture(limit: 65536)
         if subcommand == "test", let policy = invocation.trustedAgentPolicy {
             let rawCode = try RunCommand.relayTrustedAgent(
@@ -698,6 +706,55 @@ private extension SSHCommand {
         )
     }
 
+    private static func connectInvocation(
+        _ args: [String], options: GlobalOptions, context: SSHContext
+    ) throws -> SSHInvocation {
+        guard args.count == 1, let alias = args.first, !alias.hasPrefix("-") else {
+            throw CLIError.invalidArguments(message: "Usage: macop ssh connect <host-alias>")
+        }
+        let document = try ConfigStore.load(configDirectory: options.configDirectory)
+        guard let host = document.sshHosts?[alias] else {
+            throw CLIError.notFound(message: "SSH host alias was not found.")
+        }
+        try self.validate(label: host.identity)
+        _ = try self.identity(host.identity, context: context)
+        var sshArguments = self.isolatedAgentSSHOptions()
+        if let port = host.port {
+            sshArguments += ["-p", String(port)]
+        }
+        let destination = host.user.map { "\($0)@\(host.hostname)" } ?? host.hostname
+        sshArguments.append(destination)
+        return try self.agentInvocation(
+            ["shell", host.identity, "--", self.ssh] + sshArguments,
+            context: context
+        )
+    }
+
+    private static func hostConfig(_ args: [String], options: GlobalOptions) throws -> CommandResult {
+        guard args.count <= 1
+        else { throw CLIError.invalidArguments(message: "ssh host-config accepts at most one alias.") }
+        let hosts = try ConfigStore.load(configDirectory: options.configDirectory).sshHosts ?? [:]
+        let selected: [(String, SSHHostProfile)]
+        if let alias = args.first {
+            guard let host = hosts[alias] else { throw CLIError.notFound(message: "SSH host alias was not found.") }
+            selected = [(alias, host)]
+        } else {
+            selected = hosts.keys.sorted().compactMap { alias in hosts[alias].map { (alias, $0) } }
+        }
+        let text = selected.map { alias, host in
+            var lines = ["Host \(alias)", "  HostName \(host.hostname)"]
+            if let user = host.user {
+                lines.append("  User \(user)")
+            }
+            if let port = host.port {
+                lines.append("  Port \(port)")
+            }
+            lines.append("  ForwardAgent no")
+            return lines.joined(separator: "\n")
+        }.joined(separator: "\n\n")
+        return CommandResult(exitCode: 0, stdout: text + (text.isEmpty ? "" : "\n"))
+    }
+
     private static func testDestination(_ args: [String]) -> String {
         args.count >= 3 ? args[2] : "git@github.com"
     }
@@ -813,19 +870,7 @@ private extension SSHCommand {
     }
 
     private static func validate(label: String) throws {
-        guard !label.isEmpty,
-              label == label.trimmingCharacters(in: .whitespacesAndNewlines),
-              label.utf8.count <= 128,
-              !label.unicodeScalars.contains(where: {
-                  $0.value == 0 || CharacterSet.controlCharacters.contains($0)
-                      || CharacterSet.newlines.contains($0) || $0.properties.generalCategory == .format
-              })
-        else {
-            throw CLIError
-                .invalidArguments(
-                    message: "SSH identity label must be printable, trimmed, and at most 128 UTF-8 bytes."
-                )
-        }
+        try SSHIdentityLabelValidator.validate(label)
     }
 
     private static func validateDestination(_ value: String) throws {

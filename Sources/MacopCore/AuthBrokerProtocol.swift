@@ -1,5 +1,6 @@
 // swiftlint:disable file_length
 import Foundation
+import Security
 
 public enum AuthBrokerProtocolError: Error, Equatable, Sendable {
     case malformed
@@ -14,6 +15,7 @@ public enum AuthBrokerCapability: UInt32, Sendable {
     case managedKeychain = 2
     case sshSigning = 4
     case passwordAutoFill = 8
+    case passwordAutoFillUsername = 16
 }
 
 public struct AuthBrokerHello: Sendable, Equatable {
@@ -50,6 +52,113 @@ public enum AuthBrokerOperation: UInt8, Sendable {
     case passwordAutoFill = 5
     case managedKeychainDelete = 6
     case gitSSHSign = 7
+    case managedKeychainUpdate = 8
+}
+
+/// Closed, attested presentation intent for an approval request. This is a
+/// wire-level enum rather than caller-controlled display text so an older or
+/// malicious client cannot influence security-sensitive UI wording.
+public enum AuthBrokerPurpose: UInt8, Sendable, Equatable {
+    case sshSession = 1
+    case managedKeychainRead = 2
+    case otpRead = 3
+    case otpRun = 4
+    case otpInject = 5
+    case otpProfile = 6
+    case otpItem = 7
+    case managedKeychainImport = 8
+    case otpImport = 9
+    case managedKeychainUpdate = 10
+    case otpUpdate = 11
+    case passwordAutoFillRead = 12
+    case managedKeychainDelete = 13
+    case otpDelete = 14
+    case managedKeychainDeleteAll = 15
+    case gitSSHSign = 16
+    case passwordRun = 17
+    case passwordInject = 18
+    case passwordProfile = 19
+    case passwordItemGet = 20
+    case passwordItemAcquire = 21
+    case managedKeychainGenerate = 22
+    case passwordAutoFillRun = 23
+    case passwordAutoFillInject = 24
+    case passwordAutoFillProfile = 25
+    case passwordAutoFillItemAcquire = 26
+
+    public func isValid(for operation: AuthBrokerOperation) -> Bool {
+        switch (operation, self) {
+        case (.sshSession, .sshSession),
+             (.managedKeychainRead, .managedKeychainRead),
+             (.managedKeychainRead, .otpRead),
+             (.managedKeychainRead, .otpRun),
+             (.managedKeychainRead, .otpInject),
+             (.managedKeychainRead, .otpProfile),
+             (.managedKeychainRead, .otpItem),
+             (.managedKeychainRead, .passwordRun),
+             (.managedKeychainRead, .passwordInject),
+             (.managedKeychainRead, .passwordProfile),
+             (.managedKeychainRead, .passwordItemGet),
+             (.managedKeychainRead, .passwordItemAcquire),
+             (.managedKeychainImport, .managedKeychainImport),
+             (.managedKeychainImport, .managedKeychainGenerate),
+             (.managedKeychainImport, .otpImport),
+             (.managedKeychainUpdate, .managedKeychainUpdate),
+             (.managedKeychainUpdate, .otpUpdate),
+             (.passwordAutoFill, .passwordAutoFillRead),
+             (.passwordAutoFill, .passwordAutoFillRun),
+             (.passwordAutoFill, .passwordAutoFillInject),
+             (.passwordAutoFill, .passwordAutoFillProfile),
+             (.passwordAutoFill, .passwordAutoFillItemAcquire),
+             (.managedKeychainDelete, .managedKeychainDelete),
+             (.managedKeychainDelete, .otpDelete),
+             (.managedKeychainDelete, .managedKeychainDeleteAll),
+             (.gitSSHSign, .gitSSHSign):
+            true
+        default:
+            false
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .sshSession: "SSHセッション"
+        case .managedKeychainRead: "macop read"
+        case .otpRead: "macop read (OTP)"
+        case .otpRun: "macop run (OTP)"
+        case .otpInject: "macop inject (OTP)"
+        case .otpProfile: "macop profile run (OTP)"
+        case .otpItem: "macop item otp"
+        case .managedKeychainImport: "macop item import"
+        case .otpImport: "macop item otp import"
+        case .managedKeychainUpdate: "macop item generate --replace"
+        case .otpUpdate: "macop item otp edit"
+        case .passwordAutoFillRead: "macop read (Passwords)"
+        case .managedKeychainDelete: "macop item delete"
+        case .otpDelete: "macop item otp delete"
+        case .managedKeychainDeleteAll: "macop item delete --all-managed"
+        case .gitSSHSign: "Git SSH署名"
+        case .passwordRun: "macop run"
+        case .passwordInject: "macop inject"
+        case .passwordProfile: "macop profile run"
+        case .passwordItemGet: "macop item get"
+        case .passwordItemAcquire: "macop item acquire"
+        case .managedKeychainGenerate: "macop item generate"
+        case .passwordAutoFillRun: "macop run (Passwords)"
+        case .passwordAutoFillInject: "macop inject (Passwords)"
+        case .passwordAutoFillProfile: "macop profile run (Passwords)"
+        case .passwordAutoFillItemAcquire: "macop item acquire (Passwords)"
+        }
+    }
+
+    public var concernsOTP: Bool {
+        switch self {
+        case .otpRead, .otpRun, .otpInject, .otpProfile, .otpItem, .otpImport, .otpUpdate, .otpDelete:
+            true
+        default:
+            false
+        }
+    }
 }
 
 public struct AuthBrokerApprovalRequest: Sendable, Equatable {
@@ -62,7 +171,7 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
     public let rootIdentifier: String
     public let rootCodeRequirement: String
     public let rootExecutablePath: String
-    public let command: String
+    public let purpose: AuthBrokerPurpose
     public let credentialLabel: String
     public let credentialFingerprint: String
     public let host: String
@@ -80,7 +189,7 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
         rootIdentifier: String,
         rootCodeRequirement: String,
         rootExecutablePath: String,
-        command: String,
+        purpose: AuthBrokerPurpose,
         credentialLabel: String,
         credentialFingerprint: String,
         host: String,
@@ -97,7 +206,7 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
         self.rootIdentifier = rootIdentifier
         self.rootCodeRequirement = rootCodeRequirement
         self.rootExecutablePath = rootExecutablePath
-        self.command = command
+        self.purpose = purpose
         self.credentialLabel = credentialLabel
         self.credentialFingerprint = credentialFingerprint
         self.host = host
@@ -119,19 +228,22 @@ public struct AuthBrokerApprovalResponse: Sendable, Equatable {
     public let message: String
     public let resultStatus: Int32
     public let resultData: Data
+    public let verifiedUsername: String
 
     public init(
         requestID: UUID,
         status: AuthBrokerApprovalStatus,
         message: String = "",
         resultStatus: Int32 = 0,
-        resultData: Data = Data()
+        resultData: Data = Data(),
+        verifiedUsername: String = ""
     ) {
         self.requestID = requestID
         self.status = status
         self.message = message
         self.resultStatus = resultStatus
         self.resultData = resultData
+        self.verifiedUsername = verifiedUsername
     }
 }
 
@@ -147,12 +259,24 @@ public struct AuthBrokerManagedKeychainImportRequest: Sendable, Equatable {
 
 public struct AuthBrokerManagedKeychainImportResponse: Sendable, Equatable {
     public let authorizationID: UUID
+    public let outcome: AuthBrokerMutationOutcome
     public let status: Int32
 
-    public init(authorizationID: UUID, status: Int32) {
+    public init(
+        authorizationID: UUID,
+        outcome: AuthBrokerMutationOutcome,
+        status: Int32
+    ) {
         self.authorizationID = authorizationID
+        self.outcome = outcome
         self.status = status
     }
+}
+
+public enum AuthBrokerMutationOutcome: UInt8, Sendable, Equatable {
+    case committed = 1
+    case failed = 2
+    case indeterminate = 3
 }
 
 public struct AuthBrokerSSHSignRequest: Sendable, Equatable {
@@ -190,7 +314,7 @@ public enum AuthBrokerMessage: Sendable, Equatable {
 
 // swiftlint:disable:next type_body_length
 public enum AuthBrokerWire {
-    public static let currentVersion: UInt16 = 1
+    public static let currentVersion: UInt16 = 4
     public static let maximumFrameLength = 256 * 1024
     public static let maximumCommandLength = 4 * 1024
     public static let maximumMetadataLength = 512
@@ -245,16 +369,19 @@ public enum AuthBrokerWire {
             guard request.issuedAtMilliseconds < request.expiresAtMilliseconds else {
                 throw AuthBrokerProtocolError.expired
             }
+            guard request.purpose.isValid(for: request.operation) else {
+                throw AuthBrokerProtocolError.malformed
+            }
             value.append(3)
             value += try self.text(request.requestID.uuidString, maximum: 36)
             value += self.u64(request.issuedAtMilliseconds) + self.u64(request.expiresAtMilliseconds)
             value.append(request.operation.rawValue)
+            value.append(request.purpose.rawValue)
             value += self.u32(UInt32(bitPattern: request.rootPID))
             value += self.u64(request.rootStartTime)
             value += try self.text(request.rootIdentifier, maximum: self.maximumMetadataLength)
             value += try self.text(request.rootCodeRequirement, maximum: self.maximumCommandLength)
             value += try self.text(request.rootExecutablePath, maximum: self.maximumCommandLength)
-            value += try self.text(request.command, maximum: self.maximumCommandLength)
             value += try self.text(request.credentialLabel, maximum: self.maximumMetadataLength)
             value += try self.text(request.credentialFingerprint, maximum: self.maximumMetadataLength)
             value += try self.text(request.host, maximum: self.maximumMetadataLength)
@@ -268,6 +395,7 @@ public enum AuthBrokerWire {
             value += try self.text(response.message, maximum: self.maximumMetadataLength)
             value += self.u32(UInt32(bitPattern: response.resultStatus))
             value += self.bytes(response.resultData)
+            value += try self.text(response.verifiedUsername, maximum: self.maximumMetadataLength)
         case let .sshSignRequest(request):
             value.append(5)
             value += try self.text(request.authorizationID.uuidString, maximum: 36)
@@ -282,8 +410,12 @@ public enum AuthBrokerWire {
             value += try self.text(request.authorizationID.uuidString, maximum: 36)
             value += self.bytes(request.secret)
         case let .managedKeychainImportResponse(response):
+            guard self.validMutationOutcome(response.outcome, status: response.status) else {
+                throw AuthBrokerProtocolError.malformed
+            }
             value.append(8)
             value += try self.text(response.authorizationID.uuidString, maximum: 36)
+            value.append(response.outcome.rawValue)
             value += self.u32(UInt32(bitPattern: response.status))
         }
         return value
@@ -335,12 +467,14 @@ public enum AuthBrokerWire {
             guard let operation = try AuthBrokerOperation(rawValue: cursor.byte()) else {
                 throw AuthBrokerProtocolError.unsupportedMessage
             }
+            guard let purpose = try AuthBrokerPurpose(rawValue: cursor.byte()),
+                  purpose.isValid(for: operation)
+            else { throw AuthBrokerProtocolError.malformed }
             let rootPID = try Int32(bitPattern: cursor.u32())
             let rootStartTime = try cursor.u64()
             let rootIdentifier = try cursor.text(maximum: self.maximumMetadataLength)
             let rootCodeRequirement = try cursor.text(maximum: self.maximumCommandLength)
             let rootExecutablePath = try cursor.text(maximum: self.maximumCommandLength)
-            let command = try cursor.text(maximum: self.maximumCommandLength)
             let credentialLabel = try cursor.text(maximum: self.maximumMetadataLength)
             let credentialFingerprint = try cursor.text(maximum: self.maximumMetadataLength)
             let host = try cursor.text(maximum: self.maximumMetadataLength)
@@ -361,7 +495,7 @@ public enum AuthBrokerWire {
                 rootIdentifier: rootIdentifier,
                 rootCodeRequirement: rootCodeRequirement,
                 rootExecutablePath: rootExecutablePath,
-                command: command,
+                purpose: purpose,
                 credentialLabel: credentialLabel,
                 credentialFingerprint: credentialFingerprint,
                 host: host,
@@ -376,13 +510,15 @@ public enum AuthBrokerWire {
             let message = try cursor.text(maximum: self.maximumMetadataLength)
             let resultStatus = try Int32(bitPattern: cursor.u32())
             let resultData = try cursor.bytes()
+            let verifiedUsername = try cursor.text(maximum: self.maximumMetadataLength)
             guard cursor.isAtEnd else { throw AuthBrokerProtocolError.malformed }
             return .approvalResponse(AuthBrokerApprovalResponse(
                 requestID: requestID,
                 status: status,
                 message: message,
                 resultStatus: resultStatus,
-                resultData: resultData
+                resultData: resultData,
+                verifiedUsername: verifiedUsername
             ))
         case 5:
             guard let authorizationID = try UUID(uuidString: cursor.text(maximum: 36)) else {
@@ -420,10 +556,16 @@ public enum AuthBrokerWire {
             guard let authorizationID = try UUID(uuidString: cursor.text(maximum: 36)) else {
                 throw AuthBrokerProtocolError.malformed
             }
+            guard let outcome = try AuthBrokerMutationOutcome(rawValue: cursor.byte()) else {
+                throw AuthBrokerProtocolError.malformed
+            }
             let status = try Int32(bitPattern: cursor.u32())
-            guard cursor.isAtEnd else { throw AuthBrokerProtocolError.malformed }
+            guard cursor.isAtEnd, self.validMutationOutcome(outcome, status: status) else {
+                throw AuthBrokerProtocolError.malformed
+            }
             return .managedKeychainImportResponse(AuthBrokerManagedKeychainImportResponse(
                 authorizationID: authorizationID,
+                outcome: outcome,
                 status: status
             ))
         default:
@@ -438,6 +580,14 @@ public enum AuthBrokerWire {
 
     private static func validateNonce(_ nonce: Data) throws {
         guard nonce.count == 32 else { throw AuthBrokerProtocolError.malformed }
+    }
+
+    private static func validMutationOutcome(_ outcome: AuthBrokerMutationOutcome, status: Int32) -> Bool {
+        switch outcome {
+        case .committed: status == errSecSuccess
+        case .failed: status != errSecSuccess
+        case .indeterminate: true
+        }
     }
 
     private static func text(_ value: String, maximum: Int) throws -> Data {

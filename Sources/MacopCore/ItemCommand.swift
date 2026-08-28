@@ -6,6 +6,7 @@ public enum ItemCommand {
         options: GlobalOptions,
         input: Data = Data(),
         client: any KeychainClient,
+        otpClient: any KeychainClient = CompanionManagedKeychainClient(),
         importer: any ManagedKeychainImporting = CompanionManagedKeychainImporter(),
         deleter: any ManagedKeychainDeleting = CompanionManagedKeychainDeleter(),
         mutator: any KeychainMutating = SystemKeychainMutator(),
@@ -14,12 +15,14 @@ public enum ItemCommand {
         guard let subcommand = args.first
         else {
             throw CLIError.invalidArguments(
-                message: "item requires list, get, create, edit, import, acquire, or delete."
+                message: "item requires list, get, create, edit, import, acquire, generate, otp, or delete."
             )
         }
         switch subcommand {
         case "list": return try self.list(Array(args.dropFirst()), options: options)
-        case "get": return try self.get(Array(args.dropFirst()), options: options, client: client)
+        case "get": return try self.get(
+                Array(args.dropFirst()), options: options, client: client, otpClient: otpClient
+            )
         case "create", "edit": return try KeychainMutationCommand.run(
                 subcommand,
                 args: Array(args.dropFirst()),
@@ -35,6 +38,13 @@ public enum ItemCommand {
                 options: options,
                 client: client,
                 passwordAutoFillProvider: passwordAutoFillProvider
+            )
+        case "generate": return try ItemGenerateCommand.run(
+                Array(args.dropFirst()), options: options, importer: importer, mutator: mutator
+            )
+        case "otp": return try OTPCommand.run(
+                Array(args.dropFirst()), options: options, input: input, client: otpClient,
+                importer: importer, deleter: deleter
             )
         case "delete": return try ManagedKeychainDeleteCommand.run(
                 Array(args.dropFirst()), options: options, deleter: deleter, mutator: mutator
@@ -64,12 +74,21 @@ public enum ItemCommand {
         let item = try ManagedItemLocator.item(named: name, options: options)
         let service = item.value.service!
         let account = item.value.account!
-        try importer.importSecret(
-            input,
-            service: service,
-            account: account,
-            synchronizable: item.value.managedKeychainSynchronizable
-        )
+        do {
+            try importer.importSecret(
+                input,
+                service: service,
+                account: account,
+                synchronizable: item.value.managedKeychainSynchronizable
+            )
+        } catch let failure as ManagedKeychainMutationFailure {
+            throw CLIError.runtimeError(
+                message: "Managed item creation is indeterminate. \(failure.diagnostic) "
+                    + "Retry item import for the same configured item with the same stdin: success means the retry "
+                    + "created it, while already-exists means the original create completed. Never put the secret "
+                    + "in command arguments."
+            )
+        }
         if options.format == .json {
             return CommandResult(exitCode: 0, stdout: "{\"schema_version\":1,\"status\":\"imported\"}\n")
         }
@@ -106,7 +125,8 @@ public enum ItemCommand {
     private static func get(
         _ args: [String],
         options: GlobalOptions,
-        client: any KeychainClient
+        client: any KeychainClient,
+        otpClient: any KeychainClient
     ) throws -> CommandResult {
         var name: String?
         var field: String?
@@ -145,15 +165,24 @@ public enum ItemCommand {
         else { throw CLIError.notFound(message: "Configured item \"\(name)\" was not found.") }
         let fields = item.value.fields ?? []
         let selected = field.map { [$0] } ?? fields
-        guard selected.allSatisfy(fields.contains)
+        let wellKnown = item.value.schemaVersion == 2
+            ? ["username", "password", "token"] + (item.value.otp == nil ? [] : ["otp"])
+            : []
+        guard selected.allSatisfy({ fields.contains($0) || wellKnown.contains($0) })
         else { throw CLIError.notFound(message: "Requested field is not configured for this item.") }
-        let secret = reveal ? try KeychainProvider.readText(self.query(
-            for: item.value
-        ), client: client) : "<concealed by macop>"
-        let values = selected.map { label -> [String: String] in
-            [
+        let values = try selected.map { label -> [String: String] in
+            let value = if item.value.schemaVersion == 2, label == "username" {
+                item.value.account ?? ""
+            } else if reveal {
+                try CredentialFieldResolver.read(
+                    item: item.value, section: nil, field: label, client: client, otpClient: otpClient
+                )
+            } else {
+                "<concealed by macop>"
+            }
+            return [
                 "label": label,
-                "value": secret
+                "value": value
             ]
         }
         return self.render(
@@ -164,34 +193,6 @@ public enum ItemCommand {
 
     private static func supported(_ entry: (key: String, value: ConfigItem)) -> Bool {
         ["keychain-generic", "keychain-internet", "keychain-managed"].contains(entry.value.provider)
-    }
-
-    private static func query(for item: ConfigItem) throws -> KeychainQuery {
-        let genericValues = (item.service, item.account)
-        if item.provider == "keychain-generic", let service = genericValues.0, let account = genericValues.1 {
-            return .generic(
-                service: service,
-                account: account
-            )
-        }
-        let internetValues = (item.server, item.account)
-        if item.provider == "keychain-internet", let server = internetValues.0, let account = internetValues.1 {
-            return .internet(
-                server: server,
-                account: account
-            )
-        }
-        if item.provider == "keychain-managed", let service = item.service, let account = item.account {
-            return .managed(
-                service: service,
-                account: account,
-                synchronizable: item.managedKeychainSynchronizable
-            )
-        }
-        throw CLIError.unsupportedProvider(
-            provider: item.provider,
-            reason: "This provider cannot supply item secret text."
-        )
     }
 
     private static func parseField(_ value: String) throws -> String {
@@ -231,7 +232,9 @@ public enum ItemCommand {
             $0.kind == "subcommand" && $0.status == "unsupported" && $0.command == "item \(subcommand)"
         }?.reason
     }
+}
 
+private extension ItemCommand {
     private static func render(_ payload: Any, options: GlobalOptions) -> CommandResult {
         if options.format == .json {
             let data = try? JSONSerialization.data(

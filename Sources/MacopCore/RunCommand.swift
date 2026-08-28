@@ -103,9 +103,10 @@ public enum RunCommand {
     }
 
     public static func run(
-        args: [String], options: GlobalOptions, env: [String: String], client: any KeychainClient
+        args: [String], options: GlobalOptions, env: [String: String], client: any KeychainClient,
+        otpClient: any KeychainClient = CompanionManagedKeychainClient()
     ) throws -> CommandResult {
-        let context = try prepare(args: args, options: options, env: env, client: client)
+        let context = try prepare(args: args, options: options, env: env, client: client, otpClient: otpClient)
         return try ProcessRunner.execute(
             argv: context.command,
             environment: context.environment,
@@ -120,9 +121,10 @@ public enum RunCommand {
     /// used by MacopCLI so an unbounded child output cannot become CLI memory.
     public static func runStreaming(
         args: [String], options: GlobalOptions, env: [String: String], client: any KeychainClient,
+        otpClient: any KeychainClient = CompanionManagedKeychainClient(),
         stdout: @escaping @Sendable (Data) -> Void, stderr: @escaping @Sendable (Data) -> Void
     ) throws -> Int32 {
-        let context = try prepare(args: args, options: options, env: env, client: client)
+        let context = try prepare(args: args, options: options, env: env, client: client, otpClient: otpClient)
         return try ProcessRunner.executeStreaming(
             argv: context.command,
             environment: context.environment,
@@ -140,9 +142,10 @@ public enum RunCommand {
     /// buffered API above: a terminal program must observe a real terminal and
     /// its output must be relayed as it is produced.
     public static func runInteractively(
-        args: [String], options: GlobalOptions, env: [String: String], client: any KeychainClient
+        args: [String], options: GlobalOptions, env: [String: String], client: any KeychainClient,
+        otpClient: any KeychainClient = CompanionManagedKeychainClient()
     ) throws -> Int32 {
-        let context = try prepare(args: args, options: options, env: env, client: client)
+        let context = try prepare(args: args, options: options, env: env, client: client, otpClient: otpClient)
         return try TerminalRelay.execute(
             argv: context.command,
             environment: context.environment,
@@ -153,7 +156,8 @@ public enum RunCommand {
     }
 
     private static func prepare(
-        args: [String], options: GlobalOptions, env: [String: String], client: any KeychainClient
+        args: [String], options: GlobalOptions, env: [String: String], client: any KeychainClient,
+        otpClient: any KeychainClient
     ) throws -> PreparedRun {
         let parsed = try parseArgs(args)
         var childEnvironment = ProcessInfo.processInfo.environment
@@ -172,14 +176,17 @@ public enum RunCommand {
                 in: value,
                 options: options,
                 env: childEnvironment,
-                client: client
+                client: client,
+                otpClient: otpClient
             )
             childEnvironment[key] = resolved.output
             secrets.append(contentsOf: resolved.secrets)
         }
         let stdin = try parsed.stdinReference.map {
-            try Data(SecretMaterial.resolveSingleReference($0, options: options, env: childEnvironment, client: client)
-                .utf8)
+            try Data(SecretMaterial.resolveSingleReference(
+                $0, options: options, env: childEnvironment, client: client, otpClient: otpClient
+            )
+            .utf8)
         }
         if let stdin, let text = String(bytes: stdin, encoding: .utf8) {
             secrets.append(text)
@@ -350,23 +357,25 @@ enum SecretMaterial {
         _ text: String,
         options: GlobalOptions,
         env: [String: String],
-        client: any KeychainClient
+        client: any KeychainClient,
+        otpClient: any KeychainClient
     ) throws -> String {
         let reference = try ReferenceResolver.parse(text, env: env)
-        return try self.read(reference, options: options, client: client)
+        return try self.read(reference, options: options, client: client, otpClient: otpClient)
     }
 
     static func resolveReferences(
         in text: String,
         options: GlobalOptions,
         env: [String: String],
-        client: any KeychainClient
+        client: any KeychainClient,
+        otpClient: any KeychainClient
     ) throws -> Resolution {
         var output = text
         var secrets = [String]()
         for range in self.referenceRanges(in: text).reversed() {
             let secret = try self.resolveSingleReference(
-                String(output[range]), options: options, env: env, client: client
+                String(output[range]), options: options, env: env, client: client, otpClient: otpClient
             )
             secrets.append(secret)
             output.replaceSubrange(range, with: secret)
@@ -410,7 +419,8 @@ enum SecretMaterial {
     private static func read(
         _ reference: SecretReference,
         options: GlobalOptions,
-        client: any KeychainClient
+        client: any KeychainClient,
+        otpClient: any KeychainClient
     ) throws -> String {
         switch reference {
         case let .keychainGeneric(service, account): return try KeychainProvider.readText(
@@ -427,36 +437,14 @@ enum SecretMaterial {
                 item: item,
                 configDirectory: options.configDirectory
             )
-            let requested = section.map { "\($0)/\(field)" } ?? field
-            if let fields = item.fields, !fields.isEmpty, !fields.contains(requested) {
-                throw CLIError.notFound(message: "Field is not configured for this item.")
-            }
-            if item.provider == "keychain-generic", let service = item.service, let account = item.account {
-                return try KeychainProvider.readText(
-                    .generic(service: service, account: account),
-                    client: client
-                )
-            }
-            if item.provider == "keychain-managed", let service = item.service, let account = item.account {
-                return try KeychainProvider.readText(
-                    .managed(
-                        service: service,
-                        account: account,
-                        synchronizable: item.managedKeychainSynchronizable
-                    ),
-                    client: client
-                )
-            }
-            if item.provider == "keychain-internet", let server = item.server, let account = item.account {
-                return try KeychainProvider.readText(
-                    .internet(server: server, account: account),
-                    client: client
-                )
-            }
-            throw CLIError.unsupportedProvider(
-                provider: item.provider,
-                reason: "This provider cannot supply secret text."
+            return try CredentialFieldResolver.read(
+                item: item, section: section, field: field, client: client, otpClient: otpClient
             )
+        case let .opOTP(namespace, item):
+            let item = try ConfigStore.resolveItem(
+                namespace: namespace, item: item, configDirectory: options.configDirectory
+            )
+            return try CredentialFieldResolver.otp(item: item, client: otpClient)
         case .secureEnclave: throw CLIError.unsupportedProvider(
                 provider: "secure-enclave",
                 reason: "Reading Secure Enclave identities as secrets is not supported."

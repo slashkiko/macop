@@ -10,7 +10,8 @@ public enum InjectCommand {
         options: GlobalOptions,
         env: [String: String],
         input: Data,
-        client: any KeychainClient
+        client: any KeychainClient,
+        otpClient: any KeychainClient = CompanionManagedKeychainClient()
     ) throws -> CommandResult {
         let inputURL = try parseArgs(args)
         let template: Data
@@ -28,7 +29,9 @@ public enum InjectCommand {
         }
         return try CommandResult(
             exitCode: 0,
-            stdout: SecretMaterial.resolveReferences(in: text, options: options, env: env, client: client).output
+            stdout: SecretMaterial.resolveReferences(
+                in: text, options: options, env: env, client: client, otpClient: otpClient
+            ).output
         )
     }
 

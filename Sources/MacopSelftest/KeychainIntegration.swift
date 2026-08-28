@@ -11,7 +11,9 @@ func runKeychainIntegrationIfRequested() throws {
     let account = "macop-selftest-\(suffix)"
     let genericService = "macop-selftest-generic-\(suffix)"
     let mutationService = "macop-selftest-mutation-\(suffix)"
+    let generatedService = "macop-selftest-generated-\(suffix)"
     let internetServer = "macop-selftest-\(suffix).invalid"
+    let generatedInternetServer = "macop-selftest-generated-\(suffix).invalid"
     let generic = [kSecClass: kSecClassGenericPassword, kSecAttrService: genericService,
                    kSecAttrAccount: account] as [CFString: Any]
     let internet = [kSecClass: kSecClassInternetPassword, kSecAttrServer: internetServer,
@@ -77,6 +79,99 @@ func runKeychainIntegrationIfRequested() throws {
         } catch let error as CLIError {
             guard case .notFound = error else { throw error }
         }
+        let generatedQuery = KeychainQuery.generic(service: generatedService, account: account)
+        let generatedCleanup = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: generatedService,
+            kSecAttrAccount: account
+        ] as [CFString: Any]
+        let configDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("macop-keychain-generated-\(suffix)", isDirectory: true)
+        try FileManager.default.createDirectory(at: configDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: configDirectory) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: configDirectory.path)
+        let generatedConfig = """
+        { "version": 2, "items": {
+          "Local/Generated": {
+            "provider": "keychain-generic", "service": "\(generatedService)", "account": "\(account)"
+          },
+          "Local/ExistingInternet": {
+            "provider": "keychain-internet", "server": "\(internetServer)", "account": "\(account)"
+          },
+          "Local/GeneratedInternet": {
+            "provider": "keychain-internet", "server": "\(generatedInternetServer)", "account": "\(account)"
+          }
+        } }
+        """
+        let generatedConfigURL = configDirectory.appendingPathComponent("config.json")
+        try Data(generatedConfig.utf8).write(to: generatedConfigURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: generatedConfigURL.path)
+        let generatedApp = MacopApp(keychainClient: client, keychainMutator: mutator)
+        let ambiguousInternetGenerate = generatedApp.run(
+            argv: [
+                "macop", "--config", configDirectory.path, "item", "generate", "ExistingInternet",
+                "--length", "40"
+            ],
+            env: [:]
+        )
+        let existingInternetAfterRejectedGenerate = try KeychainProvider.readText(
+            .internet(server: internetServer, account: account), client: client
+        )
+        try expect(
+            ambiguousInternetGenerate.exitCode == ExitCode.invalidArguments.rawValue
+                && existingInternetAfterRejectedGenerate == "internet",
+            "internet password generation must require zero broad-selector matches before adding"
+        )
+        let generatedInternetQuery = KeychainQuery.internet(
+            server: generatedInternetServer, account: account
+        )
+        let generatedInternetCleanup = [
+            kSecClass: kSecClassInternetPassword,
+            kSecAttrServer: generatedInternetServer,
+            kSecAttrAccount: account
+        ] as [CFString: Any]
+        let generatedInternetCreate = generatedApp.run(
+            argv: [
+                "macop", "--config", configDirectory.path, "item", "generate", "GeneratedInternet",
+                "--length", "41"
+            ],
+            env: [:]
+        )
+        try expect(generatedInternetCreate.exitCode == 0, "generated internet Keychain integration create")
+        added.append(generatedInternetCleanup)
+        let generatedInternetValue = try KeychainProvider.readText(generatedInternetQuery, client: client)
+        try expect(
+            generatedInternetValue.count == 41
+                && !generatedInternetCreate.stdout.contains(generatedInternetValue),
+            "internet creation must survive persistent-reference postflight without exposing the secret"
+        )
+        try mutator.delete(query: generatedInternetQuery)
+        _ = added.popLast()
+        let generatedCreate = generatedApp.run(
+            argv: [
+                "macop", "--config", configDirectory.path, "item", "generate", "Generated", "--length", "40"
+            ],
+            env: [:]
+        )
+        try expect(generatedCreate.exitCode == 0, "generated Keychain integration create")
+        added.append(generatedCleanup)
+        let firstGenerated = try KeychainProvider.readText(generatedQuery, client: client)
+        try expect(
+            firstGenerated.count == 40 && !generatedCreate.stdout.contains(firstGenerated),
+            "generated Keychain integration must persist requested length without returning the secret"
+        )
+        let generatedRotate = generatedApp.run(
+            argv: [
+                "macop", "--config", configDirectory.path, "item", "generate", "--replace", "Generated",
+                "--length", "48"
+            ],
+            env: [:]
+        )
+        try expect(generatedRotate.exitCode == 0, "generated Keychain integration rotate")
+        let rotatedGenerated = try KeychainProvider.readText(generatedQuery, client: client)
+        try expect(rotatedGenerated.count == 48, "generated Keychain rotation must update the exact item")
+        try mutator.delete(query: generatedQuery)
+        _ = added.popLast()
         let duplicateStatus = SecItemAdd(
             (duplicateInternet.merging([kSecValueData: Data("other-internet".utf8)]) { _, new in new }) as CFDictionary,
             nil

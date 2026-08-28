@@ -1,3 +1,4 @@
+// swiftlint:disable file_length
 import Darwin
 import Foundation
 
@@ -16,15 +17,55 @@ public struct ConfigItem: Codable, Sendable {
     public let label: String?
     public let fields: [String]?
     public let synchronization: String?
+    public let otp: ConfigOTP?
+    public var schemaVersion: Int = 1
+
+    enum CodingKeys: String, CodingKey {
+        case provider, service, account, server, label, fields, synchronization, otp
+    }
 
     public var managedKeychainSynchronizable: Bool {
         self.provider == "keychain-managed" && self.synchronization == "icloud"
     }
 }
 
+public struct ConfigOTP: Codable, Sendable {
+    public let service: String
+    public let account: String
+    public let algorithm: String
+    public let digits: Int
+    public let period: Int
+    public let synchronization: String?
+    public let label: String?
+    public let issuer: String?
+
+    public var synchronizable: Bool {
+        self.synchronization == "icloud"
+    }
+}
+
+public struct CredentialProfile: Codable, Sendable {
+    public let executable: String
+    public let environment: [String: String]
+}
+
+public struct SSHHostProfile: Codable, Sendable {
+    public let hostname: String
+    public let user: String?
+    public let port: Int?
+    public let identity: String
+}
+
 public struct ConfigDocument: Codable, Sendable {
     public let version: Int
-    public let items: [String: ConfigItem]
+    public var items: [String: ConfigItem]
+    public let profiles: [String: CredentialProfile]?
+    public let sshHosts: [String: SSHHostProfile]?
+
+    enum CodingKeys: String, CodingKey {
+        case version, items, profiles
+        case sshHosts = "ssh_hosts"
+    }
 }
 
 // The schema and duplicate-key scanner intentionally remain colocated with config I/O.
@@ -56,7 +97,7 @@ public enum ConfigStore {
             throw CLIError.invalidArguments(message: "Config already exists at \(fileURL.path)")
         }
 
-        let document = ConfigDocument(version: 1, items: [:])
+        let document = ConfigDocument(version: 2, items: [:], profiles: nil, sshHosts: nil)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         var data = try encoder.encode(document)
@@ -137,7 +178,10 @@ public enum ConfigStore {
         try self.validateJSONSchema(data: data)
         let decoder = JSONDecoder()
         do {
-            let document = try decoder.decode(ConfigDocument.self, from: data)
+            var document = try decoder.decode(ConfigDocument.self, from: data)
+            for key in document.items.keys {
+                document.items[key]?.schemaVersion = document.version
+            }
             try self.validateDocument(document)
             return document
         } catch let error as CLIError {
@@ -184,9 +228,14 @@ public enum ConfigStore {
 
     private static func validateItem(_ item: ConfigItem) throws -> ConfigProviderKind {
         try self.validateFields(item.fields)
+        if let otp = item.otp {
+            try ConfigSchemaValidator.validateOTP(otp)
+        }
         switch item.provider {
         case "keychain-generic":
-            guard self.hasValue(item.service), self.hasValue(item.account) else {
+            guard self.hasSelectorValue(item.service, schemaVersion: item.schemaVersion),
+                  self.hasSelectorValue(item.account, schemaVersion: item.schemaVersion)
+            else {
                 throw CLIError.invalidArguments(
                     message: "keychain-generic requires service and account in config item."
                 )
@@ -197,7 +246,9 @@ public enum ConfigStore {
             }
             return .keychainGeneric
         case "keychain-internet":
-            guard self.hasValue(item.server), self.hasValue(item.account) else {
+            guard self.hasSelectorValue(item.server, schemaVersion: item.schemaVersion),
+                  self.hasSelectorValue(item.account, schemaVersion: item.schemaVersion)
+            else {
                 throw CLIError.invalidArguments(
                     message: "keychain-internet requires server and account in config item."
                 )
@@ -208,7 +259,11 @@ public enum ConfigStore {
             }
             return .keychainInternet
         case "keychain-managed":
-            guard self.hasValue(item.service), self.hasValue(item.account) else {
+            guard let service = item.service,
+                  let account = item.account,
+                  ConfigSchemaValidator.validSelectorMetadata(service),
+                  ConfigSchemaValidator.validSelectorMetadata(account)
+            else {
                 throw CLIError.invalidArguments(
                     message: "keychain-managed requires service and account in config item."
                 )
@@ -227,11 +282,12 @@ public enum ConfigStore {
             }
             return .keychainManaged
         case "secure-enclave":
-            guard self.hasValue(item.label) else {
+            guard let label = item.label else {
                 throw CLIError.invalidArguments(message: "secure-enclave requires label in config item.")
             }
+            try SSHIdentityLabelValidator.validate(label)
             guard item.service == nil, item.account == nil, item.server == nil, item.fields == nil,
-                  item.synchronization == nil
+                  item.synchronization == nil, item.otp == nil
             else {
                 throw CLIError.invalidArguments(message: "secure-enclave config items only allow provider and label.")
             }
@@ -249,14 +305,30 @@ public enum ConfigStore {
         return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !value.contains("\0")
     }
 
+    private static func hasSelectorValue(_ value: String?, schemaVersion: Int) -> Bool {
+        guard let value else { return false }
+        return schemaVersion == 1
+            ? self.hasValue(value)
+            : ConfigSchemaValidator.validSelectorMetadata(value)
+    }
+
     private static func validateDocument(_ document: ConfigDocument) throws {
-        guard document.version == 1 else {
+        guard document.version == 1 || document.version == 2 else {
             throw CLIError.invalidArguments(message: "Unsupported config version: \(document.version)")
         }
         for (itemKey, item) in document.items {
             try self.validateItemKey(itemKey)
             _ = try self.validateItem(item)
         }
+        for (name, profile) in document.profiles ?? [:] {
+            try self.validateMappingSegment(name, role: "profile name")
+            try ConfigSchemaValidator.validate(profile: profile)
+        }
+        for (alias, host) in document.sshHosts ?? [:] {
+            try self.validateMappingSegment(alias, role: "SSH host alias")
+            try ConfigSchemaValidator.validate(host: host)
+        }
+        try self.validateOTPSelectorSeparation(document)
     }
 
     private static func validateFields(_ fields: [String]?) throws {
@@ -299,14 +371,18 @@ public enum ConfigStore {
             throw CLIError.invalidArguments(message: "Config file is not valid JSON schema.")
         }
         guard let root = rootObject as? [String: Any],
-              Set(root.keys) == Set(["version", "items"]),
+              Set(root.keys).isSubset(of: Set(["version", "items", "profiles", "ssh_hosts"])),
+              root["version"] != nil, root["items"] != nil,
               let version = root["version"] as? Int,
               let items = root["items"] as? [String: Any]
         else {
             throw CLIError.invalidArguments(message: "Config file is not valid JSON schema.")
         }
-        guard version == 1 else {
+        guard version == 1 || version == 2 else {
             throw CLIError.invalidArguments(message: "Unsupported config version: \(root["version"] ?? "unknown")")
+        }
+        if version == 1, root["profiles"] != nil || root["ssh_hosts"] != nil {
+            throw CLIError.invalidArguments(message: "Config profiles and ssh_hosts require version 2.")
         }
         for (key, value) in items {
             try self.validateItemKey(key)
@@ -314,9 +390,15 @@ public enum ConfigStore {
                 throw CLIError.invalidArguments(message: "Config item \"\(key)\" must be an object with a provider.")
             }
             let allowed: Set<String> = switch provider {
-            case "keychain-generic": ["provider", "service", "account", "fields"]
-            case "keychain-managed": ["provider", "service", "account", "fields", "synchronization"]
-            case "keychain-internet": ["provider", "server", "account", "fields"]
+            case "keychain-generic": version == 2
+                ? ["provider", "service", "account", "fields", "otp"]
+                : ["provider", "service", "account", "fields"]
+            case "keychain-managed": version == 2
+                ? ["provider", "service", "account", "fields", "synchronization", "otp"]
+                : ["provider", "service", "account", "fields", "synchronization"]
+            case "keychain-internet": version == 2
+                ? ["provider", "server", "account", "fields", "otp"]
+                : ["provider", "server", "account", "fields"]
             case "secure-enclave": ["provider", "label"]
             default: ["provider"]
             }
@@ -336,6 +418,40 @@ public enum ConfigStore {
                         .invalidArguments(message: "Config item \"\(key)\" fields must be an array of strings.")
                 }
                 try self.validateFields(values)
+            }
+            if let otp = item["otp"] {
+                try ConfigSchemaValidator.validateOTPJSONObject(otp, itemKey: key)
+            }
+        }
+        try ConfigSchemaValidator.validateProfilesJSONObject(root["profiles"])
+        try ConfigSchemaValidator.validateSSHHostsJSONObject(root["ssh_hosts"])
+    }
+
+    private struct ManagedSelector: Hashable {
+        let service: String
+        let account: String
+        let synchronizable: Bool
+    }
+
+    private static func validateOTPSelectorSeparation(_ document: ConfigDocument) throws {
+        guard document.version == 2 else { return }
+        var passwordSelectors = Set<ManagedSelector>()
+        for item in document.items.values where item.provider == "keychain-managed" {
+            guard let service = item.service, let account = item.account else { continue }
+            passwordSelectors.insert(ManagedSelector(
+                service: service, account: account, synchronizable: item.managedKeychainSynchronizable
+            ))
+        }
+        var otpSelectors = Set<ManagedSelector>()
+        for item in document.items.values {
+            guard let otp = item.otp else { continue }
+            let selector = ManagedSelector(
+                service: otp.service, account: otp.account, synchronizable: otp.synchronizable
+            )
+            guard !passwordSelectors.contains(selector), otpSelectors.insert(selector).inserted else {
+                throw CLIError.invalidArguments(
+                    message: "Every OTP seed must use a unique managed Keychain selector distinct from passwords."
+                )
             }
         }
     }

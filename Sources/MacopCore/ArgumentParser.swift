@@ -23,7 +23,7 @@ public enum ArgumentParser {
             switch token {
             case "--":
                 if command != nil {
-                    if command == .run || command == .ssh {
+                    if command == .run || command == .ssh || command == .profile {
                         commandArgs.append("--")
                     }
                     commandArgs.append(contentsOf: args[(index + 1)...])

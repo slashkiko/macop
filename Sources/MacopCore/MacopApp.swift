@@ -45,8 +45,10 @@ private func rawDebugEnabled(argv: [String], env: [String: String]) -> Bool {
         || env["OP_DEBUG"].map { ["1", "true", "yes", "on"].contains($0.lowercased()) } == true
 }
 
+// swiftlint:disable:next type_body_length
 public struct MacopApp {
     private let keychainClient: any KeychainClient
+    private let otpSeedClient: (any KeychainClient)?
     private let commandExecutor: CommandExecutor
     private let biometricChecker: any BiometricAvailabilityChecking
     private let managedKeychainImporter: any ManagedKeychainImporting
@@ -56,6 +58,7 @@ public struct MacopApp {
 
     public init(
         keychainClient: any KeychainClient = DefaultKeychainClient(),
+        otpSeedClient: (any KeychainClient)? = nil,
         commandExecutor: CommandExecutor = SystemCommandExecutor(),
         biometricChecker: any BiometricAvailabilityChecking = SystemBiometricAvailabilityChecker(),
         managedKeychainImporter: any ManagedKeychainImporting = CompanionManagedKeychainImporter(),
@@ -64,6 +67,7 @@ public struct MacopApp {
         passwordAutoFillProvider: any PasswordAutoFillProviding = CompanionPasswordAutoFillProvider()
     ) {
         self.keychainClient = keychainClient
+        self.otpSeedClient = otpSeedClient
         self.commandExecutor = commandExecutor
         self.biometricChecker = biometricChecker
         self.managedKeychainImporter = managedKeychainImporter
@@ -114,7 +118,8 @@ public struct MacopApp {
                     return nil
                 }
                 if let code = try SSHCommand.runInteractively(
-                    args: parsed.commandArgs, env: agentHelperEnvironment(env, options: parsed.options),
+                    args: parsed.commandArgs, options: parsed.options,
+                    env: agentHelperEnvironment(env, options: parsed.options),
                     executor: self.commandExecutor
                 ) {
                     return self.withSafeDebug(
@@ -124,13 +129,28 @@ public struct MacopApp {
                     )
                 }
             }
+            if parsed.command == .profile {
+                let code = try ProfileCommand.runInteractively(
+                    args: parsed.commandArgs, options: parsed.options, env: env,
+                    client: self.passwordFallbackClient(
+                        purpose: .profile, presentation: .profilePassword
+                    ),
+                    otpClient: self.otpClient(for: .profileOTP)
+                )
+                if let code {
+                    return self.withSafeDebug(
+                        CommandResult(exitCode: code), enabled: parsed.options.debug, context: "command=profile"
+                    )
+                }
+            }
             guard parsed.command == .run else { return nil }
             guard try !RunCommand.requestsInjectedStdin(parsed.commandArgs) else { return nil }
             let code = try RunCommand.runInteractively(
                 args: parsed.commandArgs,
                 options: parsed.options,
                 env: env,
-                client: self.passwordFallbackClient(command: "macop run")
+                client: self.passwordFallbackClient(purpose: .run, presentation: .runPassword),
+                otpClient: self.otpClient(for: .runOTP)
             )
             return self.withSafeDebug(
                 CommandResult(exitCode: code), enabled: parsed.options.debug, context: "command=run"
@@ -155,13 +175,29 @@ public struct MacopApp {
                     return nil
                 }
                 if let code = try SSHCommand.runStreaming(
-                    args: parsed.commandArgs, env: agentHelperEnvironment(env, options: parsed.options),
+                    args: parsed.commandArgs, options: parsed.options,
+                    env: agentHelperEnvironment(env, options: parsed.options),
                     executor: self.commandExecutor, stdout: stdout, stderr: stderr
                 ) {
                     return self.withSafeDebug(
                         CommandResult(exitCode: code),
                         enabled: parsed.options.debug && parsed.commandArgs.first != "agent",
                         context: "command=ssh"
+                    )
+                }
+            }
+            if parsed.command == .profile {
+                let code = try ProfileCommand.runStreaming(
+                    args: parsed.commandArgs, options: parsed.options, env: env,
+                    client: self.passwordFallbackClient(
+                        purpose: .profile, presentation: .profilePassword
+                    ),
+                    otpClient: self.otpClient(for: .profileOTP),
+                    sinks: ProfileOutputSinks(stdout: stdout, stderr: stderr)
+                )
+                if let code {
+                    return self.withSafeDebug(
+                        CommandResult(exitCode: code), enabled: parsed.options.debug, context: "command=profile"
                     )
                 }
             }
@@ -173,7 +209,8 @@ public struct MacopApp {
                 args: parsed.commandArgs,
                 options: parsed.options,
                 env: env,
-                client: self.passwordFallbackClient(command: "macop run"),
+                client: self.passwordFallbackClient(purpose: .run, presentation: .runPassword),
+                otpClient: self.otpClient(for: .runOTP),
                 stdout: stdout,
                 stderr: stderr
             )
@@ -218,14 +255,18 @@ public struct MacopApp {
                 args: parsed.commandArgs,
                 options: parsed.options,
                 env: env,
-                client: self.passwordFallbackClient(command: "macop read")
+                client: self.passwordFallbackClient(purpose: .read, presentation: .readPassword),
+                otpClient: self.otpClient(for: .readOTP)
             )
         case .item:
             return try ItemCommand.run(
                 args: parsed.commandArgs,
                 options: parsed.options,
                 input: input,
-                client: self.keychainClient,
+                client: self.passwordReadClient(
+                    for: parsed.commandArgs.first == "acquire" ? .itemAcquirePassword : .itemGetPassword
+                ),
+                otpClient: self.otpClient(for: .itemOTP),
                 importer: self.managedKeychainImporter,
                 deleter: self.managedKeychainDeleter,
                 mutator: self.keychainMutator,
@@ -238,7 +279,8 @@ public struct MacopApp {
                 args: parsed.commandArgs,
                 options: parsed.options,
                 env: env,
-                client: self.passwordFallbackClient(command: "macop run")
+                client: self.passwordFallbackClient(purpose: .run, presentation: .runPassword),
+                otpClient: self.otpClient(for: .runOTP)
             )
         case .inject:
             return try InjectCommand.run(
@@ -246,7 +288,18 @@ public struct MacopApp {
                 options: parsed.options,
                 env: env,
                 input: input,
-                client: self.passwordFallbackClient(command: "macop inject")
+                client: self.passwordFallbackClient(purpose: .inject, presentation: .injectPassword),
+                otpClient: self.otpClient(for: .injectOTP)
+            )
+        case .generate:
+            return try GenerateCommand.run(args: parsed.commandArgs, options: parsed.options)
+        case .profile:
+            return try ProfileCommand.run(
+                args: parsed.commandArgs, options: parsed.options, env: env,
+                client: self.passwordFallbackClient(
+                    purpose: .profile, presentation: .profilePassword
+                ),
+                otpClient: self.otpClient(for: .profileOTP)
             )
         case .ssh:
             return try SSHCommand.run(
@@ -267,7 +320,9 @@ public struct MacopApp {
             )
         }
     }
+}
 
+private extension MacopApp {
     private func renderCLIError(_ error: CLIError, argv: [String], env: [String: String]) -> CommandResult {
         self.withSafeDebug(
             ErrorRenderer.render(error: error, format: extractFormatHint(argv: argv, env: env)),
@@ -311,12 +366,25 @@ public struct MacopApp {
 }
 
 private extension MacopApp {
-    func passwordFallbackClient(command: String) -> any KeychainClient {
+    func passwordFallbackClient(
+        purpose: PasswordAutoFillPurpose, presentation: ManagedKeychainReadPresentation
+    ) -> any KeychainClient {
         PasswordFallbackKeychainClient(
-            primary: self.keychainClient,
+            primary: self.passwordReadClient(for: presentation),
             passwordAutoFillProvider: self.passwordAutoFillProvider,
-            command: command
+            purpose: purpose
         )
+    }
+
+    func passwordReadClient(for presentation: ManagedKeychainReadPresentation) -> any KeychainClient {
+        guard let binding = self.keychainClient as? any ManagedKeychainReadPresentationBinding else {
+            return self.keychainClient
+        }
+        return binding.binding(presentation)
+    }
+
+    func otpClient(for presentation: ManagedKeychainReadPresentation) -> any KeychainClient {
+        self.otpSeedClient ?? CompanionManagedKeychainClient(presentation: presentation)
     }
 
     func debugContext(_ error: CLIError) -> String? {

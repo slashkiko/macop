@@ -52,19 +52,23 @@ private let compatibilitySSHEntries: [CompatibilityEntry] = [
     .init(command: "ssh create --touch-id", kind: "flag", status: "supported"),
     .init(command: "ssh list", kind: "subcommand", status: "supported"),
     .init(command: "ssh public-key", kind: "subcommand", status: "supported"),
-    .init(command: "ssh test", kind: "subcommand", status: "supported"),
+    .init(
+        command: "ssh test", kind: "subcommand", status: "supported",
+        reason: "First-party macop shell/test CTK and Touch ID end-to-end acceptance is complete."
+    ),
     .init(
         command: "ssh run",
         kind: "subcommand",
         status: "partial",
-        reason: "Only Git child commands are accepted; macop never exports a private key."
+        reason: "Only Git child commands are accepted; first-party CTK/Touch ID E2E is complete and macop never exports a private key."
     ),
     .init(command: "ssh delete", kind: "subcommand", status: "supported"),
     .init(
         command: "ssh agent",
         kind: "subcommand",
         status: "partial",
-        reason: "Verified sessions are limited to a newly launched cooperative root; real CTK/Touch ID and third-party application E2E are not claimed."
+        reason: "Verified sessions are limited to a newly launched cooperative root. "
+            + "First-party shell/test/run CTK and Touch ID E2E is complete; third-party application E2E is not claimed."
     ),
     .init(
         command: "ssh agent shell",
@@ -82,13 +86,26 @@ private let compatibilitySSHEntries: [CompatibilityEntry] = [
         command: "ssh shell-init",
         kind: "extension",
         status: "supported",
-        reason: "Generate per-tab zsh, bash, or fish verified-session integration."
+        reason: "Generate per-tab zsh, bash, or fish verified-session integration; real Terminal tab lifecycle acceptance remains pending."
     ),
     .init(
         command: "ssh git-signing-config",
         kind: "extension",
         status: "supported",
         reason: "Generate repository-local Git SSH signing configuration for a CTK identity."
+    ),
+    .init(
+        command: "ssh connect",
+        kind: "extension",
+        status: "supported",
+        reason: "Launch Apple OpenSSH for a configured alias with exactly one short-lived Secure Enclave identity; "
+            + "real host-routing acceptance remains pending."
+    ),
+    .init(
+        command: "ssh host-config",
+        kind: "extension",
+        status: "supported",
+        reason: "Render public SSH host metadata; credentials and agent sockets are never persisted."
     )
 ]
 
@@ -96,8 +113,8 @@ private let compatibilityReferenceQueryEntries: [CompatibilityEntry] = [
     .init(
         command: "reference ?attribute=otp",
         kind: "query",
-        status: "unsupported",
-        reason: "OTP attributes are outside the MVP."
+        status: "supported",
+        reason: "Resolves a separately stored macop-managed OTP seed."
     ),
     .init(
         command: "reference ?ssh-format=openssh",
@@ -121,7 +138,8 @@ public extension CompatibilityCommand {
                 command: "read --otp",
                 kind: "flag",
                 status: "unsupported",
-                reason: "OTP retrieval is outside the MVP."
+                reason: "The 1Password --otp flag syntax is not implemented; configured OTP retrieval is supported.",
+                alternative: "Use read 'op://<namespace>/<item>/password?attribute=otp'."
             ),
             .init(
                 command: "read --ssh-format",
@@ -148,6 +166,15 @@ public extension CompatibilityCommand {
             .init(command: "inject --out-file", kind: "flag", status: "unsupported", reason: compatibilityFilePolicy),
             .init(command: "inject --file-mode", kind: "flag", status: "unsupported", reason: compatibilityFilePolicy),
             .init(command: "inject --force", kind: "flag", status: "unsupported", reason: compatibilityFilePolicy),
+            .init(command: "generate password", kind: "extension", status: "supported"),
+            .init(command: "item generate", kind: "extension", status: "supported"),
+            .init(command: "item generate --replace", kind: "extension", status: "supported"),
+            .init(command: "item otp", kind: "extension", status: "supported"),
+            .init(command: "item otp import", kind: "extension", status: "supported"),
+            .init(command: "item otp edit", kind: "extension", status: "supported"),
+            .init(command: "item otp delete", kind: "extension", status: "supported"),
+            .init(command: "profile run", kind: "extension", status: "supported"),
+            .init(command: "profile shell-init", kind: "extension", status: "supported"),
             .init(
                 command: "item list",
                 kind: "subcommand",
@@ -236,7 +263,8 @@ public extension CompatibilityCommand {
                 command: "item get --otp",
                 kind: "flag",
                 status: "unsupported",
-                reason: "OTP retrieval is outside the MVP."
+                reason: "The 1Password item-get OTP flag syntax is not implemented; configured OTP is supported.",
+                alternative: "Use item otp <name>."
             ),
             .init(
                 command: "item get --share-link",

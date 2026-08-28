@@ -11,10 +11,16 @@ public enum KeychainQuery: Sendable, Hashable {
 public struct KeychainFailure: Error, Sendable {
     public let status: OSStatus
     public let isAmbiguous: Bool
+    public let autoFillFailure: PasswordAutoFillFailure?
 
-    public init(_ status: OSStatus, isAmbiguous: Bool = false) {
+    public init(
+        _ status: OSStatus,
+        isAmbiguous: Bool = false,
+        autoFillFailure: PasswordAutoFillFailure? = nil
+    ) {
         self.status = status
         self.isAmbiguous = isAmbiguous
+        self.autoFillFailure = autoFillFailure
     }
 
     public static let ambiguousItem = KeychainFailure(errSecDuplicateItem, isAmbiguous: true)
@@ -47,6 +53,16 @@ public protocol KeychainSecurityAccess: Sendable {
         for persistentReference: Data,
         authenticationContext: LAContext
     ) -> KeychainSecurityResult
+
+    func add(
+        attributes: [CFString: Any],
+        authenticationContext: LAContext
+    ) -> KeychainSecurityResult
+
+    func delete(
+        persistentReference: Data,
+        authenticationContext: LAContext
+    ) -> OSStatus
 }
 
 public struct SystemKeychainSecurityAccess: KeychainSecurityAccess {
@@ -95,21 +111,53 @@ public struct SystemKeychainSecurityAccess: KeychainSecurityAccess {
         let status = SecItemCopyMatching(securityQuery as CFDictionary, &result)
         return KeychainSecurityResult(status: status, result: result)
     }
+
+    public func add(
+        attributes: [CFString: Any],
+        authenticationContext: LAContext
+    ) -> KeychainSecurityResult {
+        var request = attributes
+        request[kSecReturnPersistentRef] = true
+        request[kSecUseAuthenticationContext] = authenticationContext
+        var result: CFTypeRef?
+        let status = SecItemAdd(request as CFDictionary, &result)
+        return KeychainSecurityResult(status: status, result: result)
+    }
+
+    public func delete(
+        persistentReference: Data,
+        authenticationContext: LAContext
+    ) -> OSStatus {
+        SecItemDelete([
+            kSecValuePersistentRef: persistentReference,
+            kSecUseAuthenticationContext: authenticationContext
+        ] as CFDictionary)
+    }
 }
 
-public struct DefaultKeychainClient: KeychainClient {
-    private let system = SystemKeychainClient()
-    private let managed = CompanionManagedKeychainClient()
+public protocol ManagedKeychainReadPresentationBinding: Sendable {
+    func binding(_ presentation: ManagedKeychainReadPresentation) -> any KeychainClient
+}
 
-    public init() {}
+public struct DefaultKeychainClient: KeychainClient, ManagedKeychainReadPresentationBinding {
+    private let system = SystemKeychainClient()
+    private let presentation: ManagedKeychainReadPresentation
+
+    public init(presentation: ManagedKeychainReadPresentation = .readPassword) {
+        self.presentation = presentation
+    }
 
     public func read(_ query: KeychainQuery) -> Result<Data, KeychainFailure> {
         switch query {
         case .managed:
-            self.managed.read(query)
+            CompanionManagedKeychainClient(presentation: self.presentation).read(query)
         case .generic, .internet:
             self.system.read(query)
         }
+    }
+
+    public func binding(_ presentation: ManagedKeychainReadPresentation) -> any KeychainClient {
+        Self(presentation: presentation)
     }
 }
 
@@ -173,6 +221,9 @@ public enum KeychainProvider {
         case let .success(data):
             return try self.text(from: data)
         case let .failure(failure):
+            if let autoFillFailure = failure.autoFillFailure {
+                throw autoFillFailure.cliError
+            }
             if failure.isAmbiguous {
                 throw CLIError.invalidArguments(
                     message: "Keychain selector is ambiguous; configure a unique item before reading it."

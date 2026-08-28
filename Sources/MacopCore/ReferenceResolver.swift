@@ -2,6 +2,7 @@ import Foundation
 
 public enum SecretReference: Sendable {
     case opReference(namespace: String, item: String, section: String?, field: String)
+    case opOTP(namespace: String, item: String)
     case keychainGeneric(service: String, account: String)
     case keychainInternet(server: String, account: String)
     case secureEnclave(label: String)
@@ -10,15 +11,14 @@ public enum SecretReference: Sendable {
 public enum ReferenceResolver {
     public static func parse(_ input: String, env: [String: String]) throws -> SecretReference {
         let expanded = try expandEnvironmentVariables(in: input, env: env)
+        if expanded.hasPrefix("op://") {
+            return try self.parseOpReference(expanded)
+        }
         guard !expanded.contains("?") else {
             throw CLIError.unsupportedFlag(
                 flag: "reference query parameter",
-                reason: "Reference query parameters are not supported by macop."
+                reason: "Query parameters are supported only for op ?attribute=otp references."
             )
-        }
-
-        if expanded.hasPrefix("op://") {
-            return try self.parseOpReference(expanded)
         }
         if expanded.hasPrefix("keychain://") {
             return try self.parseKeychainReference(expanded)
@@ -36,7 +36,9 @@ public enum ReferenceResolver {
     }
 
     private static func parseOpReference(_ value: String) throws -> SecretReference {
-        let body = String(value.dropFirst("op://".count))
+        let parts = value.split(separator: "?", omittingEmptySubsequences: false)
+        guard parts.count <= 2 else { throw CLIError.invalidArguments(message: "Reference query is invalid.") }
+        let body = String(parts[0].dropFirst("op://".count))
         let rawSegments = body.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         let segments = try decodeSegments(rawSegments)
 
@@ -44,6 +46,16 @@ public enum ReferenceResolver {
             throw CLIError.invalidArguments(
                 message: "op reference must be op://<namespace>/<item>/[<section>/]<field>"
             )
+        }
+
+        if parts.count == 2 {
+            guard parts[1] == "attribute=otp", segments.count == 3 else {
+                throw CLIError.unsupportedFlag(
+                    flag: "reference query parameter",
+                    reason: "Only ?attribute=otp on an op reference is supported."
+                )
+            }
+            return .opOTP(namespace: segments[0], item: segments[1])
         }
 
         let namespace = segments[0]

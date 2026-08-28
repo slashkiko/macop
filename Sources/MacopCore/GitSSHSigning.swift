@@ -60,7 +60,7 @@ public struct CompanionGitSSHSigningProvider: GitSSHSigningProviding {
         )
         let request = try AuthBrokerRequester.approvalRequest(
             operation: .gitSSHSign,
-            command: "git SSH signature",
+            purpose: .gitSSHSign,
             credentialLabel: identity.label,
             service: "",
             account: "",

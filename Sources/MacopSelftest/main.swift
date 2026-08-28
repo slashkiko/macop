@@ -54,6 +54,77 @@ private func openFileDescriptorCount() throws -> Int {
     try FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
 }
 
+private func decodeFishSingleQuotedArgument(_ encoded: String) throws -> String {
+    let scalars = Array(encoded.unicodeScalars)
+    guard scalars.count >= 2, scalars.first?.value == 0x27, scalars.last?.value == 0x27 else {
+        throw SelftestFailure(message: "fish fixture expected one single-quoted argument")
+    }
+    var decoded = ""
+    var index = 1
+    while index < scalars.count - 1 {
+        let scalar = scalars[index]
+        if scalar.value == 0x5C {
+            index += 1
+            guard index < scalars.count - 1,
+                  scalars[index].value == 0x5C || scalars[index].value == 0x27
+            else { throw SelftestFailure(message: "fish fixture found an invalid single-quote escape") }
+            decoded.unicodeScalars.append(scalars[index])
+        } else {
+            decoded.unicodeScalars.append(scalar)
+        }
+        index += 1
+    }
+    return decoded
+}
+
+private func safeExecutableOnPATH(
+    named name: String,
+    environment: [String: String]
+) -> String? {
+    guard !name.isEmpty, !name.contains("/"), let path = environment["PATH"] else { return nil }
+    for component in path.split(separator: ":", omittingEmptySubsequences: false) {
+        guard component.first == "/" else { continue }
+        let directory = URL(fileURLWithPath: String(component), isDirectory: true).standardizedFileURL
+        let candidate = directory.appendingPathComponent(name, isDirectory: false).standardizedFileURL
+        guard candidate.deletingLastPathComponent() == directory else { continue }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue,
+              FileManager.default.isExecutableFile(atPath: candidate.path)
+        else { continue }
+        return candidate.path
+    }
+    return nil
+}
+
+private struct ProcessCapture {
+    let status: Int32
+    let stdout: String
+    let stderr: String
+}
+
+private func runProcess(
+    executable: String,
+    arguments: [String],
+    environment: [String: String]? = nil
+) throws -> ProcessCapture {
+    let process = Process()
+    let output = Pipe()
+    let error = Pipe()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    process.environment = environment
+    process.standardOutput = output
+    process.standardError = error
+    try process.run()
+    process.waitUntilExit()
+    return ProcessCapture(
+        status: process.terminationStatus,
+        stdout: String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "",
+        stderr: String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    )
+}
+
 final class RecordingSSHExecutor: SSHStreamingExecuting, @unchecked Sendable {
     struct Invocation { let path: String; let arguments: [String]; let environment: [String: String] }
     var invocations = [Invocation]()
@@ -177,6 +248,16 @@ private final class RecordingGitSigningProvider: GitSSHSigningProviding, @unchec
 private struct AllowingGitSigningRequesterValidator: GitSSHSigningRequesterValidating {
     func validateRequester() throws -> Int32 {
         42
+    }
+}
+
+private struct MismatchingPasswordAutoFillProvider: PasswordAutoFillProviding {
+    func acquire(
+        service _: String, account _: String, synchronizable _: Bool, purpose _: PasswordAutoFillPurpose
+    ) throws -> PasswordAutoFillCredential {
+        PasswordAutoFillCredential(
+            username: "another-user", secret: Data("never-return-this".utf8), saveStatus: .notRequested
+        )
     }
 }
 
@@ -490,8 +571,8 @@ private func runtimeSelftests() throws {
 private func authBrokerSelftests() throws {
     let nonce = Data(repeating: 0xA5, count: 32)
     let hello = AuthBrokerMessage.hello(AuthBrokerHello(
-        minimumVersion: 1,
-        maximumVersion: 1,
+        minimumVersion: AuthBrokerWire.currentVersion,
+        maximumVersion: AuthBrokerWire.currentVersion,
         capabilities: AuthBrokerCapability.approvalUI.rawValue | AuthBrokerCapability.sshSigning.rawValue,
         nonce: nonce
     ))
@@ -512,7 +593,7 @@ private func authBrokerSelftests() throws {
         rootIdentifier: "test.agent",
         rootCodeRequirement: "anchor test",
         rootExecutablePath: "/tmp/test-agent",
-        command: "ssh -T git@github.com",
+        purpose: .sshSession,
         credentialLabel: "github",
         credentialFingerprint: "SHA256:test",
         host: "github.com"
@@ -523,6 +604,49 @@ private func authBrokerSelftests() throws {
         decodedRequest == .approvalRequest(request),
         "auth broker request must round-trip exactly"
     )
+    var unknownPurposeFrame = try AuthBrokerWire.frame(.approvalRequest(request))
+    unknownPurposeFrame[68] = 0xFF
+    do {
+        _ = try AuthBrokerWire.takeFrame(from: &unknownPurposeFrame, nowMilliseconds: 1500)
+        throw SelftestFailure(message: "unknown approval purposes must fail closed")
+    } catch AuthBrokerProtocolError.malformed {}
+    var skewedPurposeFrame = try AuthBrokerWire.frame(.approvalRequest(request))
+    skewedPurposeFrame[68] = AuthBrokerPurpose.otpRead.rawValue
+    do {
+        _ = try AuthBrokerWire.takeFrame(from: &skewedPurposeFrame, nowMilliseconds: 1500)
+        throw SelftestFailure(message: "operation/purpose skew must fail closed during decoding")
+    } catch AuthBrokerProtocolError.malformed {}
+    let managedReadPurposes: [AuthBrokerPurpose] = [
+        .managedKeychainRead, .otpRead, .otpRun, .otpInject, .otpProfile, .otpItem,
+        .passwordRun, .passwordInject, .passwordProfile, .passwordItemGet, .passwordItemAcquire
+    ]
+    for purpose in managedReadPurposes {
+        let managedReadRequest = AuthBrokerApprovalRequest(
+            requestID: UUID(),
+            issuedAtMilliseconds: 1000,
+            expiresAtMilliseconds: 2000,
+            operation: .managedKeychainRead,
+            rootPID: 42,
+            rootStartTime: 7,
+            rootIdentifier: "test.agent",
+            rootCodeRequirement: "anchor test",
+            rootExecutablePath: "/tmp/test-agent",
+            purpose: purpose,
+            credentialLabel: "fixture",
+            credentialFingerprint: "",
+            host: "",
+            keychainService: "fixture-service",
+            keychainAccount: "fixture-account"
+        )
+        var managedReadFrame = try AuthBrokerWire.frame(.approvalRequest(managedReadRequest))
+        let decodedManagedRead = try AuthBrokerWire.takeFrame(
+            from: &managedReadFrame, nowMilliseconds: 1500
+        )
+        try expect(
+            decodedManagedRead == .approvalRequest(managedReadRequest),
+            "every closed managed-read purpose must round-trip with its only permitted operation"
+        )
+    }
     let managedImport = AuthBrokerManagedKeychainImportRequest(
         authorizationID: request.requestID,
         secret: Data("secret".utf8)
@@ -532,6 +656,48 @@ private func authBrokerSelftests() throws {
     try expect(
         decodedManagedImport == .managedKeychainImportRequest(managedImport),
         "managed Keychain import messages must round-trip exactly"
+    )
+    try expect(
+        AuthBrokerPurpose.managedKeychainGenerate.isValid(for: .managedKeychainImport)
+            && !AuthBrokerPurpose.managedKeychainGenerate.isValid(for: .managedKeychainUpdate),
+        "generated managed creation must have a truthful create-only broker purpose"
+    )
+    let maximumOTPAccount = String(repeating: "a", count: AuthBrokerWire.maximumMetadataLength)
+    let maximumOTPRequest = AuthBrokerApprovalRequest(
+        requestID: UUID(),
+        issuedAtMilliseconds: 1000,
+        expiresAtMilliseconds: 2000,
+        operation: .managedKeychainImport,
+        rootPID: 42,
+        rootStartTime: 7,
+        rootIdentifier: "test.agent",
+        rootCodeRequirement: "anchor test",
+        rootExecutablePath: "/tmp/test-agent",
+        purpose: .otpImport,
+        credentialLabel: ManagedKeychainPresentationLabel.otpSeed,
+        credentialFingerprint: "",
+        host: "",
+        keychainService: "otp-service",
+        keychainAccount: maximumOTPAccount
+    )
+    var maximumOTPFrame = try AuthBrokerWire.frame(.approvalRequest(maximumOTPRequest))
+    let decodedMaximumOTP = try AuthBrokerWire.takeFrame(from: &maximumOTPFrame, nowMilliseconds: 1500)
+    try expect(
+        ManagedKeychainStore.validSelector(maximumOTPAccount)
+            && ManagedKeychainPresentationLabel.otpSeed.utf8.count <= AuthBrokerWire.maximumMetadataLength
+            && decodedMaximumOTP == .approvalRequest(maximumOTPRequest),
+        "a maximum-length OTP account must retain a bounded truthful broker presentation label"
+    )
+    let indeterminateImport = AuthBrokerManagedKeychainImportResponse(
+        authorizationID: request.requestID,
+        outcome: .indeterminate,
+        status: errSecSuccess
+    )
+    var indeterminateImportFrame = try AuthBrokerWire.frame(.managedKeychainImportResponse(indeterminateImport))
+    let decodedIndeterminateImport = try AuthBrokerWire.takeFrame(from: &indeterminateImportFrame)
+    try expect(
+        decodedIndeterminateImport == .managedKeychainImportResponse(indeterminateImport),
+        "broker v4 must preserve server-side post-mutation uncertainty"
     )
     let passwordAutoFillRequest = AuthBrokerApprovalRequest(
         requestID: UUID(),
@@ -543,7 +709,7 @@ private func authBrokerSelftests() throws {
         rootIdentifier: "test.agent",
         rootCodeRequirement: "anchor test",
         rootExecutablePath: "/tmp/test-agent",
-        command: "macop item acquire --from-passwords",
+        purpose: .passwordAutoFillRead,
         credentialLabel: "me",
         credentialFingerprint: "",
         host: "",
@@ -559,6 +725,216 @@ private func authBrokerSelftests() throws {
         decodedPasswordAutoFill == .approvalRequest(passwordAutoFillRequest),
         "Password AutoFill approval requests must round-trip exactly"
     )
+    let autoFillPurposes: [PasswordAutoFillPurpose] = [.read, .run, .inject, .profile, .itemAcquire]
+    try expect(
+        autoFillPurposes.allSatisfy { $0.brokerPurpose.isValid(for: .passwordAutoFill) },
+        "every bounded AutoFill caller purpose must be valid only for Password AutoFill"
+    )
+    try expect(
+        autoFillPurposes.allSatisfy { !$0.brokerPurpose.isValid(for: .managedKeychainRead) },
+        "AutoFill caller purposes must fail closed for managed Keychain reads"
+    )
+    let passwordAutoFillResponse = AuthBrokerApprovalResponse(
+        requestID: passwordAutoFillRequest.requestID,
+        status: .approved,
+        message: "not_requested",
+        resultStatus: errSecSuccess,
+        resultData: Data("fixture-password".utf8),
+        verifiedUsername: "verified-user"
+    )
+    var passwordAutoFillResponseFrame = try AuthBrokerWire.frame(.approvalResponse(passwordAutoFillResponse))
+    let decodedPasswordAutoFillResponse = try AuthBrokerWire.takeFrame(from: &passwordAutoFillResponseFrame)
+    try expect(
+        decodedPasswordAutoFillResponse == .approvalResponse(passwordAutoFillResponse),
+        "Password AutoFill username attestation must round-trip in broker v4"
+    )
+    let validAutoFillOutcomes: [(String, OSStatus, PasswordAutoFillSaveStatus)] = [
+        ("saved", errSecSuccess, .saved),
+        ("not_requested", errSecSuccess, .notRequested),
+        ("save_failed", errSecAuthFailed, .failed),
+        ("save_indeterminate", errSecSuccess, .indeterminate)
+    ]
+    for (message, status, expectedSaveStatus) in validAutoFillOutcomes {
+        let response = AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID,
+            status: .approved,
+            message: message,
+            resultStatus: status,
+            resultData: Data("classifier-fixture".utf8),
+            verifiedUsername: "verified-user"
+        )
+        var frame = try AuthBrokerWire.frame(.approvalResponse(response))
+        guard let decoded = try AuthBrokerWire.takeFrame(from: &frame) else {
+            throw SelftestFailure(message: "AutoFill response classifier fixture must decode")
+        }
+        let credential = try PasswordAutoFillResponseClassifier.classify(
+            decoded,
+            requestID: passwordAutoFillRequest.requestID,
+            expectedUsername: "verified-user"
+        )
+        try expect(
+            credential.saveStatus == expectedSaveStatus,
+            "AutoFill response classifier must accept each valid save outcome/status combination"
+        )
+    }
+    let invalidAutoFillResponses = [
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "saved",
+            resultStatus: errSecAuthFailed, resultData: Data("classifier-fixture".utf8),
+            verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "not_requested",
+            resultStatus: errSecAuthFailed, resultData: Data("classifier-fixture".utf8),
+            verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "save_failed",
+            resultStatus: errSecSuccess, resultData: Data("classifier-fixture".utf8),
+            verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "save_indeterminate",
+            resultStatus: errSecAuthFailed, resultData: Data("classifier-fixture".utf8),
+            verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "unknown_outcome",
+            resultStatus: errSecSuccess, resultData: Data("classifier-fixture".utf8),
+            verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "saved",
+            resultStatus: errSecSuccess, resultData: Data(), verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "not_requested",
+            resultStatus: errSecSuccess, resultData: Data([0xFF, 0xFE]), verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "not_requested",
+            resultStatus: errSecSuccess, resultData: Data("nul\0credential".utf8),
+            verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "saved",
+            resultStatus: errSecSuccess,
+            resultData: Data(repeating: 0x41, count: ManagedKeychainStore.maximumSecretLength + 1),
+            verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "saved",
+            resultStatus: errSecSuccess, resultData: Data("classifier-fixture".utf8)
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .approved, message: "saved",
+            resultStatus: errSecSuccess, resultData: Data("classifier-fixture".utf8),
+            verifiedUsername: "different-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: UUID(), status: .approved, message: "saved",
+            resultStatus: errSecSuccess, resultData: Data("classifier-fixture".utf8),
+            verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .denied, message: "saved",
+            resultStatus: errSecAuthFailed, resultData: Data("classifier-fixture".utf8),
+            verifiedUsername: "verified-user"
+        ),
+        AuthBrokerApprovalResponse(
+            requestID: passwordAutoFillRequest.requestID, status: .denied,
+            resultStatus: errSecSuccess
+        )
+    ]
+    for response in invalidAutoFillResponses {
+        var frame = try AuthBrokerWire.frame(.approvalResponse(response))
+        guard let decoded = try AuthBrokerWire.takeFrame(from: &frame) else {
+            throw SelftestFailure(message: "invalid AutoFill response classifier fixture must decode")
+        }
+        do {
+            _ = try PasswordAutoFillResponseClassifier.classify(
+                decoded,
+                requestID: passwordAutoFillRequest.requestID,
+                expectedUsername: "verified-user"
+            )
+            throw SelftestFailure(message: "contradictory AutoFill responses must fail closed")
+        } catch let failure as PasswordAutoFillFailure {
+            try expect(
+                failure == .invalidResponse,
+                "every post-send invalid AutoFill response must retain typed indeterminate state"
+            )
+        }
+    }
+    do {
+        _ = try PasswordAutoFillResponseClassifier.classify(
+            .approvalResponse(AuthBrokerApprovalResponse(
+                requestID: passwordAutoFillRequest.requestID,
+                status: .cancelled,
+                resultStatus: errSecAuthFailed
+            )),
+            requestID: passwordAutoFillRequest.requestID,
+            expectedUsername: "verified-user"
+        )
+        throw SelftestFailure(message: "valid AutoFill cancellation must remain denied")
+    } catch let error as CLIError {
+        if case .denied = error {} else {
+            throw SelftestFailure(message: "valid AutoFill cancellation must remain a denial")
+        }
+    }
+    do {
+        _ = try PasswordAutoFillResponseClassifier.classify(
+            .hello(AuthBrokerHello(
+                minimumVersion: AuthBrokerWire.currentVersion,
+                maximumVersion: AuthBrokerWire.currentVersion,
+                capabilities: 0,
+                nonce: Data(repeating: 0, count: 32)
+            )),
+            requestID: passwordAutoFillRequest.requestID,
+            expectedUsername: "verified-user"
+        )
+        throw SelftestFailure(message: "mismatched AutoFill response message types must fail closed")
+    } catch let failure as PasswordAutoFillFailure {
+        try expect(
+            failure == .invalidResponse,
+            "post-send response type mismatch must retain typed indeterminate state"
+        )
+    }
+    for saveStatus in [PasswordAutoFillSaveStatus.failed, .indeterminate] {
+        let delivered = PasswordAutoFillCompletionPresentation(
+            saveStatus: saveStatus,
+            delivery: .delivered
+        )
+        let unknown = PasswordAutoFillCompletionPresentation(
+            saveStatus: saveStatus,
+            delivery: .unknown
+        )
+        try expect(
+            !delivered.isSuccess && !unknown.isSuccess,
+            "failed or indeterminate AutoFill saves must never use a success presentation"
+        )
+    }
+    let unknownNoSave = PasswordAutoFillCompletionPresentation(
+        saveStatus: .notRequested,
+        delivery: .unknown
+    )
+    try expect(
+        !unknownNoSave.isSuccess
+            && unknownNoSave.message.contains("受け渡しは確認できません")
+            && !unknownNoSave.message.contains("今回のみ使用"),
+        "response write loss must not claim that an unsaved credential was used"
+    )
+    for status in [AuthBrokerApprovalStatus.cancelled, .denied] {
+        let rejection = PasswordAutoFillRejectionPresentation(
+            status: status,
+            delivery: .unknown
+        )
+        try expect(
+            !rejection.isSuccess
+                && rejection.message.contains("結果通知は確認できません")
+                && !rejection.message.contains("安全に検証できませんでした"),
+            "known cancellation or denial must survive response-write loss with delivery marked unknown"
+        )
+    }
     let managedDeleteRequest = AuthBrokerApprovalRequest(
         requestID: UUID(),
         issuedAtMilliseconds: 1000,
@@ -569,7 +945,7 @@ private func authBrokerSelftests() throws {
         rootIdentifier: "test.agent",
         rootCodeRequirement: "anchor test",
         rootExecutablePath: "/tmp/test-agent",
-        command: "macop item delete",
+        purpose: .managedKeychainDelete,
         credentialLabel: "me",
         credentialFingerprint: "",
         host: "",
@@ -599,16 +975,16 @@ private func authBrokerSelftests() throws {
             rootIdentifier: "test.agent",
             rootCodeRequirement: "anchor test",
             rootExecutablePath: "/tmp/test-agent",
-            command: "ssh\u{001B}[31m trusted",
+            purpose: .otpRead,
             credentialLabel: "key",
             credentialFingerprint: "SHA256:test",
             host: "github.com"
         )))
-        throw SelftestFailure(message: "ANSI control sequences must be rejected")
-    } catch AuthBrokerProtocolError.tooLarge {}
+        throw SelftestFailure(message: "mismatched approval purpose must be rejected")
+    } catch AuthBrokerProtocolError.malformed {}
 
     var unsupportedVersion = try AuthBrokerWire.frame(hello)
-    unsupportedVersion[9] = 2
+    unsupportedVersion[9] = UInt8(AuthBrokerWire.currentVersion + 1)
     do {
         _ = try AuthBrokerWire.takeFrame(from: &unsupportedVersion)
         throw SelftestFailure(message: "unknown auth broker versions must fail closed")
@@ -1916,6 +2292,14 @@ func run() throws {
         entries.allSatisfy { $0["kind"] is String && $0["id"] is String },
         "compatibility entries should declare kind and ID"
     )
+    let readOTPCompatibility = entries.first { $0["id"] as? String == "read --otp" }
+    let itemOTPCompatibility = entries.first { $0["id"] as? String == "item get --otp" }
+    try expect(
+        (readOTPCompatibility?["alternative"] as? String)?.contains("attribute=otp") == true
+            && (itemOTPCompatibility?["alternative"] as? String) == "Use item otp <name>."
+            && !(readOTPCompatibility?["reason"] as? String ?? "").contains("outside the MVP"),
+        "unsupported 1Password OTP flags must advertise the supported macop OTP alternatives"
+    )
     let expectedCompatibilityIDs: Set = [
         "read", "read --no-newline", "read --otp", "read --ssh-format", "read --out-file", "read --file-mode",
         "read --force",
@@ -1923,7 +2307,9 @@ func run() throws {
         "run --stdin",
         "run --no-masking", "run --environment", "inject", "inject -i", "inject --in-file", "inject --out-file",
         "inject --file-mode",
-        "inject --force", "item list", "item list --long", "item list --format", "item list --vault",
+        "inject --force", "generate password", "item generate", "item generate --replace",
+        "item otp", "item otp import", "item otp edit", "item otp delete",
+        "profile run", "profile shell-init", "item list", "item list --long", "item list --format", "item list --vault",
         "item list --categories", "item list --tags", "item list --favorite", "item list --include-archive",
         "item list --otp", "item list --share-link", "item get", "item get --fields",
         "item get --reveal", "item import", "item acquire", "item acquire --from-passwords",
@@ -1942,7 +2328,7 @@ func run() throws {
         "plugin", "compatibility", "config init", "config validate", "doctor", "ssh", "ssh create",
         "ssh create --touch-id",
         "ssh list", "ssh public-key", "ssh test", "ssh run", "ssh delete", "ssh agent", "ssh agent shell",
-        "ssh agent application", "ssh shell-init", "ssh git-signing-config",
+        "ssh agent application", "ssh shell-init", "ssh git-signing-config", "ssh connect", "ssh host-config",
         "reference ?attribute=otp", "reference ?ssh-format=openssh", "--help", "--version",
         "--format",
         "--config", "--no-color", "--debug", "--encoding=utf-8", "--account", "--session", "--cache",
@@ -1964,10 +2350,10 @@ func run() throws {
         "human matrix should label commands"
     )
     try expect(
-        compatibilityHuman.stdout
-            .contains(
-                "Macop extensions: item import, item acquire, item create, item edit, item delete, compatibility"
-            ),
+        compatibilityHuman.stdout.contains("Macop extensions:")
+            && compatibilityHuman.stdout.contains("item generate")
+            && compatibilityHuman.stdout.contains("profile run")
+            && compatibilityHuman.stdout.contains("ssh connect"),
         "human matrix should label extensions"
     )
     try expect(compatibilityHuman.stdout.contains("Flags:"), "human matrix should label flags separately")
@@ -2501,6 +2887,10 @@ func run() throws {
     let configMode = try FileManager.default
         .attributesOfItem(atPath: initializedConfigPath)[.posixPermissions] as? NSNumber
     try expect(configMode?.intValue == 0o600, "config init must create the file with mode 0600")
+    let initializedObject = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: URL(fileURLWithPath: initializedConfigPath))
+    ) as? [String: Any]
+    try expect(initializedObject?["version"] as? Int == 2, "config init must create explicit schema v2")
 
     let configValidate = app.run(argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:])
     try expect(configValidate.exitCode == 0, "config validate should exit 0")
@@ -2893,6 +3283,104 @@ func run() throws {
         "multiple persistent references must be rejected before reading any secret"
     )
 
+    let existingCreateAccess = RecordingKeychainSecurityAccess(referenceResponses: [
+        KeychainSecurityResult(status: errSecSuccess, result: persistentReference as CFData)
+    ])
+    do {
+        try SystemKeychainMutator(securityAccess: existingCreateAccess).create(
+            Data("must-not-be-added".utf8),
+            query: .internet(server: "server.example", account: "account")
+        )
+        throw SelftestFailure(message: "legacy create must reject any existing broad-selector match")
+    } catch let error as CLIError {
+        guard case .invalidArguments = error else { throw error }
+    }
+    try expect(
+        existingCreateAccess.queries == [.internet(server: "server.example", account: "account")],
+        "legacy create must enumerate zero exact-selector matches before SecItemAdd"
+    )
+
+    let createdReference = Data([0x10, 0x11, 0x12])
+    let competingReference = Data([0x20, 0x21, 0x22])
+    let concurrentCreateAccess = RecordingKeychainSecurityAccess(
+        referenceResponses: [
+            KeychainSecurityResult(status: errSecItemNotFound),
+            KeychainSecurityResult(
+                status: errSecSuccess,
+                result: NSArray(array: [createdReference, competingReference])
+            )
+        ],
+        addResponses: [
+            KeychainSecurityResult(status: errSecSuccess, result: createdReference as CFData)
+        ],
+        deleteResponses: [errSecSuccess]
+    )
+    do {
+        try SystemKeychainMutator(securityAccess: concurrentCreateAccess).create(
+            Data("fixture-race-secret".utf8),
+            query: .internet(server: "server.example", account: "account")
+        )
+        throw SelftestFailure(message: "a concurrent broad-selector add must fail closed")
+    } catch let error as CLIError {
+        guard case .invalidArguments = error else { throw error }
+    }
+    try expect(
+        concurrentCreateAccess.queries == [
+            .internet(server: "server.example", account: "account"),
+            .internet(server: "server.example", account: "account")
+        ]
+            && concurrentCreateAccess.deletedReferences == [createdReference]
+            && concurrentCreateAccess.addedContexts[0] === concurrentCreateAccess.deletedContexts[0],
+        "postflight ambiguity must roll back only the persistent reference created by this process"
+    )
+    let missingCreateReferenceAccess = RecordingKeychainSecurityAccess(
+        referenceResponses: [KeychainSecurityResult(status: errSecItemNotFound)],
+        addResponses: [KeychainSecurityResult(status: errSecSuccess)]
+    )
+    do {
+        try SystemKeychainMutator(securityAccess: missingCreateReferenceAccess).create(
+            Data("fixture-missing-reference".utf8),
+            query: .internet(server: "missing-ref.invalid", account: "account")
+        )
+        throw SelftestFailure(message: "successful add without persistent reference must be indeterminate")
+    } catch let error as CLIError {
+        guard case let .runtimeError(message) = error else { throw error }
+        try expect(
+            message.contains("indeterminate") && message.contains("may remain")
+                && message.contains("No broad deletion was attempted")
+                && missingCreateReferenceAccess.deletedReferences.isEmpty,
+            "missing created reference must diagnose possible orphan without broad deletion"
+        )
+    }
+    let failedRollbackAccess = RecordingKeychainSecurityAccess(
+        referenceResponses: [
+            KeychainSecurityResult(status: errSecItemNotFound),
+            KeychainSecurityResult(
+                status: errSecSuccess,
+                result: NSArray(array: [createdReference, competingReference])
+            )
+        ],
+        addResponses: [
+            KeychainSecurityResult(status: errSecSuccess, result: createdReference as CFData)
+        ],
+        deleteResponses: [errSecAuthFailed]
+    )
+    do {
+        try SystemKeychainMutator(securityAccess: failedRollbackAccess).create(
+            Data("fixture-rollback-failure".utf8),
+            query: .internet(server: "rollback.invalid", account: "account")
+        )
+        throw SelftestFailure(message: "unconfirmed targeted rollback must fail with reconciliation guidance")
+    } catch let error as CLIError {
+        guard case let .runtimeError(message) = error else { throw error }
+        try expect(
+            failedRollbackAccess.deletedReferences == [createdReference]
+                && message.contains("may remain")
+                && message.contains("No broad deletion was attempted"),
+            "rollback failure must attempt only the created reference and diagnose possible orphan"
+        )
+    }
+
     let retryAccess = RecordingKeychainSecurityAccess(
         referenceResponses: [
             KeychainSecurityResult(status: errSecSuccess, result: persistentReference as CFData),
@@ -3208,7 +3696,7 @@ func run() throws {
     try expect(nonUTF8Encoding.exitCode == 3, "non-UTF-8 encoding should be unsupported")
 
     let queryReference = app.run(argv: ["macop", "read", "op://Local/GitHub/token?attribute=otp"], env: [:])
-    try expect(queryReference.exitCode == 3, "reference query parameters should be unsupported")
+    try expect(queryReference.exitCode == 6, "OTP query should require configured OTP metadata")
     let cyclicReference = app.run(argv: ["macop", "read", "$A"], env: ["A": "$B", "B": "$A"])
     try expect(cyclicReference.exitCode == 2, "cyclic reference environment expansion should fail")
     let undefinedReference = app.run(argv: ["macop", "read", "$MISSING_REFERENCE"], env: [:])
@@ -3279,8 +3767,80 @@ func run() throws {
         "invalid selector JSON error must classify as invalid arguments"
     )
 
-    let validSectionFieldConfig = """
+    for metadata in [
+        String(repeating: "a", count: AuthBrokerWire.maximumMetadataLength + 1),
+        "unsafe\nselector",
+        "unsafe\u{202E}selector"
+    ] {
+        let unsafeManagedConfig: [String: Any] = [
+            "version": 2,
+            "items": [
+                "Local/Managed": [
+                    "provider": "keychain-managed", "service": metadata, "account": "fixture-account"
+                ]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: unsafeManagedConfig).write(to: configPath, options: [.atomic])
+        let result = app.run(
+            argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:]
+        )
+        try expect(
+            result.exitCode == ExitCode.invalidArguments.rawValue,
+            "managed selector length, control, and bidi metadata must fail before broker transport"
+        )
+
+        let legacyConfig: [String: Any] = [
+            "version": 1,
+            "items": [
+                "Local/Legacy": [
+                    "provider": "keychain-generic", "service": metadata, "account": "fixture-account"
+                ]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: legacyConfig).write(to: configPath, options: [.atomic])
+        let legacyResult = app.run(
+            argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:]
+        )
+        try expect(
+            legacyResult.exitCode == 0,
+            "schema v1 must preserve its prior selector metadata acceptance contract"
+        )
+
+        let legacyManagedConfig: [String: Any] = [
+            "version": 1,
+            "items": [
+                "Local/LegacyManaged": [
+                    "provider": "keychain-managed", "service": metadata, "account": "fixture-account"
+                ]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: legacyManagedConfig).write(to: configPath, options: [.atomic])
+        let legacyManagedResult = app.run(
+            argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:]
+        )
+        try expect(
+            legacyManagedResult.exitCode == ExitCode.invalidArguments.rawValue,
+            "schema v1 managed selectors must still fit the mandatory broker wire contract"
+        )
+    }
+
+    let safeLegacyManagedConfig = """
     { "version": 1, "items": {
+      "Local/LegacyManaged": {
+        "provider": "keychain-managed", "service": "legacy-managed", "account": "fixture-account"
+      }
+    } }
+    """
+    try safeLegacyManagedConfig.data(using: .utf8)!.write(to: configPath, options: [.atomic])
+    try expect(
+        app.run(
+            argv: ["macop", "--config", configDirectory, "config", "validate"], env: [:]
+        ).exitCode == 0,
+        "wire-safe schema v1 managed selectors must remain supported"
+    )
+
+    let validSectionFieldConfig = """
+    { "version": 2, "items": {
       "Local/GitHub": {
         "provider": "keychain-generic", "service": "github", "account": "me", "fields": ["credentials/password"]
       }
@@ -3362,15 +3922,36 @@ func run() throws {
         argv: ["macop", "--config", configDirectory, "item", "create", "Generic"], env: [:]
     )
     try expect(emptyCreate.exitCode == 2, "item create must reject empty stdin before Keychain access")
+    let generatedCreate = mutationApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "generate", "Generic", "--length", "32"],
+        env: [:]
+    )
+    let generatedEdit = mutationApp.run(
+        argv: [
+            "macop", "--config", configDirectory, "item", "generate", "--replace", "Generic", "--length", "36"
+        ],
+        env: [:]
+    )
+    try expect(
+        generatedCreate.exitCode == 0 && generatedEdit.exitCode == 0
+            && keychainMutator.creates.last?.secret.count == 32
+            && keychainMutator.edits.last?.secret.count == 36,
+        "legacy item generation must distinguish create from exact-item replacement"
+    )
 
     let managedConfig = """
-    { "version": 1, "items": {
+    { "version": 2, "items": {
       "Local/Managed": {
         "provider": "keychain-managed", "service": "github-token", "account": "me", "fields": ["token"]
       },
       "Local/Cloud": {
         "provider": "keychain-managed", "service": "cloud-token", "account": "me",
         "fields": ["token"], "synchronization": "icloud"
+      }
+    }, "profiles": {
+      "autofill-profile": {
+        "executable": "/usr/bin/printenv",
+        "environment": { "AUTOFILL_PROFILE_SECRET": "op://Local/Managed/password" }
       }
     } }
     """
@@ -3464,7 +4045,7 @@ func run() throws {
         automaticAutoFill.requests.count == 1
             && automaticAutoFill.requests[0].service == "github-token"
             && automaticAutoFill.requests[0].account == "me"
-            && automaticAutoFill.requests[0].command == "macop item acquire",
+            && automaticAutoFill.requests[0].purpose == .itemAcquire,
         "Password AutoFill must receive the exact configured selectors"
     )
 
@@ -3479,7 +4060,7 @@ func run() throws {
     try expect(fallbackRead.stdout == "fallback-read-secret\n", "read must return the selected password")
     try expect(
         fallbackReadAutoFill.requests.count == 1
-            && fallbackReadAutoFill.requests[0].command == "macop read",
+            && fallbackReadAutoFill.requests[0].purpose == .read,
         "read fallback must identify the actual requesting command"
     )
 
@@ -3499,7 +4080,7 @@ func run() throws {
     )
     try expect(
         fallbackInjectAutoFill.requests.count == 1
-            && fallbackInjectAutoFill.requests[0].command == "macop inject",
+            && fallbackInjectAutoFill.requests[0].purpose == .inject,
         "one command must cache a Passwords selection instead of prompting twice"
     )
 
@@ -3518,9 +4099,173 @@ func run() throws {
     try expect(fallbackRun.stdout == "fallback-run-secret\n", "run must inject the selected password")
     try expect(
         fallbackRunAutoFill.requests.count == 1
-            && fallbackRunAutoFill.requests[0].command == "macop run",
+            && fallbackRunAutoFill.requests[0].purpose == .run,
         "run fallback must identify the actual requesting command"
     )
+
+    let fallbackProfileAutoFill = RecordingPasswordAutoFillProvider(
+        secret: Data("fallback-profile-secret".utf8)
+    )
+    let fallbackProfile = MacopApp(
+        keychainClient: missingManagedClient,
+        passwordAutoFillProvider: fallbackProfileAutoFill
+    ).run(
+        argv: [
+            "macop", "--config", configDirectory, "profile", "run", "autofill-profile", "--",
+            "/usr/bin/printenv", "AUTOFILL_PROFILE_SECRET"
+        ],
+        env: [:]
+    )
+    try expect(fallbackProfile.exitCode == 0, "profile must fall back when a managed item is missing")
+    try expect(
+        fallbackProfileAutoFill.requests.count == 1
+            && fallbackProfileAutoFill.requests[0].purpose == .profile,
+        "profile fallback must attest its operation-specific AutoFill purpose"
+    )
+
+    let indeterminateSaveSecret = "autofill-indeterminate-secret"
+    let indeterminateSaveProvider = RecordingPasswordAutoFillProvider(
+        secret: Data(indeterminateSaveSecret.utf8),
+        saveStatus: .indeterminate
+    )
+    let indeterminateSaveApp = MacopApp(
+        keychainClient: missingManagedClient,
+        passwordAutoFillProvider: indeterminateSaveProvider
+    )
+    let indeterminateSaveResults = [
+        indeterminateSaveApp.run(
+            argv: ["macop", "--config", configDirectory, "read", "op://Local/Managed/password"], env: [:]
+        ),
+        indeterminateSaveApp.run(
+            argv: ["macop", "--config", configDirectory, "inject"], env: [:],
+            input: Data("op://Local/Managed/password".utf8)
+        ),
+        indeterminateSaveApp.run(
+            argv: ["macop", "--config", configDirectory, "run", "--", "/usr/bin/true"],
+            env: ["AUTOFILL_SECRET": "op://Local/Managed/password"]
+        ),
+        indeterminateSaveApp.run(
+            argv: [
+                "macop", "--config", configDirectory, "profile", "run", "autofill-profile", "--",
+                "/usr/bin/printenv", "AUTOFILL_PROFILE_SECRET"
+            ],
+            env: [:]
+        ),
+        indeterminateSaveApp.run(
+            argv: ["macop", "--config", configDirectory, "item", "acquire", "Managed"], env: [:]
+        )
+    ]
+    try expect(
+        indeterminateSaveResults.allSatisfy {
+            $0.exitCode == ExitCode.runtimeError.rawValue
+                && $0.stderr.contains("save verification was indeterminate")
+                && !$0.stdout.contains(indeterminateSaveSecret)
+                && !$0.stderr.contains(indeterminateSaveSecret)
+        },
+        "read/run/inject/profile/item-acquire must preserve and display AutoFill save-indeterminate outcomes"
+    )
+    let failedSave = MacopApp(
+        keychainClient: missingManagedClient,
+        passwordAutoFillProvider: RecordingPasswordAutoFillProvider(
+            saveStatus: .failed,
+            saveResultStatus: errSecAuthFailed
+        )
+    ).run(
+        argv: ["macop", "--config", configDirectory, "read", "op://Local/Managed/password"], env: [:]
+    )
+    try expect(
+        failedSave.exitCode == ExitCode.runtimeError.rawValue
+            && failedSave.stderr.contains("managed Keychain save failed")
+            && failedSave.stderr.contains("OSStatus \(errSecAuthFailed)"),
+        "received AutoFill save failures must not be discarded"
+    )
+    let lostAutoFillResponse = MacopApp(
+        keychainClient: missingManagedClient,
+        passwordAutoFillProvider: FailingPasswordAutoFillProvider(failure: .responseLost)
+    ).run(
+        argv: ["macop", "--config", configDirectory, "read", "op://Local/Managed/password"], env: [:]
+    )
+    try expect(
+        lostAutoFillResponse.exitCode == ExitCode.runtimeError.rawValue
+            && lostAutoFillResponse.stderr.contains("request may have been delivered")
+            && lostAutoFillResponse.stderr.contains("save may have completed"),
+        "post-send AutoFill response loss must retain secret-free reconciliation guidance"
+    )
+    let lostForcedAutoFillResponse = MacopApp(
+        keychainClient: RecordingKeychainClient(.success(Data("unused-managed-secret".utf8))),
+        passwordAutoFillProvider: FailingPasswordAutoFillProvider(failure: .responseLost)
+    ).run(
+        argv: [
+            "macop", "--config", configDirectory, "item", "acquire", "Managed", "--from-passwords"
+        ],
+        env: [:]
+    )
+    try expect(
+        lostForcedAutoFillResponse.exitCode == ExitCode.runtimeError.rawValue
+            && lostForcedAutoFillResponse.stderr.contains("request may have been delivered"),
+        "forced AutoFill must preserve the same typed post-send response-loss outcome"
+    )
+    let runAutoFillCallers: (any PasswordAutoFillProviding) -> [CommandResult] = { provider in
+        let callerApp = MacopApp(
+            keychainClient: missingManagedClient,
+            passwordAutoFillProvider: provider
+        )
+        return [
+            callerApp.run(
+                argv: ["macop", "--config", configDirectory, "read", "op://Local/Managed/password"], env: [:]
+            ),
+            callerApp.run(
+                argv: ["macop", "--config", configDirectory, "inject"], env: [:],
+                input: Data("op://Local/Managed/password".utf8)
+            ),
+            callerApp.run(
+                argv: ["macop", "--config", configDirectory, "run", "--", "/usr/bin/true"],
+                env: ["AUTOFILL_SECRET": "op://Local/Managed/password"]
+            ),
+            callerApp.run(
+                argv: [
+                    "macop", "--config", configDirectory, "profile", "run", "autofill-profile", "--",
+                    "/usr/bin/printenv", "AUTOFILL_PROFILE_SECRET"
+                ],
+                env: [:]
+            ),
+            callerApp.run(
+                argv: ["macop", "--config", configDirectory, "item", "acquire", "Managed"], env: [:]
+            )
+        ]
+    }
+    let invalidAutoFillCallerResults = runAutoFillCallers(
+        FailingPasswordAutoFillProvider(failure: .invalidResponse)
+    )
+    try expect(
+        invalidAutoFillCallerResults.allSatisfy {
+            $0.exitCode == ExitCode.runtimeError.rawValue
+                && $0.stderr.contains("invalid response")
+                && $0.stderr.contains("may have been delivered")
+                && !$0.stderr.contains("classifier-fixture")
+        },
+        "post-send invalid AutoFill responses must reach every caller as secret-free typed uncertainty"
+    )
+    for invalidCredential in [
+        Data(),
+        Data([0xFF, 0xFE]),
+        Data("nul\0credential".utf8),
+        Data(repeating: 0x41, count: ManagedKeychainStore.maximumSecretLength + 1)
+    ] {
+        let invalidCredentialResults = runAutoFillCallers(
+            ClassifyingPasswordAutoFillProvider(secret: invalidCredential)
+        )
+        try expect(
+            invalidCredentialResults.allSatisfy {
+                $0.exitCode == ExitCode.runtimeError.rawValue
+                    && $0.stderr.contains("invalid response")
+                    && $0.stderr.contains("reconcile the configured item")
+                    && $0.stdout.isEmpty
+            },
+            "empty, oversized, invalid UTF-8, or NUL AutoFill credentials must be rejected before every caller "
+                + "can cache or use them"
+        )
+    }
 
     let deniedFallback = MacopApp(
         keychainClient: missingManagedClient,
@@ -3559,7 +4304,7 @@ func run() throws {
     try expect(
         forcedManagedClient.queries.isEmpty
             && forcedAutoFill.requests.count == 1
-            && forcedAutoFill.requests[0].command == "macop item acquire --from-passwords",
+            && forcedAutoFill.requests[0].purpose == .itemAcquire,
         "explicit Passwords fallback must not re-read a known-bad managed credential"
     )
 
@@ -3668,15 +4413,1093 @@ func run() throws {
     let zshCompletion = app.run(argv: ["macop", "completion", "zsh"], env: [:])
     try expect(zshCompletion.stdout.contains("commands=(read run inject"), "zsh completion should offer commands")
     try expect(zshCompletion.stdout.contains("compdef _macop macop op"), "zsh completion should register both names")
+    try expect(zshCompletion.stdout.contains("'otp command' import edit delete"), "zsh should complete OTP lifecycle")
+    try expect(
+        zshCompletion.stdout.contains("__macop_zsh_next_positional_index")
+            && zshCompletion.stdout.contains("--config|--format|--encoding")
+            && zshCompletion.stdout.contains("--config=*|--format=*|--encoding=*"),
+        "zsh completion must parse valued global options before positional commands"
+    )
     let bashCompletion = app.run(argv: ["macop", "completion", "bash"], env: [:])
     try expect(bashCompletion.stdout.contains("init validate"), "bash completion should offer config subcommands")
+    try expect(bashCompletion.stdout.contains("import edit delete"), "bash should complete OTP lifecycle")
+    try expect(
+        bashCompletion.stdout.contains("__macop_bash_next_positional_index")
+            && bashCompletion.stdout.contains("--config|--format|--encoding")
+            && bashCompletion.stdout.contains("--config=*|--format=*|--encoding=*"),
+        "bash completion must parse valued global options before positional commands"
+    )
+    for (shell, executable, completion, setup) in [
+        (
+            "zsh", "/bin/zsh", zshCompletion.stdout,
+            "compdef() { :; }; _arguments() { :; }; _values() { printf '<%s>\\n' \"$@\"; }; "
+                + "words=(macop item --format json otp ''); CURRENT=6; _macop"
+        ),
+        (
+            "bash", "/bin/bash", bashCompletion.stdout,
+            "COMP_WORDS=(macop item --format json otp ''); COMP_CWORD=5; _macop_complete; "
+                + "printf '<%s>\\n' \"${COMPREPLY[@]}\""
+        )
+    ] {
+        let separated = try runProcess(
+            executable: executable,
+            arguments: [
+                "-c",
+                (shell == "zsh" ? "compdef() { :; }\n" : "") + completion + "\n" + setup
+            ]
+        )
+        try expect(
+            separated.status == 0
+                && separated.stdout.contains("<import>")
+                && separated.stdout.contains("<edit>")
+                && separated.stdout.contains("<delete>")
+                && !separated.stdout.contains("<list>")
+                && separated.stderr.isEmpty,
+            "\(shell) completion must recognize item --format json otp positionally"
+        )
+        let joinedSetup = if shell == "zsh" {
+            "compdef() { :; }; _arguments() { :; }; _values() { printf '<%s>\\n' \"$@\"; }; "
+                + "words=(macop --config /tmp item --format=json otp ''); CURRENT=7; _macop"
+        } else {
+            "COMP_WORDS=(macop --config /tmp item --format=json otp ''); COMP_CWORD=6; "
+                + "_macop_complete; printf '<%s>\\n' \"${COMPREPLY[@]}\""
+        }
+        let joined = try runProcess(
+            executable: executable,
+            arguments: [
+                "-c",
+                (shell == "zsh" ? "compdef() { :; }\n" : "") + completion + "\n" + joinedSetup
+            ]
+        )
+        try expect(
+            joined.status == 0
+                && joined.stdout.contains("<import>")
+                && joined.stdout.contains("<edit>")
+                && joined.stdout.contains("<delete>")
+                && !joined.stdout.contains("<list>")
+                && joined.stderr.isEmpty,
+            "\(shell) completion must skip global options before command and between item and otp"
+        )
+    }
     let fishCompletion = app.run(argv: ["macop", "completion", "fish"], env: [:])
     try expect(fishCompletion.stdout.contains("-l format"), "fish completion should offer format values")
+    try expect(fishCompletion.stdout.contains("import edit delete"), "fish should complete OTP lifecycle")
+    try expect(
+        fishCompletion.stdout.contains("function __macop_next_positional_index")
+            && fishCompletion.stdout.contains("function __macop_command_index")
+            && fishCompletion.stdout.contains("case --config --format --encoding")
+            && fishCompletion.stdout.contains("case '--config=*' '--format=*' '--encoding=*' --no-color --debug")
+            && fishCompletion.stdout.contains("string match -q -- $argv[1] (__macop_command)")
+            && fishCompletion.stdout.contains("__macop_command_position item")
+            && fishCompletion.stdout.contains("set -l command_index (__macop_command_index)")
+            && fishCompletion.stdout.contains(
+                "set -l otp_index (__macop_next_positional_index (math $command_index + 1))"
+            )
+            && fishCompletion.stdout.contains("string match -q -- otp $words[$otp_index]")
+            && fishCompletion.stdout.contains("__macop_item_position; and not __macop_otp_position")
+            && fishCompletion.stdout.contains("__macop_item_position; and __macop_otp_position")
+            && fishCompletion.stdout.contains("__macop_command_position generate")
+            && fishCompletion.stdout.contains("__macop_command_position profile")
+            && fishCompletion.stdout.contains("__macop_command_position config")
+            && fishCompletion.stdout.contains("__macop_command_position ssh")
+            && !fishCompletion.stdout.contains("__fish_seen_subcommand_from"),
+        "fish completion must skip valued/global flags before commands and between item and OTP positions"
+    )
+    let currentHelp = app.run(argv: ["macop", "--help"], env: [:])
+    try expect(
+        !currentHelp.stdout.contains("MVP scaffold")
+            && currentHelp.stdout.contains("item list")
+            && currentHelp.stdout.contains("item acquire")
+            && currentHelp.stdout.contains("item delete"),
+        "help must advertise the established item operations without stale MVP scaffold wording"
+    )
+}
+
+private func runKeychainNativeExtensions() throws {
+    let mutationSecret = Data("managed-mutation-fixture".utf8)
+    let readbackFailureAccess = FaultingManagedKeychainStoreAccess(
+        readResult: .failure(KeychainFailure(errSecInteractionNotAllowed))
+    )
+    let addReadbackFailure = ManagedKeychainStore.importSecret(
+        mutationSecret, service: "fixture-service", account: "fixture-account",
+        synchronizable: false, authenticationContext: LAContext(), access: readbackFailureAccess
+    )
+    try expect(
+        addReadbackFailure == .indeterminate
+            && PasswordAutoFillSaveStatus(mutationOutcome: addReadbackFailure) == .indeterminate,
+        "a successful managed add followed by readback failure must be indeterminate, including AutoFill save"
+    )
+    let mismatchAccess = FaultingManagedKeychainStoreAccess(
+        readResult: .success(Data("different-readback".utf8))
+    )
+    let updateReadbackMismatch = ManagedKeychainStore.updateSecret(
+        mutationSecret, service: "fixture-service", account: "fixture-account",
+        synchronizable: false, authenticationContext: LAContext(), access: mismatchAccess
+    )
+    try expect(
+        updateReadbackMismatch == .indeterminate && mismatchAccess.updateCount == 1
+            && mismatchAccess.readCount == 1,
+        "a successful managed update followed by mismatched readback must be indeterminate"
+    )
+    let upsertReadbackFailure = ManagedKeychainStore.upsertSecret(
+        mutationSecret, service: "fixture-service", account: "fixture-account",
+        synchronizable: false, authenticationContext: LAContext(), access: readbackFailureAccess
+    )
+    try expect(
+        upsertReadbackFailure == .indeterminate,
+        "a successful AutoFill upsert followed by failed readback must not report definite save failure"
+    )
+    let committedAccess = FaultingManagedKeychainStoreAccess(readResult: .success(mutationSecret))
+    try expect(
+        ManagedKeychainStore.importSecret(
+            mutationSecret, service: "fixture-service", account: "fixture-account",
+            synchronizable: false, authenticationContext: LAContext(), access: committedAccess
+        ) == .committed,
+        "managed mutation must report committed only after equal readback"
+    )
+
+    let sha1Vector = try TOTPGenerator.code(
+        seed: Data("12345678901234567890".utf8), algorithm: "SHA1", digits: 8, period: 30,
+        date: Date(timeIntervalSince1970: 59)
+    )
+    try expect(
+        sha1Vector == "94287082",
+        "RFC 6238 SHA1 vector must match"
+    )
+    let sha256Vector = try TOTPGenerator.code(
+        seed: Data("12345678901234567890123456789012".utf8), algorithm: "SHA256", digits: 8, period: 30,
+        date: Date(timeIntervalSince1970: 59)
+    )
+    try expect(
+        sha256Vector == "46119246",
+        "RFC 6238 SHA256 vector must match"
+    )
+    let sha512Vector = try TOTPGenerator.code(
+        seed: Data("1234567890123456789012345678901234567890123456789012345678901234".utf8),
+        algorithm: "SHA512", digits: 8, period: 30, date: Date(timeIntervalSince1970: 59)
+    )
+    try expect(
+        sha512Vector == "90693936",
+        "RFC 6238 SHA512 vector must match"
+    )
+    try expect(
+        (try? TOTPGenerator.parse("otpauth://hotp/Example?secret=JBSWY3DPEHPK3PXP")) == nil,
+        "HOTP URI must be rejected"
+    )
+    try expect((try? TOTPGenerator.decodeBase32("JBSW=Y3DP")) == nil, "padded or malformed Base32 must fail")
+    try expect((try? TOTPGenerator.decodeBase32("AAA")) == nil, "non-canonical Base32 lengths must fail")
+    try expect(
+        (try? TOTPGenerator.decodeBase32("JBSWY3DPEHPK3PXſ")) == nil
+            && (try? TOTPGenerator.decodeBase32("JBSWY3DPEHPK3PXı")) == nil,
+        "Unicode case folding must not create valid Base32 ASCII"
+    )
+    try expect(
+        (try? TOTPGenerator.parse("otpauth://totp/?secret=JBSWY3DPEHPK3PXP")) == nil,
+        "OTP URI must require a non-empty label"
+    )
+    try expect(
+        (try? TOTPGenerator.parse("otpauth://totp:443/Label?secret=JBSWY3DPEHPK3PXP")) == nil,
+        "OTP URI authority must not contain a port"
+    )
+    try expect(
+        [
+            "otpauth://%74otp/Label?secret=JBSWY3DPEHPK3PXP",
+            "otpauth://totp:/Label?secret=JBSWY3DPEHPK3PXP",
+            "otpauth://user@totp/Label?secret=JBSWY3DPEHPK3PXP",
+            "otpauth://totp@host/Label?secret=JBSWY3DPEHPK3PXP"
+        ].allSatisfy { (try? TOTPGenerator.parse($0)) == nil },
+        "OTP URI raw authority must be exactly the ASCII token totp"
+    )
+    try expect(
+        (try? TOTPGenerator.parse("otpauth://totp/Issuer/user?secret=JBSWY3DPEHPK3PXP")) == nil
+            && (try? TOTPGenerator.parse(
+                "otpauth://totp/Issuer%2Fuser?secret=JBSWY3DPEHPK3PXP"
+            )) == nil,
+        "OTP URI must contain exactly one label path segment"
+    )
+    try expect(
+        (try? TOTPGenerator.parse(
+            "otpauth://totp/Issuer:user?secret=JBSWY3DPEHPK3PXP&issuer=Other"
+        )) == nil,
+        "OTP URI issuer must agree with the label issuer"
+    )
+    try expect(
+        (try? TOTPGenerator.parse(
+            "otpauth://totp/Issuer:user:extra?secret=JBSWY3DPEHPK3PXP&issuer=Issuer"
+        )) == nil,
+        "OTP URI label must contain at most one issuer/account separator"
+    )
+    try expect(
+        [
+            "otpauth://totp/Issuer:\u{FE0F}:user?secret=JBSWY3DPEHPK3PXP&issuer=Issuer",
+            "otpauth://totp/Issuer:\u{0301}:user?secret=JBSWY3DPEHPK3PXP&issuer=Issuer"
+        ].allSatisfy { (try? TOTPGenerator.parse($0)) == nil },
+        "OTP URI colon separators with variation or combining scalars must not evade separator counting"
+    )
+    try expect(
+        [
+            "otpauth://totp/Issuer:\u{FE0F}user?secret=JBSWY3DPEHPK3PXP&issuer=Other",
+            "otpauth://totp/Issuer:\u{0301}user?secret=JBSWY3DPEHPK3PXP&issuer=Other"
+        ].allSatisfy { (try? TOTPGenerator.parse($0)) == nil },
+        "OTP URI scalar separators followed by variation or combining marks must still bind the label issuer"
+    )
+    let boundarySeed = Data("12345678901234567890".utf8)
+    let beforeBoundary = try TOTPGenerator.code(
+        seed: boundarySeed, algorithm: "SHA1", digits: 6, period: 30, date: Date(timeIntervalSince1970: 29.999)
+    )
+    let atBoundary = try TOTPGenerator.code(
+        seed: boundarySeed, algorithm: "SHA1", digits: 6, period: 30, date: Date(timeIntervalSince1970: 30)
+    )
+    try expect(beforeBoundary != atBoundary, "OTP must advance exactly at the configured period boundary")
+    try expect(
+        (try? TOTPGenerator.code(
+            seed: boundarySeed, algorithm: "SHA1", digits: 6, period: 30,
+            date: Date(timeIntervalSince1970: -1)
+        )) == nil,
+        "OTP must reject time before the Unix epoch"
+    )
+
+    for _ in 0 ..< 200 {
+        let generated = try PasswordGenerator.generate(PasswordGenerationOptions(
+            length: 32, includeDigits: true, includeSymbols: true, excluded: Set("0O1l")
+        ))
+        try expect(generated.count == 32, "generated passwords must preserve requested length")
+        try expect(generated.allSatisfy { !Set("0O1l").contains($0) }, "excluded characters must not occur")
+        try expect(generated.contains(where: \.isNumber), "generated passwords must contain a digit")
+        try expect(
+            generated.contains { "!@#$%^&*()-_=+[]{}:,.?".contains($0) },
+            "generated passwords must contain a symbol"
+        )
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("macop-native-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let config = """
+    {
+      "version": 2,
+      "items": {
+        "Local/Login": {
+          "provider": "keychain-managed", "service": "login-secret", "account": "expected-user",
+          "fields": ["token"],
+          "otp": {
+            "service": "otp-seed", "account": "expected-user", "algorithm": "SHA1", "digits": 8,
+            "period": 30, "label": "Issuer:expected-user", "issuer": "Issuer"
+          }
+        }
+      },
+      "profiles": {
+        "demo": { "executable": "/usr/bin/printenv", "environment": { "PROFILE_SECRET": "op://Local/Login/password" } }
+      },
+      "ssh_hosts": {
+        "demo-host": { "hostname": "example.com", "user": "git", "port": 2222, "identity": "github" }
+      }
+    }
+    """
+    let configURL = directory.appendingPathComponent("config.json")
+    try config.data(using: .utf8)!.write(to: configURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+    let purposeClient = RecordingPurposeClient(.success(Data("purpose-secret".utf8)))
+    let purposeApp = MacopApp(keychainClient: purposeClient)
+    let purposeReference = "op://Local/Login/password"
+    let purposeResults = [
+        purposeApp.run(
+            argv: ["macop", "--config", directory.path, "read", purposeReference], env: [:]
+        ),
+        purposeApp.run(
+            argv: ["macop", "--config", directory.path, "run", "--", "/usr/bin/true"],
+            env: ["PURPOSE_SECRET": purposeReference]
+        ),
+        purposeApp.run(
+            argv: ["macop", "--config", directory.path, "inject"],
+            env: [:], input: Data(purposeReference.utf8)
+        ),
+        purposeApp.run(
+            argv: [
+                "macop", "--config", directory.path, "profile", "run", "demo", "--",
+                "/usr/bin/printenv", "PROFILE_SECRET"
+            ],
+            env: [:]
+        ),
+        purposeApp.run(
+            argv: [
+                "macop", "--config", directory.path, "item", "get", "Login", "--fields",
+                "label=password", "--reveal"
+            ],
+            env: [:]
+        ),
+        purposeApp.run(
+            argv: ["macop", "--config", directory.path, "item", "acquire", "Login"], env: [:]
+        )
+    ]
+    try expect(
+        purposeResults.allSatisfy { $0.exitCode == 0 },
+        "every managed password caller-purpose fixture must complete"
+    )
+    try expect(
+        purposeClient.presentations == [
+            .readPassword, .runPassword, .injectPassword, .profilePassword,
+            .itemGetPassword, .itemAcquirePassword
+        ],
+        "read/run/inject/profile/item get/item acquire must bind distinct closed managed-password purposes"
+    )
+    let passwordClient = RecordingKeychainClient(.success(Data("pair-password".utf8)))
+    let app = MacopApp(keychainClient: passwordClient)
+    let username = app.run(
+        argv: ["macop", "--config", directory.path, "read", "op://Local/Login/username"], env: [:]
+    )
+    try expect(
+        username.stdout == "expected-user\n",
+        "username field must resolve from account metadata (exit \(username.exitCode): \(username.stderr))"
+    )
+    try expect(passwordClient.queries.isEmpty, "username field must not read secret data")
+    let itemUsername = app.run(
+        argv: ["macop", "--config", directory.path, "item", "get", "Login", "--fields", "label=username"],
+        env: [:]
+    )
+    try expect(
+        itemUsername.stdout.contains("expected-user") && passwordClient.queries.isEmpty,
+        "item get must expose username metadata without a secret read"
+    )
+    let password = app.run(
+        argv: ["macop", "--config", directory.path, "read", "op://Local/Login/password"], env: [:]
+    )
+    let token = app.run(
+        argv: ["macop", "--config", directory.path, "read", "op://Local/Login/token"], env: [:]
+    )
+    try expect(
+        password.stdout == "pair-password\n" && token.stdout == password.stdout,
+        "password and legacy token must resolve the secret"
+    )
+    let unknownField = app.run(
+        argv: ["macop", "--config", directory.path, "read", "op://Local/Login/not-configured"], env: [:]
+    )
+    try expect(unknownField.exitCode == ExitCode.notFound.rawValue, "unknown credential fields must fail closed")
+
+    let v1Config = """
+    {
+      "version": 1,
+      "items": {
+        "Local/Legacy": {
+          "provider": "keychain-generic", "service": "legacy", "account": "metadata-account",
+          "fields": ["username", "password"]
+        }
+      }
+    }
+    """
+    try v1Config.data(using: .utf8)!.write(to: configURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+    let legacyClient = RecordingKeychainClient(.success(Data("legacy-secret".utf8)))
+    let legacyUsername = MacopApp(keychainClient: legacyClient).run(
+        argv: ["macop", "--config", directory.path, "read", "op://Local/Legacy/username"], env: [:]
+    )
+    try expect(
+        legacyUsername.stdout == "legacy-secret\n" && legacyClient.queries.count == 1,
+        "genuine config v1 username fields must preserve their legacy secret semantics"
+    )
+
+    let v1ExpandedConfig = """
+    { "version": 1, "items": {
+      "Local/Legacy": {
+        "provider": "keychain-generic", "service": "legacy", "account": "account",
+        "otp": { "service": "otp", "account": "account", "algorithm": "SHA1", "digits": 6, "period": 30 }
+      }
+    } }
+    """
+    try v1ExpandedConfig.data(using: .utf8)!.write(to: configURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+    try expect(
+        MacopApp().run(
+            argv: ["macop", "--config", directory.path, "config", "validate"], env: [:]
+        ).exitCode == ExitCode.invalidArguments.rawValue,
+        "config v1 must reject v2-only OTP schema rather than reinterpret it"
+    )
+
+    let collidingOTPConfig = """
+    { "version": 2, "items": {
+      "Local/One": {
+        "provider": "keychain-managed", "service": "same", "account": "same",
+        "otp": { "service": "same", "account": "same", "algorithm": "SHA1", "digits": 6, "period": 30 }
+      }
+    } }
+    """
+    try collidingOTPConfig.data(using: .utf8)!.write(to: configURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+    try expect(
+        MacopApp().run(
+            argv: ["macop", "--config", directory.path, "config", "validate"], env: [:]
+        ).exitCode == ExitCode.invalidArguments.rawValue,
+        "OTP and password selectors must never alias"
+    )
+
+    let crossItemOTPConfig = """
+    { "version": 2, "items": {
+      "Local/One": {
+        "provider": "keychain-generic", "service": "one", "account": "one",
+        "otp": { "service": "shared-otp", "account": "same", "algorithm": "SHA1", "digits": 6, "period": 30 }
+      },
+      "Local/Two": {
+        "provider": "keychain-internet", "server": "two.invalid", "account": "two",
+        "otp": { "service": "shared-otp", "account": "same", "algorithm": "SHA1", "digits": 6, "period": 30 }
+      }
+    } }
+    """
+    try crossItemOTPConfig.data(using: .utf8)!.write(to: configURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+    try expect(
+        MacopApp().run(
+            argv: ["macop", "--config", directory.path, "config", "validate"], env: [:]
+        ).exitCode == ExitCode.invalidArguments.rawValue,
+        "OTP selectors must be unique across items"
+    )
+
+    let injectedIdentityConfig = """
+    { "version": 2, "items": {}, "ssh_hosts": {
+      "unsafe": { "hostname": "example.com", "identity": "github\\nProxyCommand unsafe" }
+    } }
+    """
+    try injectedIdentityConfig.data(using: .utf8)!.write(to: configURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+    try expect(
+        MacopApp().run(
+            argv: ["macop", "--config", directory.path, "ssh", "host-config"], env: [:]
+        ).exitCode == ExitCode.invalidArguments.rawValue,
+        "SSH identities containing line breaks must fail before config rendering"
+    )
+    for (label, description) in [
+        (" github", "surrounding whitespace"),
+        (String(repeating: "x", count: 129), "labels over 128 UTF-8 bytes"),
+        ("git\u{200D}hub", "Unicode format characters")
+    ] {
+        let unsafeHostObject: [String: Any] = [
+            "version": 2,
+            "items": [:],
+            "ssh_hosts": [
+                "unsafe": ["hostname": "example.com", "identity": label]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: unsafeHostObject).write(to: configURL, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+        let validate = MacopApp().run(
+            argv: ["macop", "--config", directory.path, "config", "validate"], env: [:]
+        )
+        let connect = MacopApp(commandExecutor: RecordingSSHExecutor(identityAlreadyExists: true)).run(
+            argv: ["macop", "--config", directory.path, "ssh", "connect", "unsafe"], env: [:]
+        )
+        try expect(
+            validate.exitCode == ExitCode.invalidArguments.rawValue
+                && connect.exitCode == ExitCode.invalidArguments.rawValue,
+            "config validate and ssh connect must both reject \(description)"
+        )
+    }
+    try config.data(using: .utf8)!.write(to: configURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+
+    let otpClient = RecordingKeychainClient(.success(boundarySeed))
+    let otpPasswordClient = RecordingKeychainClient(.failure(KeychainFailure(errSecItemNotFound)))
+    let otpFallback = RecordingPasswordAutoFillProvider()
+    let otpApp = MacopApp(
+        keychainClient: otpPasswordClient,
+        otpSeedClient: otpClient,
+        passwordAutoFillProvider: otpFallback
+    )
+    let otp = otpApp.run(
+        argv: ["macop", "--config", directory.path, "read", "op://Local/Login/password?attribute=otp"], env: [:]
+    )
+    try expect(
+        otp.exitCode == 0 && otp.stdout.trimmingCharacters(in: .whitespacesAndNewlines).count == 8,
+        "OTP query must resolve current code"
+    )
+    try expect(
+        otpClient.queries == [.managed(service: "otp-seed", account: "expected-user")],
+        "OTP must use its separate managed Keychain selector"
+    )
+    try expect(
+        otpPasswordClient.queries.isEmpty && otpFallback.requests.isEmpty,
+        "OTP reads must never route through password Keychain or Passwords AutoFill fallback"
+    )
+
+    let missingOTPClient = RecordingKeychainClient(.failure(KeychainFailure(errSecItemNotFound)))
+    let missingOTPFallback = RecordingPasswordAutoFillProvider()
+    let missingOTP = MacopApp(
+        keychainClient: RecordingKeychainClient(.failure(KeychainFailure(errSecItemNotFound))),
+        otpSeedClient: missingOTPClient,
+        passwordAutoFillProvider: missingOTPFallback
+    ).run(
+        argv: ["macop", "--config", directory.path, "read", "op://Local/Login/password?attribute=otp"],
+        env: [:]
+    )
+    try expect(
+        missingOTP.exitCode == ExitCode.notFound.rawValue && missingOTPFallback.requests.isEmpty,
+        "missing OTP seeds must fail without opening Passwords AutoFill"
+    )
+
+    let mismatch = MacopApp(
+        keychainClient: RecordingKeychainClient(.failure(KeychainFailure(errSecItemNotFound))),
+        passwordAutoFillProvider: MismatchingPasswordAutoFillProvider()
+    ).run(argv: ["macop", "--config", directory.path, "item", "acquire", "Login"], env: [:])
+    try expect(mismatch.exitCode == ExitCode.denied.rawValue, "AutoFill username mismatch must fail closed")
+    try expect(
+        !mismatch.stdout.contains("never-return-this") && !mismatch.stderr.contains("never-return-this"),
+        "mismatched credential must not be exposed"
+    )
+
+    let mutator = RecordingKeychainMutator()
+    let generatedImporter = RecordingManagedKeychainImporter()
+    let generateApp = MacopApp(managedKeychainImporter: generatedImporter, keychainMutator: mutator)
+    let generate = generateApp.run(
+        argv: ["macop", "--config", directory.path, "item", "generate", "Login", "--length", "40"], env: [:]
+    )
+    try expect(
+        generate.exitCode == 0 && mutator.creates.isEmpty
+            && generatedImporter.generatedImports.first?.secret.count == 40,
+        "managed generation must save directly through companion authorization without stdout exposure"
+    )
+    let rotate = generateApp.run(
+        argv: [
+            "macop", "--config", directory.path, "item", "generate", "--replace", "Login", "--length", "44"
+        ],
+        env: [:]
+    )
+    try expect(
+        rotate.exitCode == 0 && generatedImporter.updates.count == 1
+            && generatedImporter.updates[0].secret.count == 44
+            && generatedImporter.generatedImports.count == 1,
+        "managed password rotation must use authenticated exact-item update without creating a duplicate"
+    )
+    let lostPasswordImportValue = "fixture-import-response-loss"
+    let lostPasswordImporter = RecordingManagedKeychainImporter(
+        importFailure: ManagedKeychainMutationFailure.responseLost
+    )
+    let lostPasswordImport = MacopApp(managedKeychainImporter: lostPasswordImporter).run(
+        argv: ["macop", "--config", directory.path, "item", "import", "Login"],
+        env: [:], input: Data(lostPasswordImportValue.utf8)
+    )
+    try expect(
+        lostPasswordImport.exitCode == ExitCode.runtimeError.rawValue
+            && lostPasswordImporter.imports.count == 1
+            && lostPasswordImport.stderr.contains("creation is indeterminate")
+            && lostPasswordImport.stderr.contains("broker response was lost")
+            && lostPasswordImport.stderr.contains("already-exists")
+            && !lostPasswordImport.stderr.contains(lostPasswordImportValue),
+        "managed import mutation-then-lost-response must provide secret-free create reconciliation"
+    )
+    let lostGeneratedImporter = RecordingManagedKeychainImporter(
+        updateFailure: ManagedKeychainMutationFailure.serverIndeterminate
+    )
+    let lostGeneratedRotation = MacopApp(managedKeychainImporter: lostGeneratedImporter).run(
+        argv: [
+            "macop", "--config", directory.path, "item", "generate", "--replace", "Login",
+            "--length", "43"
+        ],
+        env: [:]
+    )
+    let lostGeneratedValue = lostGeneratedImporter.updates.first
+        .flatMap { String(data: $0.secret, encoding: .utf8) } ?? ""
+    try expect(
+        lostGeneratedRotation.exitCode == ExitCode.runtimeError.rawValue
+            && lostGeneratedImporter.updates.count == 1
+            && !lostGeneratedValue.isEmpty
+            && lostGeneratedRotation.stderr.contains("rotation is indeterminate")
+            && lostGeneratedRotation.stderr.contains("companion returned")
+            && lostGeneratedRotation.stderr.contains("successful retry establishes")
+            && !lostGeneratedRotation.stderr.contains(lostGeneratedValue)
+            && !lostGeneratedRotation.stdout.contains(lostGeneratedValue),
+        "managed generated rotation response loss must never expose the generated value and must give safe retry guidance"
+    )
+    let lostGeneratedCreateImporter = RecordingManagedKeychainImporter(
+        importFailure: ManagedKeychainMutationFailure.responseLost
+    )
+    let lostGeneratedCreate = MacopApp(managedKeychainImporter: lostGeneratedCreateImporter).run(
+        argv: [
+            "macop", "--config", directory.path, "item", "generate", "Login", "--length", "42"
+        ],
+        env: [:]
+    )
+    let lostGeneratedCreateValue = lostGeneratedCreateImporter.generatedImports.first
+        .flatMap { String(data: $0.secret, encoding: .utf8) } ?? ""
+    try expect(
+        lostGeneratedCreate.exitCode == ExitCode.runtimeError.rawValue
+            && lostGeneratedCreate.stderr.contains("creation is indeterminate")
+            && lostGeneratedCreate.stderr.contains("broker response was lost")
+            && !lostGeneratedCreateValue.isEmpty
+            && !lostGeneratedCreate.stderr.contains(lostGeneratedCreateValue),
+        "managed generated creation must distinguish transport response loss without exposing generated data"
+    )
+
+    let otpImporter = RecordingManagedKeychainImporter()
+    let otpDeleter = RecordingManagedKeychainDeleter()
+    let otpLifecycleApp = MacopApp(
+        otpSeedClient: otpClient,
+        managedKeychainImporter: otpImporter,
+        managedKeychainDeleter: otpDeleter
+    )
+    let otpURI = "otpauth://totp/Issuer:expected-user?secret=JBSWY3DPEHPK3PXP&issuer=Issuer&digits=8&period=30"
+    let lostOTPImportImporter = RecordingManagedKeychainImporter(
+        importFailure: ManagedKeychainMutationFailure.serverIndeterminate
+    )
+    let lostOTPImport = MacopApp(managedKeychainImporter: lostOTPImportImporter).run(
+        argv: ["macop", "--config", directory.path, "item", "otp", "import", "Login"],
+        env: [:], input: Data(otpURI.utf8)
+    )
+    try expect(
+        lostOTPImport.exitCode == ExitCode.runtimeError.rawValue
+            && lostOTPImportImporter.imports.count == 1
+            && lostOTPImport.stderr.contains("creation is indeterminate")
+            && lostOTPImport.stderr.contains("companion returned")
+            && lostOTPImport.stderr.contains("already-exists")
+            && !lostOTPImport.stderr.contains("JBSWY3DPEHPK3PXP"),
+        "OTP import response loss must provide secret-free create reconciliation"
+    )
+    let lostOTPEditImporter = RecordingManagedKeychainImporter(
+        updateFailure: ManagedKeychainMutationFailure.responseLost
+    )
+    let lostOTPEdit = MacopApp(managedKeychainImporter: lostOTPEditImporter).run(
+        argv: ["macop", "--config", directory.path, "item", "otp", "edit", "Login"],
+        env: [:], input: Data(otpURI.utf8)
+    )
+    try expect(
+        lostOTPEdit.exitCode == ExitCode.runtimeError.rawValue
+            && lostOTPEditImporter.updates.count == 1
+            && lostOTPEdit.stderr.contains("update is indeterminate")
+            && lostOTPEdit.stderr.contains("broker response was lost")
+            && lostOTPEdit.stderr.contains("safe to repeat")
+            && !lostOTPEdit.stderr.contains("JBSWY3DPEHPK3PXP"),
+        "OTP edit response loss must provide secret-free idempotent update reconciliation"
+    )
+    let otpImport = otpLifecycleApp.run(
+        argv: ["macop", "--config", directory.path, "item", "otp", "import", "Login"],
+        env: [:], input: Data(otpURI.utf8)
+    )
+    let otpEdit = otpLifecycleApp.run(
+        argv: ["macop", "--config", directory.path, "item", "otp", "edit", "Login"],
+        env: [:], input: Data(otpURI.utf8)
+    )
+    let otpDelete = otpLifecycleApp.run(
+        argv: ["macop", "--config", directory.path, "item", "otp", "delete", "Login"], env: [:]
+    )
+    try expect(
+        otpImport.exitCode == 0 && otpEdit.exitCode == 0 && otpDelete.exitCode == 0
+            && otpImporter.imports.count == 1 && otpImporter.updates.count == 1
+            && otpDeleter.deletes.last?.service == "otp-seed"
+            && otpDeleter.deletes.last?.purpose == .otpSeed,
+        "OTP lifecycle must expose distinct authenticated create, exact update, and delete operations"
+    )
+    let lostStandaloneOTPDeleter = RecordingManagedKeychainDeleter(deleteFailures: [
+        ManagedKeychainDeletionFailure.indeterminate
+    ])
+    let lostStandaloneOTPDelete = MacopApp(managedKeychainDeleter: lostStandaloneOTPDeleter).run(
+        argv: ["macop", "--config", directory.path, "item", "otp", "delete", "Login"], env: [:]
+    )
+    try expect(
+        lostStandaloneOTPDelete.exitCode == ExitCode.runtimeError.rawValue
+            && lostStandaloneOTPDeleter.deletes.count == 1
+            && lostStandaloneOTPDelete.stderr.contains("indeterminate")
+            && lostStandaloneOTPDelete.stderr.contains("success or not-found")
+            && !lostStandaloneOTPDelete.stderr.contains("Issuer:expected-user"),
+        "standalone OTP mutation-then-lost-response must give secret-free idempotent reconciliation guidance"
+    )
+    let lostBulkDeleteDeleter = RecordingManagedKeychainDeleter(
+        deleteAllFailure: ManagedKeychainDeletionFailure.indeterminate
+    )
+    let lostBulkDelete = MacopApp(managedKeychainDeleter: lostBulkDeleteDeleter).run(
+        argv: ["macop", "--config", directory.path, "item", "delete", "--all-managed"], env: [:]
+    )
+    try expect(
+        lostBulkDelete.exitCode == ExitCode.runtimeError.rawValue
+            && lostBulkDeleteDeleter.deleteAllCount == 1
+            && lostBulkDelete.stderr.contains("indeterminate")
+            && lostBulkDelete.stderr.contains("Retry item delete --all-managed")
+            && lostBulkDelete.stderr.contains("No secret value is needed"),
+        "bulk mutation-then-lost-response must give secret-free idempotent reconciliation guidance"
+    )
+    try expect(
+        ManagedKeychainReadPresentation.readOTP.brokerPurpose == .otpRead
+            && ManagedKeychainReadPresentation.runOTP.brokerPurpose == .otpRun
+            && ManagedKeychainReadPresentation.injectOTP.brokerPurpose == .otpInject
+            && ManagedKeychainReadPresentation.profileOTP.brokerPurpose == .otpProfile
+            && ManagedKeychainReadPresentation.itemOTP.brokerPurpose == .otpItem
+            && ManagedKeychainDeletePurpose.otpSeed.brokerPurpose == .otpDelete,
+        "bounded OTP presentations must attest each real command purpose to the native UI"
+    )
+    let mismatchedOTPURI = "otpauth://totp/Other:expected-user?secret=JBSWY3DPEHPK3PXP&issuer=Other&digits=8&period=30"
+    let rejectedOTPImport = otpLifecycleApp.run(
+        argv: ["macop", "--config", directory.path, "item", "otp", "import", "Login"],
+        env: [:], input: Data(mismatchedOTPURI.utf8)
+    )
+    try expect(
+        rejectedOTPImport.exitCode == ExitCode.invalidArguments.rawValue && otpImporter.imports.count == 1,
+        "OTP URI label and issuer must exactly match configured metadata before broker access"
+    )
+    let deleteItemWithOTP = otpLifecycleApp.run(
+        argv: ["macop", "--config", directory.path, "item", "delete", "Login"], env: [:]
+    )
+    try expect(
+        deleteItemWithOTP.exitCode == 0 && otpDeleter.deletes.suffix(2).map(\.service) == [
+            "login-secret", "otp-seed"
+        ] && otpDeleter.deletes.suffix(2).map(\.purpose) == [.item, .otpSeed],
+        "deleting a configured item must delete its primary before its independent OTP seed"
+    )
+
+    let primaryFailureDeleter = RecordingManagedKeychainDeleter(deleteFailures: [
+        CLIError.denied(message: "fixture primary denial")
+    ])
+    let primaryFailure = MacopApp(managedKeychainDeleter: primaryFailureDeleter).run(
+        argv: ["macop", "--config", directory.path, "item", "delete", "Login"], env: [:]
+    )
+    try expect(
+        primaryFailure.exitCode == ExitCode.denied.rawValue
+            && primaryFailureDeleter.deletes.map(\.service) == ["login-secret"],
+        "primary managed deletion failure must preserve the OTP seed without requesting its deletion"
+    )
+
+    let lostPrimaryResponseDeleter = RecordingManagedKeychainDeleter(deleteFailures: [
+        ManagedKeychainDeletionFailure.indeterminate
+    ])
+    let lostPrimaryResponse = MacopApp(managedKeychainDeleter: lostPrimaryResponseDeleter).run(
+        argv: ["macop", "--config", directory.path, "item", "delete", "Login"], env: [:]
+    )
+    try expect(
+        lostPrimaryResponse.exitCode == ExitCode.runtimeError.rawValue
+            && lostPrimaryResponseDeleter.deletes.map(\.service) == ["login-secret"]
+            && lostPrimaryResponse.stderr.contains("indeterminate")
+            && !lostPrimaryResponse.stderr.contains("primary Keychain item was deleted"),
+        "a mutation-then-lost primary response must report indeterminate state without touching OTP or claiming preservation"
+    )
+
+    let partialFailureDeleter = RecordingManagedKeychainDeleter(deleteFailures: [
+        nil, CLIError.denied(message: "fixture OTP denial")
+    ])
+    let partialFailure = MacopApp(managedKeychainDeleter: partialFailureDeleter).run(
+        argv: ["macop", "--config", directory.path, "item", "delete", "Login"], env: [:]
+    )
+    try expect(
+        partialFailure.exitCode == ExitCode.runtimeError.rawValue
+            && partialFailureDeleter.deletes.map(\.service) == ["login-secret", "otp-seed"]
+            && partialFailure.stderr.contains("primary Keychain item was deleted")
+            && partialFailure.stderr.contains("same configured item")
+            && !partialFailure.stderr.contains("Login"),
+        "secondary OTP deletion failure must report the unavoidable partial state without unsafe shell interpolation"
+    )
+
+    let nonCLIOTPFailureDeleter = RecordingManagedKeychainDeleter(deleteFailures: [
+        nil, FixtureTransportFailure()
+    ])
+    let nonCLIOTPFailure = MacopApp(managedKeychainDeleter: nonCLIOTPFailureDeleter).run(
+        argv: ["macop", "--config", directory.path, "item", "delete", "Login"], env: [:]
+    )
+    try expect(
+        nonCLIOTPFailure.exitCode == ExitCode.runtimeError.rawValue
+            && nonCLIOTPFailureDeleter.deletes.map(\.service) == ["login-secret", "otp-seed"]
+            && nonCLIOTPFailure.stderr.contains("OTP seed deletion could not be confirmed")
+            && nonCLIOTPFailure.stderr.contains("may remain"),
+        "non-CLI OTP failures must retain an explicit primary-deleted and OTP-indeterminate recovery diagnostic"
+    )
+
+    let legacyOTPConfig = """
+    { "version": 2, "items": {
+      "Local/LegacyOTP": {
+        "provider": "keychain-internet", "server": "legacy.invalid", "account": "user",
+        "otp": { "service": "legacy-otp", "account": "user", "algorithm": "SHA1", "digits": 6, "period": 30 }
+      }
+    } }
+    """
+    try legacyOTPConfig.data(using: .utf8)!.write(to: configURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+    let untouchedOTPDeleter = RecordingManagedKeychainDeleter()
+    let ambiguousLegacyDelete = MacopApp(
+        managedKeychainDeleter: untouchedOTPDeleter,
+        keychainMutator: RecordingKeychainMutator(deleteFailure: .invalidArguments(
+            message: "fixture ambiguous selector"
+        ))
+    ).run(
+        argv: ["macop", "--config", directory.path, "item", "delete", "LegacyOTP"], env: [:]
+    )
+    try expect(
+        ambiguousLegacyDelete.exitCode == ExitCode.invalidArguments.rawValue
+            && untouchedOTPDeleter.deletes.isEmpty,
+        "missing or ambiguous legacy primary selection must not delete the OTP seed"
+    )
+    try config.data(using: .utf8)!.write(to: configURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+
+    let profile = app.run(
+        argv: [
+            "macop",
+            "--config",
+            directory.path,
+            "profile",
+            "run",
+            "demo",
+            "--",
+            "/usr/bin/printenv",
+            "PROFILE_SECRET"
+        ],
+        env: [:]
+    )
+    try expect(
+        profile.exitCode == 0 && !profile.stdout.contains("pair-password"),
+        "profile output must redact injected credentials"
+    )
+    let wrongExecutable = app.run(
+        argv: ["macop", "--config", directory.path, "profile", "run", "demo", "--", "/bin/echo"], env: [:]
+    )
+    try expect(wrongExecutable.exitCode == ExitCode.denied.rawValue, "profile must reject a different executable")
+    let extraReference = app.run(
+        argv: ["macop", "--config", directory.path, "profile", "run", "demo", "--", "/usr/bin/printenv"],
+        env: ["UNDECLARED_SECRET": "op://Local/Login/password"]
+    )
+    try expect(
+        extraReference.exitCode == ExitCode.denied.rawValue,
+        "profile must reject undeclared ambient secret references"
+    )
+    let wrapper = app.run(
+        argv: ["macop", "--config", directory.path, "profile", "shell-init", "demo", "zsh"], env: [:]
+    )
+    try expect(
+        wrapper.stdout.contains("macop --config") && wrapper.stdout.contains("profile run")
+            && wrapper.stdout.contains("/usr/bin/printenv"),
+        "profile wrapper must preserve custom config and exact executable"
+    )
+    let quotedConfigDirectory = directory.appendingPathComponent("quoted ' config; false", isDirectory: true)
+    try FileManager.default.createDirectory(at: quotedConfigDirectory, withIntermediateDirectories: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: quotedConfigDirectory.path)
+    let quotedConfigURL = quotedConfigDirectory.appendingPathComponent("config.json")
+    try config.data(using: .utf8)!.write(to: quotedConfigURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: quotedConfigURL.path)
+    let quotedWrapper = app.run(
+        argv: [
+            "macop", "--config", quotedConfigDirectory.path, "profile", "shell-init", "demo", "zsh"
+        ],
+        env: [:]
+    )
+    let shimDirectory = directory.appendingPathComponent("profile-wrapper-shim", isDirectory: true)
+    try FileManager.default.createDirectory(at: shimDirectory, withIntermediateDirectories: true)
+    let shimURL = shimDirectory.appendingPathComponent("macop")
+    try Data("#!/bin/sh\nfor arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n".utf8).write(to: shimURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: shimURL.path)
+    let wrapperProcess = Process()
+    let wrapperOutput = Pipe()
+    let wrapperError = Pipe()
+    wrapperProcess.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    wrapperProcess.arguments = [
+        "-c",
+        quotedWrapper.stdout + "\nPATH='\(shimDirectory.path)'; rehash; macop_demo 'argument with spaces'\n"
+    ]
+    wrapperProcess.environment = ["PATH": shimDirectory.path]
+    wrapperProcess.standardOutput = wrapperOutput
+    wrapperProcess.standardError = wrapperError
+    try wrapperProcess.run()
+    wrapperProcess.waitUntilExit()
+    let wrapperInvocation = String(
+        data: wrapperOutput.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
+    ) ?? ""
+    let wrapperFailure = String(
+        data: wrapperError.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
+    ) ?? ""
+    try expect(
+        wrapperProcess.terminationStatus == 0
+            && wrapperInvocation.contains("<--config>\n<\(quotedConfigDirectory.path)>\n<profile>\n<run>\n<demo>")
+            && wrapperInvocation.contains("<argument with spaces>")
+            && !wrapperInvocation.contains("<false>")
+            && wrapperFailure.isEmpty,
+        "executed wrapper must retain quoted custom config as one argument without shell injection"
+    )
+
+    let scalarInjection = "'\u{0301}; printf PWNED; #"
+    let hostileExecutable = directory.appendingPathComponent("profile-tool-" + scalarInjection)
+    try Data("#!/bin/sh\nexit 0\n".utf8).write(to: hostileExecutable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hostileExecutable.path)
+    let scalarConfigDirectory = directory.appendingPathComponent(
+        "scalar-config-" + scalarInjection,
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: scalarConfigDirectory, withIntermediateDirectories: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scalarConfigDirectory.path)
+    guard var scalarConfigObject = try JSONSerialization.jsonObject(
+        with: Data(config.utf8)
+    ) as? [String: Any],
+        var scalarProfiles = scalarConfigObject["profiles"] as? [String: Any],
+        var scalarDemo = scalarProfiles["demo"] as? [String: Any]
+    else { throw SelftestFailure(message: "profile shell fixture config must be an object") }
+    scalarDemo["executable"] = hostileExecutable.path
+    scalarProfiles["demo"] = scalarDemo
+    scalarConfigObject["profiles"] = scalarProfiles
+    let scalarConfigURL = scalarConfigDirectory.appendingPathComponent("config.json")
+    try JSONSerialization.data(withJSONObject: scalarConfigObject).write(to: scalarConfigURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: scalarConfigURL.path)
+    let hostileRuntimeArgument = "runtime-" + scalarInjection
+    for (shell, executable) in [("zsh", "/bin/zsh"), ("bash", "/bin/bash")] {
+        let hostileWrapper = app.run(
+            argv: [
+                "macop", "--config", scalarConfigDirectory.path,
+                "profile", "shell-init", "demo", shell
+            ],
+            env: [:]
+        )
+        let process = Process()
+        let output = Pipe()
+        let error = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = try [
+            "-c",
+            hostileWrapper.stdout
+                + "\nPATH="
+                + (ProfileShellArgumentEncoder.quote(shimDirectory.path, shell: shell))
+                + "; export PATH; hash -r; macop_demo "
+                + (ProfileShellArgumentEncoder.quote(hostileRuntimeArgument, shell: shell))
+                + "\n"
+        ]
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        process.waitUntilExit()
+        let invocation = String(
+            data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
+        ) ?? ""
+        let failure = error.fileHandleForReading.readDataToEndOfFile()
+        let failureDescription = String(data: failure, encoding: .utf8)?.debugDescription ?? "non-UTF8"
+        let expectedInvocation = [
+            "--config", scalarConfigDirectory.path, "profile", "run", "demo", "--",
+            hostileExecutable.path, hostileRuntimeArgument
+        ].map { "<\($0)>" }.joined(separator: "\n") + "\n"
+        try expect(
+            hostileWrapper.exitCode == 0
+                && process.terminationStatus == 0
+                && invocation == expectedInvocation
+                && !invocation.split(separator: "\n").contains("PWNED")
+                && failure.isEmpty,
+            "\(shell) wrapper must escape literal apostrophe scalars inside combining graphemes "
+                + "(wrapper=\(hostileWrapper.exitCode), process=\(process.terminationStatus), "
+                + "stdout=\(invocation.debugDescription), expected=\(expectedInvocation.debugDescription), "
+                + "stderr=\(failureDescription))"
+        )
+    }
+
+    let fishQuoteFixtures = [
+        "back\\slash",
+        "apostrophe's",
+        "terminal\\",
+        "combined\\'$(false); echo injected\\",
+        "'\u{0301}; printf PWNED; #"
+    ]
+    for fixture in fishQuoteFixtures {
+        let encoded = try ProfileShellArgumentEncoder.quote(fixture, shell: "fish")
+        let decoded = try decodeFishSingleQuotedArgument(encoded)
+        try expect(
+            decoded == fixture,
+            "fish argument encoding must round-trip backslashes, apostrophes, and shell syntax"
+        )
+    }
+    let fishConfigDirectory = directory.appendingPathComponent(
+        "fish\\'$(false); echo injected\\",
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: fishConfigDirectory, withIntermediateDirectories: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fishConfigDirectory.path)
+    let fishConfigURL = fishConfigDirectory.appendingPathComponent("config.json")
+    try config.data(using: .utf8)!.write(to: fishConfigURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fishConfigURL.path)
+    let fishWrapper = app.run(
+        argv: ["macop", "--config", fishConfigDirectory.path, "profile", "shell-init", "demo", "fish"],
+        env: [:]
+    )
+    let encodedFishConfig = try ProfileShellArgumentEncoder.quote(fishConfigDirectory.path, shell: "fish")
+    let decodedFishConfig = try decodeFishSingleQuotedArgument(encodedFishConfig)
+    try expect(
+        fishWrapper.exitCode == 0
+            && fishWrapper.stdout.contains("--config \(encodedFishConfig) profile run")
+            && decodedFishConfig == fishConfigDirectory.path,
+        "generated fish wrappers must preserve adversarial custom config paths as one literal argument"
+    )
+    let arbitraryFishDirectory = directory.appendingPathComponent("nix-style-profile/bin", isDirectory: true)
+    try FileManager.default.createDirectory(at: arbitraryFishDirectory, withIntermediateDirectories: true)
+    let arbitraryFishExecutable = arbitraryFishDirectory.appendingPathComponent("fish")
+    try Data("#!/bin/sh\nexit 0\n".utf8).write(to: arbitraryFishExecutable)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o700],
+        ofItemAtPath: arbitraryFishExecutable.path
+    )
+    try expect(
+        safeExecutableOnPATH(
+            named: "fish",
+            environment: ["PATH": "/relative:\(arbitraryFishDirectory.path):/opt/local/bin"]
+        ) == arbitraryFishExecutable.path,
+        "fish detection must safely honor arbitrary absolute PATH entries such as Nix or MacPorts profiles"
+    )
+    let scalarFishWrapper = app.run(
+        argv: [
+            "macop", "--config", scalarConfigDirectory.path,
+            "profile", "shell-init", "demo", "fish"
+        ],
+        env: [:]
+    )
+    if let fishExecutable = safeExecutableOnPATH(
+        named: "fish",
+        environment: ProcessInfo.processInfo.environment
+    ) {
+        let fishProcess = Process()
+        let fishOutput = Pipe()
+        let fishError = Pipe()
+        fishProcess.executableURL = URL(fileURLWithPath: fishExecutable)
+        fishProcess.arguments = try [
+            "-c",
+            scalarFishWrapper.stdout
+                + "\nset -gx PATH "
+                + (ProfileShellArgumentEncoder.quote(shimDirectory.path, shell: "fish"))
+                + "; macop_demo "
+                + (ProfileShellArgumentEncoder.quote(hostileRuntimeArgument, shell: "fish"))
+                + "\n"
+        ]
+        fishProcess.standardOutput = fishOutput
+        fishProcess.standardError = fishError
+        try fishProcess.run()
+        fishProcess.waitUntilExit()
+        let invocation = String(
+            data: fishOutput.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
+        ) ?? ""
+        let failure = fishError.fileHandleForReading.readDataToEndOfFile()
+        let expectedInvocation = [
+            "--config", scalarConfigDirectory.path, "profile", "run", "demo", "--",
+            hostileExecutable.path, hostileRuntimeArgument
+        ].map { "<\($0)>" }.joined(separator: "\n") + "\n"
+        try expect(
+            scalarFishWrapper.exitCode == 0
+                && fishProcess.terminationStatus == 0
+                && invocation == expectedInvocation
+                && failure.isEmpty,
+            "fish must scalar-escape and execute the generated wrapper without changing arguments"
+        )
+    }
+
+    let sshExecutor = RecordingSSHExecutor(identityAlreadyExists: true)
+    let sshApp = MacopApp(commandExecutor: sshExecutor)
+    let connect = sshApp.run(
+        argv: ["macop", "--config", directory.path, "ssh", "connect", "demo-host"], env: [:]
+    )
+    try expect(connect.exitCode == 0, "SSH host alias must create a verified-session invocation")
+    let launch = sshExecutor.invocations.last
+    try expect(
+        launch?.arguments.contains("github") == true
+            && launch?.arguments.contains("git@example.com") == true
+            && launch?.arguments.contains("ForwardAgent=no") == true,
+        "SSH host routing must bind one identity, destination, and forwarding denial"
+    )
+    let hostConfig = sshApp.run(
+        argv: ["macop", "--config", directory.path, "ssh", "host-config", "demo-host"], env: [:]
+    )
+    try expect(
+        hostConfig.stdout.contains("HostName example.com") && hostConfig.stdout.contains("ForwardAgent no"),
+        "SSH fragment must contain public host metadata only"
+    )
 }
 
 if runHarnessIfRequested() == nil {
     do {
         try run()
+        try runKeychainNativeExtensions()
         print("selftest passed")
         exit(0)
     } catch let error as SelftestFailure {
