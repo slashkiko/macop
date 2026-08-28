@@ -6,13 +6,13 @@ enum ManagedItemLocator {
         named name: String,
         options: GlobalOptions
     ) throws -> (key: String, value: ConfigItem) {
-        let matches = try ConfigStore.items(configDirectory: options.configDirectory)
-            .filter {
-                $0.value.provider == "keychain-managed"
-                    && $0.key.split(separator: "/").last == Substring(name)
-            }
-        guard matches.count == 1, let item = matches.first,
-              item.value.service != nil, item.value.account != nil
+        let item = try ConfiguredKeychainItemLocator.item(
+            named: name,
+            options: options,
+            providers: ["keychain-managed"]
+        )
+        guard
+            item.value.service != nil, item.value.account != nil
         else { throw CLIError.notFound(message: "Configured managed item \"\(name)\" was not found.") }
         return item
     }

@@ -158,11 +158,7 @@ public enum ItemCommand {
             index += 1
         }
         guard let name else { throw CLIError.invalidArguments(message: "item get requires an item name.") }
-        let matches = try ConfigStore.items(configDirectory: options.configDirectory)
-            .filter { self.supported($0) && $0.key.split(separator: "/").last == Substring(name) }
-        guard matches.count == 1,
-              let item = matches.first
-        else { throw CLIError.notFound(message: "Configured item \"\(name)\" was not found.") }
+        let item = try ConfiguredKeychainItemLocator.item(named: name, options: options)
         let fields = item.value.fields ?? []
         let selected = field.map { [$0] } ?? fields
         let wellKnown = item.value.schemaVersion == 2

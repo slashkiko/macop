@@ -27,6 +27,7 @@ struct MacopAuthApplication: App {
 }
 
 @MainActor
+// swiftlint:disable:next type_body_length
 private final class AuthApprovalCoordinator: ObservableObject {
     private enum PasswordPoCError: Error {
         case accessControlUnavailable
@@ -37,7 +38,8 @@ private final class AuthApprovalCoordinator: ObservableObject {
         case pending(PendingApproval)
         case processing
         case completed(Completion)
-        case cancelled
+        case cancelled(String)
+        case denied(String)
         case failed(String)
     }
 
@@ -215,6 +217,21 @@ private final class AuthApprovalCoordinator: ObservableObject {
         self.state = .completed(Completion(message: message, isSuccess: isSuccess))
     }
 
+    func beginProcessing() {
+        self.state = .processing
+    }
+
+    func completeRejection(_ status: AuthBrokerApprovalStatus, message: String) {
+        switch status {
+        case .cancelled:
+            self.state = .cancelled(message)
+        case .denied:
+            self.state = .denied(message)
+        case .approved:
+            self.state = .completed(Completion(message: message, isSuccess: false))
+        }
+    }
+
     func terminateSoon(after delay: Duration = .milliseconds(250)) {
         Task {
             try? await Task.sleep(for: delay)
@@ -239,7 +256,11 @@ private final class AuthApprovalCoordinator: ObservableObject {
             nil
         }
         self.continuation = nil
-        self.state = status == .approved ? .processing : .cancelled
+        self.state = switch status {
+        case .approved: .processing
+        case .cancelled: .cancelled("キャンセルしました")
+        case .denied: .denied("許可されませんでした")
+        }
         continuation.resume(returning: ApprovalOutcome(
             status: status,
             context: context,
@@ -401,17 +422,28 @@ private enum AuthBrokerAppServer {
         var resultMessage = ""
         let isSigningRequest = request.operation == .sshSession || request.operation == .gitSSHSign
         if outcome.status == .approved, let context = outcome.context, isSigningRequest {
-            try self.validateRoot(request)
-            let candidate = try SSHCommand.makeVerifiedSessionSigner(
-                label: request.credentialLabel,
-                authenticationContext: context
-            )
-            guard constantTimeEqual(
-                Data(candidate.fingerprint.utf8),
-                Data(request.credentialFingerprint.utf8)
-            ) else { throw AgentProtocolError.denied }
-            signer = candidate
-            resultData = candidate.publicKeyBlob
+            do {
+                try self.validateRoot(request)
+                let candidate = try SSHCommand.makeVerifiedSessionSigner(
+                    label: request.credentialLabel,
+                    authenticationContext: context
+                )
+                guard constantTimeEqual(
+                    Data(candidate.fingerprint.utf8),
+                    Data(request.credentialFingerprint.utf8)
+                ) else { throw AgentProtocolError.denied }
+                signer = candidate
+                resultData = candidate.publicKeyBlob
+            } catch {
+                let presentation = SSHSigningEffectPresentation(
+                    operation: request.operation,
+                    outcome: .preparationFailed,
+                    delivery: .notAttempted
+                )
+                await coordinator.complete(presentation.message, isSuccess: false)
+                await coordinator.terminateSoon(after: .seconds(2))
+                return
+            }
         } else if outcome.status == .approved,
                   let context = outcome.context,
                   request.operation == .managedKeychainRead
@@ -472,15 +504,10 @@ private enum AuthBrokerAppServer {
         } else {
             signer = nil
         }
-        let completionMessage = if request.operation == .managedKeychainDelete {
-            resultStatus == errSecSuccess ? "Keychainから削除しました" : "Keychain項目の削除に失敗しました"
-        } else if request.operation == .managedKeychainUpdate {
-            "Keychain項目の更新を許可しました"
-        } else if request.operation == .gitSSHSign {
-            "Git SSH署名を許可しました"
-        } else {
-            "許可しました"
-        }
+        let completion = self.approvedCompletion(
+            operation: request.operation,
+            resultStatus: resultStatus
+        )
         do {
             try AuthBrokerSocketIO.writeMessage(.approvalResponse(AuthBrokerApprovalResponse(
                 requestID: request.requestID,
@@ -492,69 +519,182 @@ private enum AuthBrokerAppServer {
             )), to: client, timeout: 5)
         } catch {
             if request.operation == .passwordAutoFill {
-                if outcome.status == .approved,
-                   let saveStatus = PasswordAutoFillSaveStatus(rawValue: resultMessage)
-                // swiftlint:disable:next opening_brace
-                {
-                    let presentation = PasswordAutoFillCompletionPresentation(
-                        saveStatus: saveStatus,
-                        delivery: .unknown
-                    )
-                    await coordinator.complete(presentation.message, isSuccess: false)
+                if outcome.status == .approved {
+                    if let saveStatus = PasswordAutoFillSaveStatus(rawValue: resultMessage) {
+                        let presentation = PasswordAutoFillCompletionPresentation(
+                            saveStatus: saveStatus,
+                            delivery: .unknown
+                        )
+                        await coordinator.complete(presentation.message, isSuccess: false)
+                    } else {
+                        await coordinator.complete(
+                            "資格情報の承認結果と、要求元への結果通知を確認できません",
+                            isSuccess: false
+                        )
+                    }
                 } else {
                     let presentation = PasswordAutoFillRejectionPresentation(
                         status: outcome.status,
                         delivery: .unknown
                     )
-                    await coordinator.complete(presentation.message, isSuccess: false)
+                    await coordinator.completeRejection(
+                        outcome.status,
+                        message: presentation.message
+                    )
                 }
                 await coordinator.terminateSoon(after: .seconds(2))
                 return
             }
-            throw error
+            if outcome.status == .approved {
+                if request.operation == .managedKeychainImport || request.operation == .managedKeychainUpdate {
+                    let presentation = ManagedKeychainEffectPresentation(
+                        updating: request.operation == .managedKeychainUpdate,
+                        outcome: .notStarted,
+                        delivery: .notAttempted
+                    )
+                    await coordinator.complete(presentation.message, isSuccess: false)
+                } else if isSigningRequest {
+                    let presentation = SSHSigningEffectPresentation(
+                        operation: request.operation,
+                        outcome: .noSignatureRequested,
+                        delivery: .notAttempted
+                    )
+                    await coordinator.complete(presentation.message, isSuccess: false)
+                } else {
+                    await coordinator.complete(
+                        completion.message + "。要求元への結果通知は確認できません",
+                        isSuccess: false
+                    )
+                }
+            } else {
+                let presentation = PasswordAutoFillRejectionPresentation(
+                    status: outcome.status,
+                    delivery: .unknown
+                )
+                await coordinator.completeRejection(
+                    outcome.status,
+                    message: presentation.message
+                )
+            }
+            await coordinator.terminateSoon(after: .seconds(2))
+            return
         }
-        if request.operation == .passwordAutoFill {
-            if outcome.status == .approved,
-               let saveStatus = PasswordAutoFillSaveStatus(rawValue: resultMessage)
-            // swiftlint:disable:next opening_brace
-            {
+        switch AuthApprovalOrchestration.deliveredRoute(
+            operation: request.operation,
+            status: outcome.status,
+            hasSigner: signer != nil
+        ) {
+        case .passwordAutoFill:
+            if let saveStatus = PasswordAutoFillSaveStatus(rawValue: resultMessage) {
                 let presentation = PasswordAutoFillCompletionPresentation(
                     saveStatus: saveStatus,
                     delivery: .delivered
                 )
                 await coordinator.complete(presentation.message, isSuccess: presentation.isSuccess)
+            } else {
+                await coordinator.complete("資格情報の承認結果を確認できません", isSuccess: false)
             }
-        } else {
-            await coordinator.complete(completionMessage)
+        case .approvedPhaseTwo:
+            await coordinator.beginProcessing()
+        case .approvedImmediate:
+            await coordinator.complete(completion.message, isSuccess: completion.isSuccess)
+        case let .rejected(status):
+            let presentation = PasswordAutoFillRejectionPresentation(
+                status: status,
+                delivery: .delivered
+            )
+            await coordinator.completeRejection(
+                status,
+                message: presentation.message
+            )
         }
         if let signer {
-            try self.serveSigning(
+            await self.serveSigning(
                 client: client,
                 request: request,
-                signer: signer
+                signer: signer,
+                coordinator: coordinator
             )
+            await coordinator.terminateSoon(after: .seconds(2))
+            return
         } else if outcome.status == .approved,
                   let context = outcome.context,
                   request.operation == .managedKeychainImport || request.operation == .managedKeychainUpdate
         // swiftlint:disable:next opening_brace
         {
-            try self.serveManagedKeychainImport(client: client, request: request, context: context)
+            await self.serveManagedKeychainImport(
+                client: client,
+                request: request,
+                context: context,
+                coordinator: coordinator
+            )
+            await coordinator.terminateSoon(after: .seconds(2))
+            return
         }
         await coordinator.terminateSoon(
             after: request.operation == .passwordAutoFill ? .seconds(2) : .milliseconds(250)
         )
     }
 
+    private static func approvedCompletion(
+        operation: AuthBrokerOperation,
+        resultStatus: OSStatus
+    ) -> (message: String, isSuccess: Bool) {
+        guard resultStatus == errSecSuccess else {
+            let message = switch operation {
+            case .managedKeychainRead:
+                "Keychain項目を読み取れませんでした"
+            case .managedKeychainDelete:
+                "Keychain項目の削除に失敗しました"
+            default:
+                "許可後の処理に失敗しました"
+            }
+            return (message, false)
+        }
+        let message = switch operation {
+        case .sshSession, .sshSign:
+            "SSH鍵の使用を許可しました"
+        case .managedKeychainRead:
+            "Keychain項目を読み取りました"
+        case .managedKeychainImport:
+            "Keychain項目の登録を許可しました"
+        case .managedKeychainUpdate:
+            "Keychain項目の更新を許可しました"
+        case .managedKeychainDelete:
+            "Keychainから削除しました"
+        case .gitSSHSign:
+            "Git SSH署名を許可しました"
+        case .passwordAutoFill:
+            "資格情報の使用を許可しました"
+        }
+        return (message, true)
+    }
+
     private static func serveManagedKeychainImport(
         client: Int32,
         request: AuthBrokerApprovalRequest,
-        context: LAContext
-    ) throws {
-        guard case let .managedKeychainImportRequest(importRequest) = try AuthBrokerSocketIO.readMessage(
-            from: client,
-            timeout: 30
-        ), importRequest.authorizationID == request.requestID else { throw AgentProtocolError.denied }
-        try self.validateRoot(request)
+        context: LAContext,
+        coordinator: AuthApprovalCoordinator
+    ) async {
+        let importRequest: AuthBrokerManagedKeychainImportRequest
+        do {
+            guard case let .managedKeychainImportRequest(received) = try AuthBrokerSocketIO.readMessage(
+                from: client,
+                timeout: 30
+            ), received.authorizationID == request.requestID else {
+                throw AgentProtocolError.denied
+            }
+            try self.validateRoot(request)
+            importRequest = received
+        } catch {
+            let presentation = ManagedKeychainEffectPresentation(
+                updating: request.operation == .managedKeychainUpdate,
+                outcome: .notStarted,
+                delivery: .notAttempted
+            )
+            await coordinator.complete(presentation.message, isSuccess: false)
+            return
+        }
         let mutation = if request.operation == .managedKeychainUpdate {
             ManagedKeychainStore.updateSecret(
                 importRequest.secret,
@@ -572,23 +712,47 @@ private enum AuthBrokerAppServer {
                 authenticationContext: context
             )
         }
-        try AuthBrokerSocketIO.writeMessage(.managedKeychainImportResponse(
+        let outcome: ManagedKeychainEffectOutcome = switch mutation {
+        case .committed: .committed
+        case .failed: .failed
+        case .indeterminate: .indeterminate
+        }
+        let response = AuthBrokerMessage.managedKeychainImportResponse(
             AuthBrokerManagedKeychainImportResponse(
                 authorizationID: request.requestID,
                 outcome: mutation.brokerOutcome,
                 status: mutation.status
             )
-        ), to: client, timeout: 30)
+        )
+        let presentation = AuthEffectPipeline.managedMutation(
+            updating: request.operation == .managedKeychainUpdate,
+            outcome: outcome
+        ) {
+            try AuthBrokerSocketIO.writeMessage(response, to: client, timeout: 30)
+        }
+        await coordinator.complete(presentation.message, isSuccess: presentation.isSuccess)
     }
 
     private static func serveSigning(
         client: Int32,
         request: AuthBrokerApprovalRequest,
-        signer: any AgentKeySigning
-    ) throws {
+        signer: any AgentKeySigning,
+        coordinator: AuthApprovalCoordinator
+    ) async {
+        var completedSignature = false
         while true {
             let now = UInt64(Date().timeIntervalSince1970 * 1000)
-            guard now < request.expiresAtMilliseconds else { return }
+            if now >= request.expiresAtMilliseconds {
+                if !completedSignature {
+                    let presentation = SSHSigningEffectPresentation(
+                        operation: request.operation,
+                        outcome: .noSignatureRequested,
+                        delivery: .notAttempted
+                    )
+                    await coordinator.complete(presentation.message, isSuccess: false)
+                }
+                return
+            }
             let remaining = TimeInterval(request.expiresAtMilliseconds - now) / 1000
             let message: AuthBrokerMessage
             do {
@@ -598,16 +762,48 @@ private enum AuthBrokerAppServer {
                     nowMilliseconds: now
                 )
             } catch {
+                if !completedSignature {
+                    let presentation = SSHSigningEffectPresentation(
+                        operation: request.operation,
+                        outcome: .noSignatureRequested,
+                        delivery: .notAttempted
+                    )
+                    await coordinator.complete(presentation.message, isSuccess: false)
+                }
                 return
             }
             guard case let .sshSignRequest(signRequest) = message,
-                  signRequest.authorizationID == request.requestID else { throw AgentProtocolError.denied }
-            try self.validateRoot(request)
-            let signature = try signer.sign(data: signRequest.data, flags: signRequest.flags)
-            try AuthBrokerSocketIO.writeMessage(.sshSignResponse(AuthBrokerSSHSignResponse(
-                authorizationID: request.requestID,
-                signature: signature
-            )), to: client, timeout: 30)
+                  signRequest.authorizationID == request.requestID
+            else {
+                if !completedSignature {
+                    let presentation = SSHSigningEffectPresentation(
+                        operation: request.operation,
+                        outcome: .noSignatureRequested,
+                        delivery: .notAttempted
+                    )
+                    await coordinator.complete(presentation.message, isSuccess: false)
+                }
+                return
+            }
+            await coordinator.beginProcessing()
+            let presentation = AuthEffectPipeline.signing(
+                operation: request.operation,
+                prepare: {
+                    try self.validateRoot(request)
+                },
+                sign: {
+                    try signer.sign(data: signRequest.data, flags: signRequest.flags)
+                },
+                deliver: { signature in
+                    try AuthBrokerSocketIO.writeMessage(.sshSignResponse(AuthBrokerSSHSignResponse(
+                        authorizationID: request.requestID,
+                        signature: signature
+                    )), to: client, timeout: 30)
+                }
+            )
+            await coordinator.complete(presentation.message, isSuccess: presentation.isSuccess)
+            guard presentation.isSuccess else { return }
+            completedSignature = true
         }
     }
 
@@ -679,8 +875,10 @@ private struct AuthApprovalView: View {
                     symbol: completion.isSuccess ? "checkmark.circle.fill" : "exclamationmark.triangle",
                     title: completion.message
                 )
-            case .cancelled:
-                ResultView(symbol: "xmark.circle", title: "キャンセルしました")
+            case let .cancelled(message):
+                ResultView(symbol: "xmark.circle", title: message)
+            case let .denied(message):
+                ResultView(symbol: "exclamationmark.triangle", title: message)
             case let .failed(message):
                 ResultView(symbol: "exclamationmark.triangle", title: message)
             }

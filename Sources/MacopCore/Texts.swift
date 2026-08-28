@@ -36,6 +36,10 @@ public enum HelpText {
       ssh
       config
       doctor
+
+    Item names:
+      Use the full <namespace>/<item> key printed by item list.
+      A unique trailing <item> name is accepted for backward compatibility.
     """
 }
 

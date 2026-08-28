@@ -112,11 +112,9 @@ enum OTPCommand {
     }
 
     private static func locate(name: String, options: GlobalOptions) throws -> (key: String, value: ConfigItem) {
-        let matches = try ConfigStore.items(configDirectory: options.configDirectory).filter {
-            $0.key.split(separator: "/").last == Substring(name) && $0.value.otp != nil
-        }
-        guard matches.count == 1, let item = matches.first else {
-            throw CLIError.notFound(message: "Configured OTP item \"\(name)\" was not found or is ambiguous.")
+        let item = try ConfiguredKeychainItemLocator.item(named: name, options: options)
+        guard item.value.otp != nil else {
+            throw CLIError.notFound(message: "OTP is not configured for item \"\(item.key)\".")
         }
         return item
     }

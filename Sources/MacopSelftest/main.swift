@@ -924,16 +924,237 @@ private func authBrokerSelftests() throws {
         "response write loss must not claim that an unsaved credential was used"
     )
     for status in [AuthBrokerApprovalStatus.cancelled, .denied] {
+        let delivered = PasswordAutoFillRejectionPresentation(
+            status: status,
+            delivery: .delivered
+        )
         let rejection = PasswordAutoFillRejectionPresentation(
             status: status,
             delivery: .unknown
         )
         try expect(
-            !rejection.isSuccess
+            !delivered.isSuccess
+                && !rejection.isSuccess
+                && (status == .cancelled
+                    ? delivered.message == "キャンセルしました"
+                    : delivered.message == "承認しませんでした")
                 && rejection.message.contains("結果通知は確認できません")
                 && !rejection.message.contains("安全に検証できませんでした"),
-            "known cancellation or denial must survive response-write loss with delivery marked unknown"
+            "known cancellation and denial must remain distinct across delivered and response-loss UI states"
         )
+    }
+    for updating in [false, true] {
+        let notStarted = ManagedKeychainEffectPresentation(
+            updating: updating,
+            outcome: .notStarted,
+            delivery: .notAttempted
+        )
+        let committed = ManagedKeychainEffectPresentation(
+            updating: updating,
+            outcome: .committed,
+            delivery: .delivered
+        )
+        let failed = ManagedKeychainEffectPresentation(
+            updating: updating,
+            outcome: .failed,
+            delivery: .delivered
+        )
+        let indeterminate = ManagedKeychainEffectPresentation(
+            updating: updating,
+            outcome: .indeterminate,
+            delivery: .delivered
+        )
+        let committedResponseLost = ManagedKeychainEffectPresentation(
+            updating: updating,
+            outcome: .committed,
+            delivery: .unknown
+        )
+        let failedResponseLost = ManagedKeychainEffectPresentation(
+            updating: updating,
+            outcome: .failed,
+            delivery: .unknown
+        )
+        let indeterminateResponseLost = ManagedKeychainEffectPresentation(
+            updating: updating,
+            outcome: .indeterminate,
+            delivery: .unknown
+        )
+        try expect(
+            !notStarted.isSuccess
+                && notStarted.message.contains("Keychainは変更していません")
+                && committed.isSuccess
+                && !failed.isSuccess
+                && failed.message.contains("失敗")
+                && !indeterminate.isSuccess
+                && indeterminate.message.contains("結果を確認できません")
+                && !committedResponseLost.isSuccess
+                && committedResponseLost.message.contains(updating ? "更新しました" : "登録しました")
+                && committedResponseLost.message.contains("結果通知は確認できません")
+                && !failedResponseLost.isSuccess
+                && failedResponseLost.message.contains("失敗しました")
+                && failedResponseLost.message.contains("結果通知は確認できません")
+                && !indeterminateResponseLost.isSuccess
+                && indeterminateResponseLost.message.contains("結果と、要求元への結果通知を確認できません"),
+            "managed import/update UI must separate pre-mutation, mutation, and response-delivery states"
+        )
+    }
+    for operation in [AuthBrokerOperation.sshSession, .gitSSHSign] {
+        let noRequest = SSHSigningEffectPresentation(
+            operation: operation,
+            outcome: .noSignatureRequested,
+            delivery: .notAttempted
+        )
+        let signFailed = SSHSigningEffectPresentation(
+            operation: operation,
+            outcome: .signatureFailed,
+            delivery: .notAttempted
+        )
+        let preparationFailed = SSHSigningEffectPresentation(
+            operation: operation,
+            outcome: .preparationFailed,
+            delivery: .notAttempted
+        )
+        let delivered = SSHSigningEffectPresentation(
+            operation: operation,
+            outcome: .signed,
+            delivery: .delivered
+        )
+        let responseLost = SSHSigningEffectPresentation(
+            operation: operation,
+            outcome: .signed,
+            delivery: .unknown
+        )
+        try expect(
+            !noRequest.isSuccess
+                && noRequest.message.contains("署名要求は受信しませんでした")
+                && !preparationFailed.isSuccess
+                && preparationFailed.message.contains("署名は実行していません")
+                && !signFailed.isSuccess
+                && signFailed.message.contains("署名結果は返していません")
+                && delivered.isSuccess
+                && delivered.message.contains("完了しました")
+                && !responseLost.isSuccess
+                && responseLost.message.contains("署名は完了しました")
+                && responseLost.message.contains("受け渡しは確認できません"),
+            "SSH and Git signing UI must separate approval, signature outcome, and response delivery"
+        )
+    }
+    let mutationDelivered = AuthEffectPipeline.managedMutation(
+        updating: false,
+        outcome: .committed,
+        deliver: {}
+    )
+    let mutationResponseLost = AuthEffectPipeline.managedMutation(
+        updating: true,
+        outcome: .committed,
+        deliver: { throw SelftestFailure(message: "fixture mutation response loss") }
+    )
+    try expect(
+        mutationDelivered.isSuccess
+            && !mutationResponseLost.isSuccess
+            && mutationResponseLost.message.contains("更新しました")
+            && mutationResponseLost.message.contains("結果通知は確認できません"),
+        "managed mutation delivery faults must preserve the known committed server state"
+    )
+    var signingDeliveryAttempted = false
+    var signingAttempted = false
+    let signingPreparationFailed = AuthEffectPipeline.signing(
+        operation: .sshSession,
+        prepare: { throw SelftestFailure(message: "fixture requester revalidation failure") },
+        sign: {
+            signingAttempted = true
+            return Data("must-not-be-signed".utf8)
+        },
+        deliver: { _ in signingDeliveryAttempted = true }
+    )
+    try expect(
+        !signingPreparationFailed.isSuccess
+            && signingPreparationFailed.message.contains("署名は実行していません")
+            && !signingAttempted
+            && !signingDeliveryAttempted,
+        "requester revalidation or signer preparation failure must remain distinct from an attempted signature"
+    )
+    let signingFailed = AuthEffectPipeline.signing(
+        operation: .gitSSHSign,
+        sign: {
+            signingAttempted = true
+            throw SelftestFailure(message: "fixture signer failure")
+        },
+        deliver: { _ in signingDeliveryAttempted = true }
+    )
+    try expect(
+        !signingFailed.isSuccess
+            && signingFailed.message.contains("署名結果は返していません")
+            && signingAttempted
+            && !signingDeliveryAttempted,
+        "a signature failure must not attempt a response or claim a completed signature"
+    )
+    let fixtureSignature = Data("fixture-signature".utf8)
+    var deliveredSignature = Data()
+    let signingDelivered = AuthEffectPipeline.signing(
+        operation: .sshSession,
+        sign: { fixtureSignature },
+        deliver: { deliveredSignature = $0 }
+    )
+    let signingResponseLost = AuthEffectPipeline.signing(
+        operation: .sshSession,
+        sign: { fixtureSignature },
+        deliver: { _ in throw SelftestFailure(message: "fixture signature response loss") }
+    )
+    try expect(
+        signingDelivered.isSuccess
+            && deliveredSignature == fixtureSignature
+            && !signingResponseLost.isSuccess
+            && signingResponseLost.message.contains("署名は完了しました")
+            && signingResponseLost.message.contains("受け渡しは確認できません"),
+        "signature delivery faults must preserve the known successful signing effect without leaking it"
+    )
+    for operation in [
+        AuthBrokerOperation.managedKeychainImport,
+        .managedKeychainUpdate,
+        .sshSession,
+        .gitSSHSign
+    ] {
+        let route = AuthApprovalOrchestration.deliveredRoute(
+            operation: operation,
+            status: .approved,
+            hasSigner: operation == .sshSession || operation == .gitSSHSign
+        )
+        try expect(
+            route == .approvedPhaseTwo,
+            "delivered approved phase-two server operations must remain processing instead of entering rejection UI"
+        )
+    }
+    try expect(
+        AuthApprovalOrchestration.deliveredRoute(
+            operation: .managedKeychainRead,
+            status: .approved,
+            hasSigner: false
+        ) == .approvedImmediate
+            && AuthApprovalOrchestration.deliveredRoute(
+                operation: .passwordAutoFill,
+                status: .approved,
+                hasSigner: false
+            ) == .passwordAutoFill,
+        "delivered server orchestration must retain immediate and AutoFill routes"
+    )
+    for status in [AuthBrokerApprovalStatus.cancelled, .denied] {
+        for operation in [
+            AuthBrokerOperation.managedKeychainImport,
+            .managedKeychainUpdate,
+            .sshSession,
+            .gitSSHSign,
+            .passwordAutoFill
+        ] {
+            try expect(
+                AuthApprovalOrchestration.deliveredRoute(
+                    operation: operation,
+                    status: status,
+                    hasSigner: false
+                ) == .rejected(status),
+                "cancelled and denied server operations must route only to rejection presentation"
+            )
+        }
     }
     let managedDeleteRequest = AuthBrokerApprovalRequest(
         requestID: UUID(),
@@ -3939,6 +4160,173 @@ func run() throws {
         "legacy item generation must distinguish create from exact-item replacement"
     )
 
+    let itemNameResolutionConfig = """
+    { "version": 2, "items": {
+      "Dogfood/Managed": {
+        "provider": "keychain-managed", "service": "dogfood-managed", "account": "dogfood-user",
+        "fields": ["token"],
+        "otp": {
+          "service": "dogfood-otp", "account": "dogfood-otp-user",
+          "algorithm": "SHA1", "digits": 6, "period": 30
+        }
+      },
+      "Other/Managed": {
+        "provider": "keychain-managed", "service": "other-managed", "account": "other-user",
+        "fields": ["token"],
+        "otp": {
+          "service": "other-otp", "account": "other-otp-user",
+          "algorithm": "SHA1", "digits": 6, "period": 30
+        }
+      },
+      "Dogfood/Unique": {
+        "provider": "keychain-generic", "service": "unique-generic", "account": "unique-user",
+        "fields": ["token"]
+      },
+      "Legacy/Scoped": {
+        "provider": "keychain-generic", "service": "legacy-scoped", "account": "legacy-user"
+      },
+      "Dogfood/Scoped": {
+        "provider": "keychain-managed", "service": "managed-scoped", "account": "managed-user"
+      },
+      "Dogfood/SSH": { "provider": "secure-enclave", "label": "item-name-fixture" }
+    } }
+    """
+    try itemNameResolutionConfig.data(using: .utf8)!.write(to: configPath, options: [.atomic])
+    let nameResolutionImporter = RecordingManagedKeychainImporter()
+    let nameResolutionDeleter = RecordingManagedKeychainDeleter()
+    let nameResolutionMutator = RecordingKeychainMutator()
+    let nameResolutionClient = RecordingKeychainClient(.success(Data("name-resolution-secret".utf8)))
+    let nameResolutionApp = MacopApp(
+        keychainClient: nameResolutionClient,
+        managedKeychainImporter: nameResolutionImporter,
+        managedKeychainDeleter: nameResolutionDeleter,
+        keychainMutator: nameResolutionMutator
+    )
+    let fullList = nameResolutionApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "list"], env: [:]
+    )
+    try expect(
+        fullList.stdout.contains("Dogfood/Managed") && fullList.stdout.contains("Other/Managed"),
+        "item list must expose the full keys accepted by subsequent item operations"
+    )
+    let exactFullGenerate = nameResolutionApp.run(
+        argv: [
+            "macop", "--config", configDirectory, "item", "generate", "Dogfood/Managed", "--length", "32"
+        ],
+        env: [:]
+    )
+    let disambiguatedFullGenerate = nameResolutionApp.run(
+        argv: [
+            "macop", "--config", configDirectory, "item", "generate", "Other/Managed", "--length", "32"
+        ],
+        env: [:]
+    )
+    try expect(
+        exactFullGenerate.exitCode == 0 && disambiguatedFullGenerate.exitCode == 0
+            && nameResolutionImporter.generatedImports.map(\.service) == ["dogfood-managed", "other-managed"],
+        "exact full item keys must take priority and disambiguate duplicate leaves"
+    )
+    let ambiguousLeafGenerate = nameResolutionApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "generate", "Managed"], env: [:]
+    )
+    try expect(
+        ambiguousLeafGenerate.exitCode == ExitCode.invalidArguments.rawValue
+            && ambiguousLeafGenerate.stderr.contains("ambiguous")
+            && ambiguousLeafGenerate.stderr.contains("Dogfood/Managed")
+            && ambiguousLeafGenerate.stderr.contains("Other/Managed")
+            && nameResolutionImporter.generatedImports.count == 2,
+        "duplicate leaf item names must require a full key without invoking a provider"
+    )
+    let ambiguousManagedImport = nameResolutionApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "import", "Managed"],
+        env: [:],
+        input: Data("ambiguous-import-secret".utf8)
+    )
+    try expect(
+        ambiguousManagedImport.exitCode == ExitCode.invalidArguments.rawValue
+            && ambiguousManagedImport.stderr.contains("ambiguous")
+            && nameResolutionImporter.imports.isEmpty,
+        "managed-only item operations must reject duplicate leaves before broker access"
+    )
+    let uniqueLeafCreate = nameResolutionApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "create", "Unique"],
+        env: [:],
+        input: Data("unique-create-secret".utf8)
+    )
+    let fullEdit = nameResolutionApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "edit", "Dogfood/Unique"],
+        env: [:],
+        input: Data("unique-edit-secret".utf8)
+    )
+    let fullGet = nameResolutionApp.run(
+        argv: [
+            "macop", "--config", configDirectory, "item", "get", "Dogfood/Unique",
+            "--fields", "label=token", "--reveal"
+        ],
+        env: [:]
+    )
+    try expect(
+        uniqueLeafCreate.exitCode == 0 && fullEdit.exitCode == 0 && fullGet.exitCode == 0
+            && nameResolutionMutator.creates.last?.query == .generic(
+                service: "unique-generic", account: "unique-user"
+            )
+            && nameResolutionMutator.edits.last?.query == .generic(
+                service: "unique-generic", account: "unique-user"
+            ),
+        "legacy create/edit/get must accept unique leaf and exact full item keys consistently"
+    )
+    let fullImport = nameResolutionApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "import", "Dogfood/Managed"],
+        env: [:],
+        input: Data("full-import-secret".utf8)
+    )
+    let fullAcquire = nameResolutionApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "acquire", "Dogfood/Managed"], env: [:]
+    )
+    let providerScopedAcquire = nameResolutionApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "acquire", "Scoped"], env: [:]
+    )
+    let fullDelete = nameResolutionApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "delete", "Other/Managed"], env: [:]
+    )
+    try expect(
+        fullImport.exitCode == 0 && fullAcquire.exitCode == 0
+            && providerScopedAcquire.exitCode == 0 && fullDelete.exitCode == 0
+            && nameResolutionImporter.imports.last?.service == "dogfood-managed"
+            && nameResolutionClient.queries.contains(.managed(
+                service: "dogfood-managed", account: "dogfood-user"
+            ))
+            && nameResolutionClient.queries.contains(.managed(
+                service: "managed-scoped", account: "managed-user"
+            ))
+            && nameResolutionDeleter.deletes.first?.service == "other-managed",
+        "managed import/acquire/delete must share full-key and provider-scoped leaf resolution"
+    )
+    let otpNameApp = MacopApp(
+        otpSeedClient: RecordingKeychainClient(.success(Data("JBSWY3DPEHPK3PXP".utf8)))
+    )
+    let fullOTP = otpNameApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "otp", "Dogfood/Managed"], env: [:]
+    )
+    let ambiguousOTP = otpNameApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "otp", "Managed"], env: [:]
+    )
+    try expect(
+        fullOTP.exitCode == 0
+            && ambiguousOTP.exitCode == ExitCode.invalidArguments.rawValue
+            && ambiguousOTP.stderr.contains("ambiguous"),
+        "OTP operations must accept full keys and reject ambiguous leaf names"
+    )
+    let unsupportedFullItem = nameResolutionApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "get", "Dogfood/SSH"], env: [:]
+    )
+    try expect(
+        unsupportedFullItem.exitCode == ExitCode.unsupported.rawValue
+            && unsupportedFullItem.stderr.contains("secure-enclave")
+            && nameResolutionClient.queries.count == 3,
+        "an exact full key with an unsupported provider must fail before provider access"
+    )
+
     let managedConfig = """
     { "version": 2, "items": {
       "Local/Managed": {
@@ -4510,7 +4898,8 @@ func run() throws {
         !currentHelp.stdout.contains("MVP scaffold")
             && currentHelp.stdout.contains("item list")
             && currentHelp.stdout.contains("item acquire")
-            && currentHelp.stdout.contains("item delete"),
+            && currentHelp.stdout.contains("item delete")
+            && currentHelp.stdout.contains("full <namespace>/<item> key"),
         "help must advertise the established item operations without stale MVP scaffold wording"
     )
 }

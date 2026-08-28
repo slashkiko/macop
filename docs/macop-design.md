@@ -281,7 +281,7 @@ printf %s "$REPLACEMENT_FROM_A_SAFE_SOURCE" | macop item edit LegacyGitHub
 macop item delete LegacyGitHub
 ```
 
-設定済みのKeychain itemのみを対象にする。`item list`は`--long`と`--format=json`を受け付ける。`item get`はitem名、`--fields label=<field>`、`--reveal`、`--format=json`を受け付け、`--reveal`がないsecret fieldはマスクする。macop固有の`item import`は`keychain-managed` itemだけを対象に、UTF-8 secretのstdinをData Protection Keychainへ登録する。既存itemは上書きせず、Touch IDまたはMac認証と`userPresence` access controlを要求する。`synchronization: "icloud"`を明示したmanaged itemは`kSecAttrSynchronizable=true`と`kSecAttrAccessibleWhenUnlocked`を使い、デフォルトのlocal itemは`ThisDeviceOnly`を維持する。
+設定済みのKeychain itemのみを対象にする。`item list`が表示する`<namespace>/<item>`のfull keyは、get/import/acquire/generate/otp/deleteとlegacy create/editへそのまま渡せる。後方互換のleaf名は各操作のprovider対象内で一意な場合だけ受理し、複数namespaceに同じleafがあれば候補full keyを示すinvalid-argumentsとして、exact full-keyによる明示を要求する。`item list`は`--long`と`--format=json`を受け付ける。`item get`はitem名、`--fields label=<field>`、`--reveal`、`--format=json`を受け付け、`--reveal`がないsecret fieldはマスクする。macop固有の`item import`は`keychain-managed` itemだけを対象に、UTF-8 secretのstdinをData Protection Keychainへ登録する。既存itemは上書きせず、Touch IDまたはMac認証と`userPresence` access controlを要求する。`synchronization: "icloud"`を明示したmanaged itemは`kSecAttrSynchronizable=true`と`kSecAttrAccessibleWhenUnlocked`を使い、デフォルトのlocal itemは`ThisDeviceOnly`を維持する。
 
 `item create/edit`は設定済みのlegacy generic/internet passwordをstdinだけから作成・更新する。`edit/delete`はsecretを読む前にopaque persistent referenceを列挙してexact-oneを要求し、曖昧selectorで複数itemを変更しない。`item delete`はlegacy itemまたは1件のmanaged itemを削除し、`--all-managed`はmacop access group内のlocal/synchronizable generic passwordだけを対象にする。
 

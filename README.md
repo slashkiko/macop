@@ -243,6 +243,12 @@ printf %s "$REPLACEMENT_FROM_A_SAFE_SOURCE" | macop item edit GitHub
 macop item delete GitHub
 ```
 
+`item list` prints canonical keys such as `Dogfood/Managed`. Every item command
+accepts that full key unchanged. A leaf such as `Managed` remains supported for
+backward compatibility only when it is unique among providers supported by the
+operation; otherwise macop reports the candidate full keys and requires one of
+them explicitly.
+
 `create` requires a zero-match preflight, captures the persistent reference
 returned by the add, and postflight-verifies that it is the selector's only
 match. If a concurrent add makes the selector ambiguous, macop rolls back only

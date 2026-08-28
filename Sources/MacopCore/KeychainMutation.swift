@@ -202,15 +202,38 @@ enum ConfiguredKeychainItemLocator {
         options: GlobalOptions,
         providers: Set<String> = ["keychain-generic", "keychain-internet", "keychain-managed"]
     ) throws -> (key: String, value: ConfigItem) {
-        let matches = try ConfigStore.items(configDirectory: options.configDirectory)
-            .filter {
-                providers.contains($0.value.provider)
-                    && $0.key.split(separator: "/").last == Substring(name)
+        let items = try ConfigStore.items(configDirectory: options.configDirectory)
+        if let exact = items[name] {
+            guard providers.contains(exact.provider) else {
+                throw CLIError.unsupportedProvider(
+                    provider: exact.provider,
+                    reason: "This item operation does not support the configured provider."
+                )
             }
-        guard matches.count == 1, let item = matches.first else {
-            throw CLIError.notFound(message: "Configured Keychain item \"\(name)\" was not found.")
+            return (name, exact)
         }
-        return item
+        let matches = items.filter {
+            providers.contains($0.value.provider)
+                && $0.key.split(separator: "/").last == Substring(name)
+        }
+        if matches.count > 1 {
+            let candidates = matches.keys.sorted().joined(separator: ", ")
+            throw CLIError.invalidArguments(
+                message: "Configured Keychain item name \"\(name)\" is ambiguous; use a full name: \(candidates)."
+            )
+        }
+        if let item = matches.first {
+            return item
+        }
+        if let unsupported = items.first(where: {
+            $0.key.split(separator: "/").last == Substring(name)
+        }) {
+            throw CLIError.unsupportedProvider(
+                provider: unsupported.value.provider,
+                reason: "This item operation does not support the configured provider."
+            )
+        }
+        throw CLIError.notFound(message: "Configured Keychain item \"\(name)\" was not found.")
     }
 
     static func query(for item: ConfigItem) throws -> KeychainQuery {
