@@ -4,8 +4,10 @@ Apple-native `op` compatibility CLI for macOS. It resolves configured Keychain
 references at the process boundary and uses Secure Enclave-backed SSH identities
 without exporting private-key files.
 
-This project is an early source-build preview for macOS 14+. It is
-not a 1Password backend, vault, or Apple Passwords reader.
+This project is an early source-build preview for macOS 14+. It is not a
+1Password backend or vault. Apple Passwords access is user-initiated through
+the system AutoFill chooser; macop cannot enumerate or silently query its
+database.
 
 ## Install from source
 
@@ -128,6 +130,17 @@ It removes only its marked PATH block by default; pass `--keep-path` to retain
 that block. Use the same `--bin-dir`, `MACOP_BIN_DIR`, `--shell-profile`, or
 `MACOP_SHELL_PROFILE` value that was used to install.
 
+To remove every item stored in macop's private managed-Keychain access group,
+delete them while the signed CLI and companion are still installed:
+
+```bash
+scripts/uninstall.sh --delete-managed-keychain
+```
+
+This opt-in path displays the native macop approval window and requires Touch ID
+or the Mac login password before deleting the items. It does not delete legacy
+generic/internet Keychain entries, configuration, or Secure Enclave identities.
+
 ## Keychain and configuration
 
 macop supports legacy generic/internet Keychain mappings and a separate
@@ -197,23 +210,50 @@ matching provisioning profile via `MACOP_PROVISIONING_PROFILE`; builds without
 that profile do not advertise the managed Keychain capability. Ad-hoc builds
 deliberately fail closed.
 
+For an interactive credential, `read`, `run`, and `inject` first try the
+configured managed Keychain item. If it is missing, macOS opens its Passwords
+AutoFill chooser; after selection, macop shows the verified requesting app again
+and requires Touch ID or the Mac login password before returning the credential
+to the requesting command. The approval window lets you save or update the
+selected password in the managed Keychain. Cancellation, authentication errors,
+and other Keychain failures never trigger the fallback.
+
+`item acquire` performs the same lookup and writes the credential to stdout.
+Pass `--from-passwords` to bypass a known-bad cached item explicitly; macop does
+not automatically rerun a child command after a remote service rejects a stored
+credential.
+
+```bash
+macop item acquire GitHub
+macop item acquire GitHub --from-passwords
+macop item delete GitHub
+macop item delete --all-managed
+```
+
+`item delete GitHub` uses the configured service/account selector.
+`--all-managed` is intentionally limited to generic-password items in macop's
+private access group. Both forms require the native approval and macOS
+authentication; deleting an already-missing individual item reports not found.
+
 The supported secret boundary is deliberately narrow:
 
-- `read` writes the requested UTF-8 text secret to stdout.
+- `read` and `item acquire` write the requested UTF-8 text secret to stdout.
 - `run` resolves references only into its direct child process; it masks matching
   stdout/stderr by default, unless `--no-masking` is explicitly selected.
 - `inject` reads a template from stdin or an input file and writes the expanded
   result only to stdout; persistent secret output files are rejected.
 - `item list` and `item get` return macop metadata. `item import` accepts exact
-  UTF-8 secret bytes from stdin for a configured managed item. Their JSON is a macop schema
+  UTF-8 secret bytes from stdin for a configured managed item; `item acquire`
+  returns a managed or interactively selected credential; `item delete` removes
+  only managed items. Metadata JSON is a macop schema
   with `schema_version`, not a complete 1Password item schema; `--reveal` is an
   explicit request to expose an item field.
 - Resolved secrets exist in process memory while a command is prepared and
   relayed. macop does not guarantee zeroization, locked memory, or protection
   from process memory inspection, core dumps, or swap.
 
-`--out-file`, secret-bearing argv, Apple Passwords access, binary/NUL secrets,
-and unsupported 1Password cloud/vault commands are outside this contract.
+`--out-file`, secret-bearing argv, binary/NUL secrets, and unsupported 1Password
+cloud/vault commands are outside this contract.
 
 ## Secure Enclave SSH
 
