@@ -28,10 +28,15 @@ struct MacopAuthApplication: App {
 
 @MainActor
 private final class AuthApprovalCoordinator: ObservableObject {
+    private enum PasswordPoCError: Error {
+        case accessControlUnavailable
+    }
+
     enum State {
         case starting
         case pending(PendingApproval)
-        case approved
+        case processing
+        case completed(String)
         case cancelled
         case failed(String)
     }
@@ -40,11 +45,14 @@ private final class AuthApprovalCoordinator: ObservableObject {
         let request: AuthBrokerApprovalRequest
         let peer: AuthBrokerVerifiedPeer
         let context: LAContext
+        let attemptID: UUID
     }
 
     struct ApprovalOutcome: @unchecked Sendable {
         let status: AuthBrokerApprovalStatus
         let context: LAContext?
+        let credential: Data?
+        let saveToKeychain: Bool
     }
 
     @Published private(set) var state: State = .starting
@@ -81,8 +89,14 @@ private final class AuthApprovalCoordinator: ObservableObject {
         await withCheckedContinuation { continuation in
             let context = LAContext()
             context.localizedCancelTitle = "キャンセル"
+            context.localizedFallbackTitle = "パスワードを使用"
             self.continuation = continuation
-            self.state = .pending(PendingApproval(request: request, peer: peer, context: context))
+            self.state = .pending(PendingApproval(
+                request: request,
+                peer: peer,
+                context: context,
+                attemptID: UUID()
+            ))
             NSApplication.shared.activate(ignoringOtherApps: true)
             NSApplication.shared.windows.first?.makeKeyAndOrderFront(nil)
             NSRunningApplication.current.activate(options: [.activateAllWindows])
@@ -98,11 +112,73 @@ private final class AuthApprovalCoordinator: ObservableObject {
                     .deviceOwnerAuthentication,
                     localizedReason: self.localizedReason(for: pending.request)
                 )
-                self.finish(success ? .approved : .denied)
+                self.finish(success ? .approved : .denied, pending: pending)
             } catch let error as LAError where error.code == .userCancel || error.code == .appCancel {
-                self.finish(.cancelled)
+                self.finish(.cancelled, pending: pending)
             } catch {
-                self.finish(.denied)
+                self.finish(.denied, pending: pending)
+            }
+        }
+    }
+
+    func authenticateWithPassword(_ pending: PendingApproval) {
+        guard case let .pending(current) = self.state,
+              current.attemptID == pending.attemptID else { return }
+        let context = LAContext()
+        context.localizedCancelTitle = "キャンセル"
+        let replacement = PendingApproval(
+            request: pending.request,
+            peer: pending.peer,
+            context: context,
+            attemptID: UUID()
+        )
+        self.state = .pending(replacement)
+        current.context.invalidate()
+        Task {
+            do {
+                let success = try await self.evaluatePasswordOnly(replacement)
+                self.finish(success ? .approved : .denied, pending: replacement)
+            } catch let error as LAError where error.code == .userCancel || error.code == .appCancel {
+                self.finish(.cancelled, pending: replacement)
+            } catch {
+                self.finish(.denied, pending: replacement)
+            }
+        }
+    }
+
+    func submitCredential(
+        _ password: String,
+        saveToKeychain: Bool,
+        passwordOnly: Bool,
+        pending: PendingApproval
+    ) {
+        guard case let .pending(current) = self.state,
+              current.request.requestID == pending.request.requestID,
+              !password.isEmpty,
+              let credential = password.data(using: .utf8),
+              credential.count <= ManagedKeychainStore.maximumSecretLength,
+              !password.contains("\0")
+        else { return }
+        Task {
+            do {
+                let success = if passwordOnly {
+                    try await self.evaluatePasswordOnly(pending)
+                } else {
+                    try await pending.context.evaluatePolicy(
+                        .deviceOwnerAuthentication,
+                        localizedReason: self.localizedReason(for: pending.request)
+                    )
+                }
+                self.finish(
+                    success ? .approved : .denied,
+                    credential: success ? credential : nil,
+                    saveToKeychain: success && saveToKeychain,
+                    pending: pending
+                )
+            } catch let error as LAError where error.code == .userCancel || error.code == .appCancel {
+                self.finish(.cancelled, pending: pending)
+            } catch {
+                self.finish(.denied, pending: pending)
             }
         }
     }
@@ -110,33 +186,55 @@ private final class AuthApprovalCoordinator: ObservableObject {
     func cancel() {
         if case let .pending(pending) = self.state {
             pending.context.invalidate()
+            self.finish(.cancelled, pending: pending)
         }
-        self.finish(.cancelled)
     }
 
     func fail(_ message: String) {
         self.state = .failed(message)
-        self.continuation?.resume(returning: ApprovalOutcome(status: .denied, context: nil))
+        self.continuation?.resume(returning: ApprovalOutcome(
+            status: .denied,
+            context: nil,
+            credential: nil,
+            saveToKeychain: false
+        ))
         self.continuation = nil
     }
 
-    func terminateSoon() {
+    func complete(_ message: String) {
+        self.state = .completed(message)
+    }
+
+    func terminateSoon(after delay: Duration = .milliseconds(250)) {
         Task {
-            try? await Task.sleep(for: .milliseconds(250))
+            try? await Task.sleep(for: delay)
             NSApplication.shared.terminate(nil)
         }
     }
 
-    private func finish(_ status: AuthBrokerApprovalStatus) {
-        guard let continuation = self.continuation else { return }
-        let context: LAContext? = if status == .approved, case let .pending(pending) = self.state {
-            pending.context
+    private func finish(
+        _ status: AuthBrokerApprovalStatus,
+        credential: Data? = nil,
+        saveToKeychain: Bool = false,
+        pending: PendingApproval
+    ) {
+        guard let continuation = self.continuation,
+              case let .pending(current) = self.state,
+              current.attemptID == pending.attemptID
+        else { return }
+        let context: LAContext? = if status == .approved {
+            current.context
         } else {
             nil
         }
         self.continuation = nil
-        self.state = status == .approved ? .approved : .cancelled
-        continuation.resume(returning: ApprovalOutcome(status: status, context: context))
+        self.state = status == .approved ? .processing : .cancelled
+        continuation.resume(returning: ApprovalOutcome(
+            status: status,
+            context: context,
+            credential: credential,
+            saveToKeychain: saveToKeychain
+        ))
     }
 
     private func localizedReason(for request: AuthBrokerApprovalRequest) -> String {
@@ -149,7 +247,31 @@ private final class AuthApprovalCoordinator: ObservableObject {
             "Secure EnclaveのSSH鍵で署名します。"
         case .managedKeychainImport:
             "Touch IDで保護するKeychain項目を登録します。"
+        case .passwordAutoFill:
+            "Passwordsから選んだ資格情報をmacopで使用します。"
+        case .managedKeychainDelete:
+            "macop管理のKeychain項目を削除します。"
         }
+    }
+
+    private func evaluatePasswordOnly(_ pending: PendingApproval) async throws -> Bool {
+        var error: Unmanaged<CFError>?
+        guard let accessControl = SecAccessControlCreateWithFlags(
+            nil,
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            .devicePasscode,
+            &error
+        ) else {
+            if let error {
+                throw error.takeRetainedValue()
+            }
+            throw PasswordPoCError.accessControlUnavailable
+        }
+        return try await pending.context.evaluateAccessControl(
+            accessControl,
+            operation: .useItem,
+            localizedReason: self.localizedReason(for: pending.request)
+        )
     }
 }
 
@@ -159,6 +281,7 @@ private enum AuthBrokerRuntimeCapabilities {
             | AuthBrokerCapability.sshSigning.rawValue
         if AuthBrokerRuntimeCapabilities.hasManagedKeychainEntitlements() {
             capabilities |= AuthBrokerCapability.managedKeychain.rawValue
+                | AuthBrokerCapability.passwordAutoFill.rawValue
         }
         return capabilities
     }()
@@ -223,14 +346,21 @@ private enum AuthBrokerAppServer {
         let requiredCapability = switch request.operation {
         case .sshSession, .sshSign:
             AuthBrokerCapability.sshSigning.rawValue
-        case .managedKeychainRead, .managedKeychainImport:
+        case .managedKeychainRead, .managedKeychainImport, .passwordAutoFill, .managedKeychainDelete:
             AuthBrokerCapability.managedKeychain.rawValue
         }
         guard capabilities & requiredCapability == requiredCapability else {
             throw AgentProtocolError.denied
         }
-        if request.operation == .managedKeychainRead || request.operation == .managedKeychainImport {
-            guard !request.keychainService.isEmpty, !request.keychainAccount.isEmpty else {
+        let isKeychainRequest = request.operation == .managedKeychainRead
+            || request.operation == .managedKeychainImport
+            || request.operation == .passwordAutoFill
+            || request.operation == .managedKeychainDelete
+        if isKeychainRequest {
+            let isDeleteAll = request.operation == .managedKeychainDelete
+                && request.keychainService.isEmpty
+                && request.keychainAccount.isEmpty
+            guard isDeleteAll || (!request.keychainService.isEmpty && !request.keychainAccount.isEmpty) else {
                 throw AgentProtocolError.denied
             }
         }
@@ -239,6 +369,7 @@ private enum AuthBrokerAppServer {
         let signer: (any AgentKeySigning)?
         var resultStatus = outcome.status == .approved ? errSecSuccess : errSecAuthFailed
         var resultData = Data()
+        var resultMessage = ""
         if outcome.status == .approved, let context = outcome.context, request.operation == .sshSession {
             try self.validateRoot(request)
             let candidate = try SSHCommand.makeVerifiedSessionSigner(
@@ -268,15 +399,64 @@ private enum AuthBrokerAppServer {
                 resultStatus = failure.status
             }
             signer = nil
+        } else if outcome.status == .approved,
+                  let context = outcome.context,
+                  let credential = outcome.credential,
+                  request.operation == .passwordAutoFill
+        // swiftlint:disable:next opening_brace
+        {
+            try self.validateRoot(request)
+            resultData = credential
+            if outcome.saveToKeychain {
+                resultStatus = ManagedKeychainStore.upsertSecret(
+                    credential,
+                    service: request.keychainService,
+                    account: request.keychainAccount,
+                    authenticationContext: context
+                )
+                resultMessage = resultStatus == errSecSuccess ? "saved" : "save_failed"
+            } else {
+                resultMessage = "not_requested"
+            }
+            signer = nil
+        } else if outcome.status == .approved,
+                  let context = outcome.context,
+                  request.operation == .managedKeychainDelete
+        // swiftlint:disable:next opening_brace
+        {
+            try self.validateRoot(request)
+            if request.keychainService.isEmpty, request.keychainAccount.isEmpty {
+                resultStatus = ManagedKeychainStore.deleteAll(authenticationContext: context)
+            } else {
+                resultStatus = ManagedKeychainStore.delete(
+                    service: request.keychainService,
+                    account: request.keychainAccount,
+                    authenticationContext: context
+                )
+            }
+            signer = nil
         } else {
             signer = nil
         }
         try AuthBrokerSocketIO.writeMessage(.approvalResponse(AuthBrokerApprovalResponse(
             requestID: request.requestID,
             status: outcome.status,
+            message: resultMessage,
             resultStatus: resultStatus,
             resultData: resultData
         )), to: client, timeout: 5)
+        let completionMessage = if request.operation == .passwordAutoFill {
+            switch resultMessage {
+            case "saved": "Keychainに保存しました"
+            case "not_requested": "今回のみ使用しました"
+            default: "資格情報を受け取りましたが、Keychainへの保存に失敗しました"
+            }
+        } else if request.operation == .managedKeychainDelete {
+            resultStatus == errSecSuccess ? "Keychainから削除しました" : "Keychain項目の削除に失敗しました"
+        } else {
+            "許可しました"
+        }
+        await coordinator.complete(completionMessage)
         if let signer {
             try self.serveSigning(
                 client: client,
@@ -290,7 +470,9 @@ private enum AuthBrokerAppServer {
         {
             try self.serveManagedKeychainImport(client: client, request: request, context: context)
         }
-        await coordinator.terminateSoon()
+        await coordinator.terminateSoon(
+            after: request.operation == .passwordAutoFill ? .seconds(2) : .milliseconds(250)
+        )
     }
 
     private static func serveManagedKeychainImport(
@@ -386,10 +568,31 @@ private struct AuthApprovalView: View {
             case .starting:
                 ProgressView("承認要求を確認しています…")
             case let .pending(pending):
-                ApprovalRequestView(pending: pending, cancel: self.coordinator.cancel)
+                if pending.request.operation == .passwordAutoFill {
+                    PasswordAutoFillRequestView(
+                        pending: pending,
+                        submit: { password, save, passwordOnly in
+                            self.coordinator.submitCredential(
+                                password,
+                                saveToKeychain: save,
+                                passwordOnly: passwordOnly,
+                                pending: pending
+                            )
+                        },
+                        cancel: self.coordinator.cancel
+                    )
+                } else {
+                    ApprovalRequestView(
+                        pending: pending,
+                        usePassword: { self.coordinator.authenticateWithPassword(pending) },
+                        cancel: self.coordinator.cancel
+                    )
                     .task(id: pending.request.requestID) { self.coordinator.authenticate(pending) }
-            case .approved:
-                ResultView(symbol: "checkmark.circle.fill", title: "許可しました")
+                }
+            case .processing:
+                ProgressView("処理しています…")
+            case let .completed(message):
+                ResultView(symbol: "checkmark.circle.fill", title: message)
             case .cancelled:
                 ResultView(symbol: "xmark.circle", title: "キャンセルしました")
             case let .failed(message):
@@ -400,8 +603,155 @@ private struct AuthApprovalView: View {
     }
 }
 
+private struct PasswordAutoFillRequestView: View {
+    let pending: AuthApprovalCoordinator.PendingApproval
+    let submit: (String, Bool, Bool) -> Void
+    let cancel: () -> Void
+    @State private var password = ""
+    @State private var saveToKeychain = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 14) {
+                Image(nsImage: self.requesterIcon)
+                    .resizable()
+                    .frame(width: 52, height: 52)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(self.requesterName) が資格情報を要求しています")
+                        .font(.headline)
+                    Label("検証済み", systemImage: "checkmark.seal.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                }
+                Spacer()
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Passwordsから選択")
+                    .font(.title3.weight(.semibold))
+                Text("パスワード欄をクリックし、システムのAutoFill候補から使用するログイン情報を選んでください。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                AutoFillTextField(
+                    text: self.$password,
+                    placeholder: "パスワード",
+                    contentType: .password,
+                    secure: true
+                )
+            }
+            Toggle("選んだパスワードをmacop管理のKeychainに保存・更新する", isOn: self.$saveToKeychain)
+            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
+                self.row("サービス", self.pending.request.keychainService)
+                self.row("保存先", self.pending.request.keychainAccount)
+                self.row("コマンド", self.pending.request.command)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
+            VStack(alignment: .leading, spacing: 12) {
+                Text("資格情報は画面に再表示せず、現在の要求にだけ返します")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 10) {
+                    Button("キャンセル", action: self.cancel)
+                        .keyboardShortcut(.cancelAction)
+                    Spacer(minLength: 24)
+                    HStack(spacing: 10) {
+                        Button("Macのパスワードで使用") {
+                            self.submit(self.password, self.saveToKeychain, true)
+                            self.password = ""
+                        }
+                        Button("Touch IDで使用") {
+                            self.submit(self.password, self.saveToKeychain, false)
+                            self.password = ""
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .disabled(self.password.isEmpty)
+                }
+            }
+        }
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label).foregroundStyle(.secondary)
+            Text(value).lineLimit(2).textSelection(.enabled)
+        }
+    }
+
+    private var requesterIdentity: LiveCodeIdentity {
+        self.pending.peer.requestingApplication ?? self.pending.peer.peerIdentity
+    }
+
+    private var requesterName: String {
+        let path = self.requesterIdentity.canonicalPath
+        if let range = path.range(of: ".app/Contents/MacOS/") {
+            return URL(fileURLWithPath: String(path[..<range.lowerBound]) + ".app")
+                .deletingPathExtension().lastPathComponent
+        }
+        return URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    private var requesterIcon: NSImage {
+        let path = self.requesterIdentity.canonicalPath
+        if let range = path.range(of: ".app/Contents/MacOS/") {
+            return NSWorkspace.shared.icon(forFile: String(path[..<range.lowerBound]) + ".app")
+        }
+        return NSWorkspace.shared.icon(forFile: path)
+    }
+}
+
+private struct AutoFillTextField: NSViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+    let contentType: NSTextContentType
+    let secure: Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: self.$text)
+    }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field: NSTextField = self.secure ? NSSecureTextField() : NSTextField()
+        field.placeholderString = self.placeholder
+        field.contentType = self.contentType
+        field.delegate = context.coordinator
+        field.isEditable = true
+        field.isSelectable = true
+        field.bezelStyle = .roundedBezel
+        field.controlSize = .large
+        field.font = .systemFont(ofSize: NSFont.systemFontSize(for: .large))
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context _: Context) {
+        if field.stringValue != self.text {
+            field.stringValue = self.text
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        @Binding private var text: String
+
+        init(text: Binding<String>) {
+            self._text = text
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            self.text = field.stringValue
+        }
+    }
+}
+
 private struct ApprovalRequestView: View {
     let pending: AuthApprovalCoordinator.PendingApproval
+    let usePassword: () -> Void
     let cancel: () -> Void
 
     var body: some View {
@@ -424,9 +774,13 @@ private struct ApprovalRequestView: View {
                 .controlSize(.large)
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
                 if self.isManagedKeychainRequest {
-                    self.row("操作", self.pending.request.operation == .managedKeychainRead ? "読み取り" : "登録")
-                    self.row("サービス", self.pending.request.keychainService)
-                    self.row("アカウント", self.pending.request.keychainAccount)
+                    self.row("操作", self.managedKeychainAction)
+                    if self.isDeleteAllRequest {
+                        self.row("対象", "macop管理のKeychain項目すべて")
+                    } else {
+                        self.row("サービス", self.pending.request.keychainService)
+                        self.row("アカウント", self.pending.request.keychainAccount)
+                    }
                 } else {
                     self.row("接続先", self.pending.request.host.isEmpty ? "SSHセッション" : self.pending.request.host)
                     self.row("使用する鍵", self.pending.request.credentialLabel)
@@ -441,6 +795,7 @@ private struct ApprovalRequestView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                Button("Macのパスワードを使用", action: self.usePassword)
                 Button("キャンセル", action: self.cancel)
                     .keyboardShortcut(.cancelAction)
             }
@@ -461,12 +816,26 @@ private struct ApprovalRequestView: View {
     private var isManagedKeychainRequest: Bool {
         self.pending.request.operation == .managedKeychainRead
             || self.pending.request.operation == .managedKeychainImport
+            || self.pending.request.operation == .managedKeychainDelete
+    }
+
+    private var isDeleteAllRequest: Bool {
+        self.pending.request.operation == .managedKeychainDelete
+            && self.pending.request.keychainService.isEmpty
+            && self.pending.request.keychainAccount.isEmpty
+    }
+
+    private var managedKeychainAction: String {
+        switch self.pending.request.operation {
+        case .managedKeychainRead: "読み取り"
+        case .managedKeychainDelete: "削除"
+        default: "登録"
+        }
     }
 
     private var requestTitle: String {
         if self.isManagedKeychainRequest {
-            let action = self.pending.request.operation == .managedKeychainRead ? "読み取り" : "登録"
-            return "\(self.requesterName) がKeychain項目の\(action)を要求しています"
+            return "\(self.requesterName) がKeychain項目の\(self.managedKeychainAction)を要求しています"
         }
         return "\(self.requesterName) がSSH鍵を要求しています"
     }

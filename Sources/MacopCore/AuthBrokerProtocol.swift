@@ -13,6 +13,7 @@ public enum AuthBrokerCapability: UInt32, Sendable {
     case approvalUI = 1
     case managedKeychain = 2
     case sshSigning = 4
+    case passwordAutoFill = 8
 }
 
 public struct AuthBrokerHello: Sendable, Equatable {
@@ -46,6 +47,8 @@ public enum AuthBrokerOperation: UInt8, Sendable {
     case managedKeychainRead = 2
     case sshSign = 3
     case managedKeychainImport = 4
+    case passwordAutoFill = 5
+    case managedKeychainDelete = 6
 }
 
 public struct AuthBrokerApprovalRequest: Sendable, Equatable {

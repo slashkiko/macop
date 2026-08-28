@@ -6,15 +6,26 @@ public enum ItemCommand {
         options: GlobalOptions,
         input: Data = Data(),
         client: any KeychainClient,
-        importer: any ManagedKeychainImporting = CompanionManagedKeychainImporter()
+        importer: any ManagedKeychainImporting = CompanionManagedKeychainImporter(),
+        deleter: any ManagedKeychainDeleting = CompanionManagedKeychainDeleter(),
+        passwordAutoFillProvider: any PasswordAutoFillProviding = CompanionPasswordAutoFillProvider()
     ) throws -> CommandResult {
         guard let subcommand = args.first
-        else { throw CLIError.invalidArguments(message: "item requires list, get, or import.") }
+        else { throw CLIError.invalidArguments(message: "item requires list, get, import, acquire, or delete.") }
         switch subcommand {
         case "list": return try self.list(Array(args.dropFirst()), options: options)
         case "get": return try self.get(Array(args.dropFirst()), options: options, client: client)
         case "import": return try self.importItem(
                 Array(args.dropFirst()), options: options, input: input, importer: importer
+            )
+        case "acquire": return try CredentialAcquireCommand.run(
+                Array(args.dropFirst()),
+                options: options,
+                client: client,
+                passwordAutoFillProvider: passwordAutoFillProvider
+            )
+        case "delete": return try ManagedKeychainDeleteCommand.run(
+                Array(args.dropFirst()), options: options, deleter: deleter
             )
         default:
             if let reason = self.unsupportedSubcommandReason(subcommand) {
@@ -38,11 +49,9 @@ public enum ItemCommand {
         else {
             throw CLIError.invalidArguments(message: "item import requires 1 to 65536 bytes of UTF-8 secret stdin.")
         }
-        let matches = try ConfigStore.items(configDirectory: options.configDirectory)
-            .filter { $0.value.provider == "keychain-managed" && $0.key.split(separator: "/").last == Substring(name) }
-        guard matches.count == 1, let item = matches.first,
-              let service = item.value.service, let account = item.value.account
-        else { throw CLIError.notFound(message: "Configured managed item \"\(name)\" was not found.") }
+        let item = try ManagedItemLocator.item(named: name, options: options)
+        let service = item.value.service!
+        let account = item.value.account!
         try importer.importSecret(input, service: service, account: account)
         if options.format == .json {
             return CommandResult(exitCode: 0, stdout: "{\"schema_version\":1,\"status\":\"imported\"}\n")

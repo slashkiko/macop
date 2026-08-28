@@ -50,17 +50,23 @@ public struct MacopApp {
     private let commandExecutor: CommandExecutor
     private let biometricChecker: any BiometricAvailabilityChecking
     private let managedKeychainImporter: any ManagedKeychainImporting
+    private let managedKeychainDeleter: any ManagedKeychainDeleting
+    private let passwordAutoFillProvider: any PasswordAutoFillProviding
 
     public init(
         keychainClient: any KeychainClient = DefaultKeychainClient(),
         commandExecutor: CommandExecutor = SystemCommandExecutor(),
         biometricChecker: any BiometricAvailabilityChecking = SystemBiometricAvailabilityChecker(),
-        managedKeychainImporter: any ManagedKeychainImporting = CompanionManagedKeychainImporter()
+        managedKeychainImporter: any ManagedKeychainImporting = CompanionManagedKeychainImporter(),
+        managedKeychainDeleter: any ManagedKeychainDeleting = CompanionManagedKeychainDeleter(),
+        passwordAutoFillProvider: any PasswordAutoFillProviding = CompanionPasswordAutoFillProvider()
     ) {
         self.keychainClient = keychainClient
         self.commandExecutor = commandExecutor
         self.biometricChecker = biometricChecker
         self.managedKeychainImporter = managedKeychainImporter
+        self.managedKeychainDeleter = managedKeychainDeleter
+        self.passwordAutoFillProvider = passwordAutoFillProvider
     }
 
     public func run(argv: [String], env: [String: String], input: Data = Data()) -> CommandResult {
@@ -118,7 +124,10 @@ public struct MacopApp {
             guard parsed.command == .run else { return nil }
             guard try !RunCommand.requestsInjectedStdin(parsed.commandArgs) else { return nil }
             let code = try RunCommand.runInteractively(
-                args: parsed.commandArgs, options: parsed.options, env: env, client: self.keychainClient
+                args: parsed.commandArgs,
+                options: parsed.options,
+                env: env,
+                client: self.passwordFallbackClient(command: "macop run")
             )
             return self.withSafeDebug(
                 CommandResult(exitCode: code), enabled: parsed.options.debug, context: "command=run"
@@ -161,7 +170,7 @@ public struct MacopApp {
                 args: parsed.commandArgs,
                 options: parsed.options,
                 env: env,
-                client: self.keychainClient,
+                client: self.passwordFallbackClient(command: "macop run"),
                 stdout: stdout,
                 stderr: stderr
             )
@@ -206,7 +215,7 @@ public struct MacopApp {
                 args: parsed.commandArgs,
                 options: parsed.options,
                 env: env,
-                client: self.keychainClient
+                client: self.passwordFallbackClient(command: "macop read")
             )
         case .item:
             return try ItemCommand.run(
@@ -214,7 +223,9 @@ public struct MacopApp {
                 options: parsed.options,
                 input: input,
                 client: self.keychainClient,
-                importer: self.managedKeychainImporter
+                importer: self.managedKeychainImporter,
+                deleter: self.managedKeychainDeleter,
+                passwordAutoFillProvider: self.passwordAutoFillProvider
             )
         case .config:
             return try ConfigCommand.run(args: parsed.commandArgs, options: parsed.options)
@@ -223,7 +234,7 @@ public struct MacopApp {
                 args: parsed.commandArgs,
                 options: parsed.options,
                 env: env,
-                client: self.keychainClient
+                client: self.passwordFallbackClient(command: "macop run")
             )
         case .inject:
             return try InjectCommand.run(
@@ -231,7 +242,7 @@ public struct MacopApp {
                 options: parsed.options,
                 env: env,
                 input: input,
-                client: self.keychainClient
+                client: self.passwordFallbackClient(command: "macop inject")
             )
         case .ssh:
             return try SSHCommand.run(
@@ -300,8 +311,18 @@ public struct MacopApp {
             stderr: result.stderr + "macop: debug exit_code=\(result.exitCode)\(context.map { " \($0)" } ?? "")\n"
         )
     }
+}
 
-    private func debugContext(_ error: CLIError) -> String? {
+private extension MacopApp {
+    func passwordFallbackClient(command: String) -> any KeychainClient {
+        PasswordFallbackKeychainClient(
+            primary: self.keychainClient,
+            passwordAutoFillProvider: self.passwordAutoFillProvider,
+            command: command
+        )
+    }
+
+    func debugContext(_ error: CLIError) -> String? {
         switch error {
         case let .unsupportedCommand(command, _):
             "command=\(command.split(separator: " ").first ?? "unknown")"

@@ -2,7 +2,7 @@ import Foundation
 import LocalAuthentication
 import Security
 
-public enum KeychainQuery: Sendable, Equatable {
+public enum KeychainQuery: Sendable, Hashable {
     case generic(service: String, account: String)
     case internet(server: String, account: String)
     case managed(service: String, account: String)
@@ -170,10 +170,7 @@ public enum KeychainProvider {
     public static func readText(_ query: KeychainQuery, client: any KeychainClient) throws -> String {
         switch client.read(query) {
         case let .success(data):
-            guard let text = String(data: data, encoding: .utf8), !text.contains("\0") else {
-                throw CLIError.runtimeError(message: "Keychain secret must be UTF-8 text without NUL bytes.")
-            }
-            return text
+            return try self.text(from: data)
         case let .failure(failure):
             if failure.isAmbiguous {
                 throw CLIError.invalidArguments(
@@ -182,6 +179,13 @@ public enum KeychainProvider {
             }
             throw self.mapStatus(failure.status)
         }
+    }
+
+    static func text(from data: Data) throws -> String {
+        guard let text = String(data: data, encoding: .utf8), !text.contains("\0") else {
+            throw CLIError.runtimeError(message: "Keychain secret must be UTF-8 text without NUL bytes.")
+        }
+        return text
     }
 
     private static func mapStatus(_ status: OSStatus) -> CLIError {

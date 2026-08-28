@@ -464,6 +464,55 @@ private func authBrokerSelftests() throws {
         decodedManagedImport == .managedKeychainImportRequest(managedImport),
         "managed Keychain import messages must round-trip exactly"
     )
+    let passwordAutoFillRequest = AuthBrokerApprovalRequest(
+        requestID: UUID(),
+        issuedAtMilliseconds: 1000,
+        expiresAtMilliseconds: 2000,
+        operation: .passwordAutoFill,
+        rootPID: 42,
+        rootStartTime: 7,
+        rootIdentifier: "test.agent",
+        rootCodeRequirement: "anchor test",
+        rootExecutablePath: "/tmp/test-agent",
+        command: "macop item acquire --from-passwords",
+        credentialLabel: "me",
+        credentialFingerprint: "",
+        host: "",
+        keychainService: "github.com",
+        keychainAccount: "me"
+    )
+    var passwordAutoFillFrame = try AuthBrokerWire.frame(.approvalRequest(passwordAutoFillRequest))
+    let decodedPasswordAutoFill = try AuthBrokerWire.takeFrame(
+        from: &passwordAutoFillFrame,
+        nowMilliseconds: 1500
+    )
+    try expect(
+        decodedPasswordAutoFill == .approvalRequest(passwordAutoFillRequest),
+        "Password AutoFill approval requests must round-trip exactly"
+    )
+    let managedDeleteRequest = AuthBrokerApprovalRequest(
+        requestID: UUID(),
+        issuedAtMilliseconds: 1000,
+        expiresAtMilliseconds: 2000,
+        operation: .managedKeychainDelete,
+        rootPID: 42,
+        rootStartTime: 7,
+        rootIdentifier: "test.agent",
+        rootCodeRequirement: "anchor test",
+        rootExecutablePath: "/tmp/test-agent",
+        command: "macop item delete",
+        credentialLabel: "me",
+        credentialFingerprint: "",
+        host: "",
+        keychainService: "github.com",
+        keychainAccount: "me"
+    )
+    var managedDeleteFrame = try AuthBrokerWire.frame(.approvalRequest(managedDeleteRequest))
+    let decodedManagedDelete = try AuthBrokerWire.takeFrame(from: &managedDeleteFrame, nowMilliseconds: 1500)
+    try expect(
+        decodedManagedDelete == .approvalRequest(managedDeleteRequest),
+        "managed Keychain delete requests must round-trip exactly"
+    )
     var expiredFrame = try AuthBrokerWire.frame(.approvalRequest(request))
     do {
         _ = try AuthBrokerWire.takeFrame(from: &expiredFrame, nowMilliseconds: 2000)
@@ -1738,7 +1787,7 @@ func run() throws {
         "inject --force", "item list", "item list --long", "item list --format", "item list --vault",
         "item list --categories", "item list --tags", "item list --favorite", "item list --include-archive",
         "item list --otp", "item list --share-link", "item get", "item get --fields",
-        "item get --reveal", "item import",
+        "item get --reveal", "item import", "item acquire",
         "item get --format", "item get --id", "item get --stdin", "item get --vault", "item get --categories",
         "item get --tags",
         "item get --favorite",
@@ -1777,7 +1826,7 @@ func run() throws {
     )
     try expect(
         compatibilityHuman.stdout
-            .contains("Macop extensions: item import, compatibility, config init, config validate, doctor, ssh"),
+            .contains("Macop extensions: item import, item acquire, item delete, compatibility, config init"),
         "human matrix should label extensions"
     )
     try expect(compatibilityHuman.stdout.contains("Flags:"), "human matrix should label flags separately")
@@ -3092,7 +3141,12 @@ func run() throws {
     try managedConfig.data(using: .utf8)!.write(to: configPath, options: [.atomic])
     let managedClient = RecordingKeychainClient(.success(Data("managed-secret".utf8)))
     let managedImporter = RecordingManagedKeychainImporter()
-    let managedApp = MacopApp(keychainClient: managedClient, managedKeychainImporter: managedImporter)
+    let managedDeleter = RecordingManagedKeychainDeleter()
+    let managedApp = MacopApp(
+        keychainClient: managedClient,
+        managedKeychainImporter: managedImporter,
+        managedKeychainDeleter: managedDeleter
+    )
     let managedRead = managedApp.run(
         argv: ["macop", "--config", configDirectory, "read", "op://Local/Managed/token"], env: [:]
     )
@@ -3119,6 +3173,154 @@ func run() throws {
         argv: ["macop", "--config", configDirectory, "item", "import", "Managed"], env: [:]
     )
     try expect(emptyManagedImport.exitCode == 2, "item import must reject empty stdin before broker access")
+    let managedDelete = managedApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "delete", "Managed"], env: [:]
+    )
+    try expect(managedDelete.exitCode == 0, "item delete must accept a configured managed item")
+    try expect(
+        managedDeleter.deletes.count == 1
+            && managedDeleter.deletes[0].service == "github-token"
+            && managedDeleter.deletes[0].account == "me",
+        "item delete must forward the exact configured selectors"
+    )
+    let managedDeleteAll = managedApp.run(
+        argv: ["macop", "item", "delete", "--all-managed"], env: [:]
+    )
+    try expect(managedDeleteAll.exitCode == 0, "item delete --all-managed must not require config")
+    try expect(managedDeleter.deleteAllCount == 1, "item delete --all-managed must use scoped bulk deletion")
+
+    let unusedAutoFill = RecordingPasswordAutoFillProvider()
+    let existingAcquireApp = MacopApp(
+        keychainClient: managedClient,
+        managedKeychainImporter: managedImporter,
+        passwordAutoFillProvider: unusedAutoFill
+    )
+    let existingAcquire = existingAcquireApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "acquire", "Managed"], env: [:]
+    )
+    try expect(existingAcquire.exitCode == 0, "item acquire must prefer an available managed Keychain item")
+    try expect(existingAcquire.stdout == "managed-secret\n", "item acquire must return the available credential")
+    try expect(unusedAutoFill.requests.isEmpty, "an available managed item must not launch Password AutoFill")
+
+    let missingManagedClient = RecordingKeychainClient(.failure(KeychainFailure(errSecItemNotFound)))
+    let automaticAutoFill = RecordingPasswordAutoFillProvider(saveStatus: .notRequested)
+    let missingAcquire = MacopApp(
+        keychainClient: missingManagedClient,
+        passwordAutoFillProvider: automaticAutoFill
+    ).run(argv: ["macop", "--config", configDirectory, "item", "acquire", "Managed"], env: [:])
+    try expect(missingAcquire.exitCode == 0, "a missing managed item must fall back to Password AutoFill")
+    try expect(missingAcquire.stdout == "passwords-secret\n", "item acquire must return the selected password")
+    try expect(
+        automaticAutoFill.requests.count == 1
+            && automaticAutoFill.requests[0].service == "github-token"
+            && automaticAutoFill.requests[0].account == "me"
+            && automaticAutoFill.requests[0].command == "macop item acquire",
+        "Password AutoFill must receive the exact configured selectors"
+    )
+
+    let fallbackReadAutoFill = RecordingPasswordAutoFillProvider(secret: Data("fallback-read-secret".utf8))
+    let fallbackRead = MacopApp(
+        keychainClient: missingManagedClient,
+        passwordAutoFillProvider: fallbackReadAutoFill
+    ).run(
+        argv: ["macop", "--config", configDirectory, "read", "op://Local/Managed/token"], env: [:]
+    )
+    try expect(fallbackRead.exitCode == 0, "read must fall back when a managed item is missing")
+    try expect(fallbackRead.stdout == "fallback-read-secret\n", "read must return the selected password")
+    try expect(
+        fallbackReadAutoFill.requests.count == 1
+            && fallbackReadAutoFill.requests[0].command == "macop read",
+        "read fallback must identify the actual requesting command"
+    )
+
+    let fallbackInjectAutoFill = RecordingPasswordAutoFillProvider(secret: Data("fallback-inject-secret".utf8))
+    let fallbackInject = MacopApp(
+        keychainClient: missingManagedClient,
+        passwordAutoFillProvider: fallbackInjectAutoFill
+    ).run(
+        argv: ["macop", "--config", configDirectory, "inject"],
+        env: [:],
+        input: Data("op://Local/Managed/token op://Local/Managed/token".utf8)
+    )
+    try expect(fallbackInject.exitCode == 0, "inject must fall back when a managed item is missing")
+    try expect(
+        fallbackInject.stdout == "fallback-inject-secret fallback-inject-secret",
+        "inject must use the selected password for every matching reference"
+    )
+    try expect(
+        fallbackInjectAutoFill.requests.count == 1
+            && fallbackInjectAutoFill.requests[0].command == "macop inject",
+        "one command must cache a Passwords selection instead of prompting twice"
+    )
+
+    let fallbackRunAutoFill = RecordingPasswordAutoFillProvider(secret: Data("fallback-run-secret".utf8))
+    let fallbackRun = MacopApp(
+        keychainClient: missingManagedClient,
+        passwordAutoFillProvider: fallbackRunAutoFill
+    ).run(
+        argv: [
+            "macop", "--config", configDirectory, "run", "--no-masking", "--",
+            "/usr/bin/printenv", "MACOP_FALLBACK_SECRET"
+        ],
+        env: ["MACOP_FALLBACK_SECRET": "op://Local/Managed/token"]
+    )
+    try expect(fallbackRun.exitCode == 0, "run must fall back when a managed item is missing")
+    try expect(fallbackRun.stdout == "fallback-run-secret\n", "run must inject the selected password")
+    try expect(
+        fallbackRunAutoFill.requests.count == 1
+            && fallbackRunAutoFill.requests[0].command == "macop run",
+        "run fallback must identify the actual requesting command"
+    )
+
+    let deniedFallback = MacopApp(
+        keychainClient: missingManagedClient,
+        passwordAutoFillProvider: DenyingPasswordAutoFillProvider()
+    ).run(
+        argv: ["macop", "--config", configDirectory, "read", "op://Local/Managed/token"], env: [:]
+    )
+    try expect(deniedFallback.exitCode == 5, "cancelled Password AutoFill must remain an access denial")
+
+    let legacyMissingAutoFill = RecordingPasswordAutoFillProvider()
+    let legacyMissing = MacopApp(
+        keychainClient: missingManagedClient,
+        passwordAutoFillProvider: legacyMissingAutoFill
+    ).run(
+        argv: ["macop", "read", "keychain://generic/missing/me"], env: [:]
+    )
+    try expect(legacyMissing.exitCode == 6, "legacy Keychain misses must remain not found")
+    try expect(
+        legacyMissingAutoFill.requests.isEmpty,
+        "legacy Keychain providers must never trigger the managed Passwords fallback"
+    )
+
+    let forcedManagedClient = RecordingKeychainClient(.success(Data("stale-secret".utf8)))
+    let forcedAutoFill = RecordingPasswordAutoFillProvider()
+    let forcedAcquire = MacopApp(
+        keychainClient: forcedManagedClient,
+        passwordAutoFillProvider: forcedAutoFill
+    ).run(
+        argv: [
+            "macop", "--config", configDirectory, "item", "acquire", "Managed", "--from-passwords"
+        ],
+        env: [:]
+    )
+    try expect(forcedAcquire.exitCode == 0, "explicit Passwords fallback must succeed")
+    try expect(forcedAcquire.stdout == "passwords-secret\n", "explicit fallback must return the selected password")
+    try expect(
+        forcedManagedClient.queries.isEmpty
+            && forcedAutoFill.requests.count == 1
+            && forcedAutoFill.requests[0].command == "macop item acquire --from-passwords",
+        "explicit Passwords fallback must not re-read a known-bad managed credential"
+    )
+
+    let deniedManagedClient = RecordingKeychainClient(.failure(KeychainFailure(errSecUserCanceled)))
+    let deniedAutoFill = RecordingPasswordAutoFillProvider()
+    let deniedAcquire = MacopApp(
+        keychainClient: deniedManagedClient,
+        passwordAutoFillProvider: deniedAutoFill
+    ).run(argv: ["macop", "--config", configDirectory, "item", "acquire", "Managed"], env: [:])
+    try expect(deniedAcquire.exitCode != 0, "cancelled Keychain access must not silently fall back")
+    try expect(deniedAutoFill.requests.isEmpty, "cancelled Keychain access must preserve user cancellation")
 
     let literalSelectorConfig = """
     { "version": 1, "items": {

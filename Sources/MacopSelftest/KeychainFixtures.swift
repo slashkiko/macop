@@ -86,3 +86,39 @@ final class RecordingManagedKeychainImporter: ManagedKeychainImporting, @uncheck
         self.imports.append((secret, service, account))
     }
 }
+
+final class RecordingManagedKeychainDeleter: ManagedKeychainDeleting, @unchecked Sendable {
+    private(set) var deletes = [(service: String, account: String)]()
+    private(set) var deleteAllCount = 0
+
+    func delete(service: String, account: String) throws {
+        self.deletes.append((service, account))
+    }
+
+    func deleteAll() throws {
+        self.deleteAllCount += 1
+    }
+}
+
+final class RecordingPasswordAutoFillProvider: PasswordAutoFillProviding, @unchecked Sendable {
+    private(set) var requests = [(service: String, account: String, command: String)]()
+    let credential: PasswordAutoFillCredential
+
+    init(
+        secret: Data = Data("passwords-secret".utf8),
+        saveStatus: PasswordAutoFillSaveStatus = .saved
+    ) {
+        self.credential = PasswordAutoFillCredential(secret: secret, saveStatus: saveStatus)
+    }
+
+    func acquire(service: String, account: String, command: String) throws -> PasswordAutoFillCredential {
+        self.requests.append((service, account, command))
+        return self.credential
+    }
+}
+
+struct DenyingPasswordAutoFillProvider: PasswordAutoFillProviding {
+    func acquire(service _: String, account _: String, command _: String) throws -> PasswordAutoFillCredential {
+        throw CLIError.denied(message: "Password AutoFill was denied for this fixture.")
+    }
+}

@@ -69,6 +69,66 @@ public enum ManagedKeychainStore {
         }
     }
 
+    public static func upsertSecret(
+        _ secret: Data,
+        service: String,
+        account: String,
+        authenticationContext: LAContext
+    ) -> OSStatus {
+        guard !secret.isEmpty, secret.count <= self.maximumSecretLength,
+              self.validSelector(service), self.validSelector(account)
+        else { return errSecParam }
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecUseDataProtectionKeychain: true,
+            kSecUseAuthenticationContext: authenticationContext
+        ]
+        let status = SecItemUpdate(query as CFDictionary, [kSecValueData: secret] as CFDictionary)
+        if status == errSecItemNotFound {
+            return self.importSecret(
+                secret,
+                service: service,
+                account: account,
+                authenticationContext: authenticationContext
+            )
+        }
+        guard status == errSecSuccess else { return status }
+        switch self.read(service: service, account: account, authenticationContext: authenticationContext) {
+        case let .success(readback):
+            return constantTimeEqual(secret, readback) ? errSecSuccess : errSecDecode
+        case let .failure(failure):
+            return failure.status
+        }
+    }
+
+    public static func delete(
+        service: String,
+        account: String,
+        authenticationContext: LAContext
+    ) -> OSStatus {
+        guard self.validSelector(service), self.validSelector(account) else { return errSecParam }
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecUseDataProtectionKeychain: true,
+            kSecUseAuthenticationContext: authenticationContext
+        ]
+        return SecItemDelete(query as CFDictionary)
+    }
+
+    public static func deleteAll(authenticationContext: LAContext) -> OSStatus {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecUseDataProtectionKeychain: true,
+            kSecUseAuthenticationContext: authenticationContext
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecItemNotFound ? errSecSuccess : status
+    }
+
     private static func validSelector(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= AuthBrokerWire.maximumMetadataLength
             && !value.contains("\0")
@@ -113,6 +173,105 @@ public struct CompanionManagedKeychainClient: KeychainClient {
 
 public protocol ManagedKeychainImporting: Sendable {
     func importSecret(_ secret: Data, service: String, account: String) throws
+}
+
+public protocol ManagedKeychainDeleting: Sendable {
+    func delete(service: String, account: String) throws
+    func deleteAll() throws
+}
+
+public struct CompanionManagedKeychainDeleter: ManagedKeychainDeleting {
+    public init() {}
+
+    public func delete(service: String, account: String) throws {
+        try self.deleteRequest(service: service, account: account, all: false)
+    }
+
+    public func deleteAll() throws {
+        try self.deleteRequest(service: "", account: "", all: true)
+    }
+
+    private func deleteRequest(service: String, account: String, all: Bool) throws {
+        let connection = try AuthBrokerClientConnection.launchAndConnect(
+            requiredCapabilities: AuthBrokerCapability.managedKeychain.rawValue
+        )
+        let request = try AuthBrokerRequester.approvalRequest(
+            operation: .managedKeychainDelete,
+            command: all ? "macop item delete --all-managed" : "macop item delete",
+            credentialLabel: all ? "all managed items" : account,
+            service: service,
+            account: account
+        )
+        guard case let .approvalResponse(response) = try connection.send(.approvalRequest(request)),
+              response.requestID == request.requestID
+        else { throw CLIError.runtimeError(message: "Managed Keychain deletion returned an invalid response.") }
+        guard response.status == .approved else {
+            throw CLIError.denied(message: "Managed Keychain deletion was denied or cancelled.")
+        }
+        switch response.resultStatus {
+        case errSecSuccess:
+            return
+        case errSecItemNotFound:
+            throw CLIError.notFound(message: "Managed Keychain item was not found.")
+        case errSecUserCanceled, errSecAuthFailed, errSecInteractionNotAllowed:
+            throw CLIError.denied(message: "Managed Keychain deletion was denied or cancelled.")
+        default:
+            throw CLIError.runtimeError(
+                message: "Managed Keychain deletion failed (OSStatus \(response.resultStatus))."
+            )
+        }
+    }
+}
+
+public enum PasswordAutoFillSaveStatus: String, Sendable {
+    case saved
+    case notRequested = "not_requested"
+    case failed = "save_failed"
+}
+
+public struct PasswordAutoFillCredential: Sendable {
+    public let secret: Data
+    public let saveStatus: PasswordAutoFillSaveStatus
+
+    public init(secret: Data, saveStatus: PasswordAutoFillSaveStatus) {
+        self.secret = secret
+        self.saveStatus = saveStatus
+    }
+}
+
+public protocol PasswordAutoFillProviding: Sendable {
+    func acquire(service: String, account: String, command: String) throws -> PasswordAutoFillCredential
+}
+
+public struct CompanionPasswordAutoFillProvider: PasswordAutoFillProviding {
+    public init() {}
+
+    public func acquire(service: String, account: String, command: String) throws -> PasswordAutoFillCredential {
+        let required = AuthBrokerCapability.managedKeychain.rawValue
+            | AuthBrokerCapability.passwordAutoFill.rawValue
+        let connection = try AuthBrokerClientConnection.launchAndConnect(requiredCapabilities: required)
+        let request = try AuthBrokerRequester.approvalRequest(
+            operation: .passwordAutoFill,
+            command: command,
+            credentialLabel: account,
+            service: service,
+            account: account
+        )
+        guard case let .approvalResponse(response) = try connection.send(
+            .approvalRequest(request),
+            timeout: 600
+        ),
+            response.requestID == request.requestID
+        else { throw CLIError.runtimeError(message: "Password AutoFill returned an invalid response.") }
+        guard response.status == .approved else {
+            throw CLIError.denied(message: "Password AutoFill was denied or cancelled.")
+        }
+        guard !response.resultData.isEmpty,
+              response.resultData.count <= ManagedKeychainStore.maximumSecretLength,
+              let saveStatus = PasswordAutoFillSaveStatus(rawValue: response.message)
+        else { throw CLIError.runtimeError(message: "Password AutoFill returned an invalid credential.") }
+        return PasswordAutoFillCredential(secret: response.resultData, saveStatus: saveStatus)
+    }
 }
 
 public struct CompanionManagedKeychainImporter: ManagedKeychainImporting {
@@ -174,10 +333,11 @@ public enum AuthBrokerRequester {
               let snapshot = SystemRequesterInspector().snapshot(of: getpid())
         else { throw AgentProtocolError.denied }
         let now = UInt64(Date().timeIntervalSince1970 * 1000)
+        let lifetime: UInt64 = operation == .passwordAutoFill ? 600_000 : 120_000
         return AuthBrokerApprovalRequest(
             requestID: UUID(),
             issuedAtMilliseconds: now,
-            expiresAtMilliseconds: now + 120_000,
+            expiresAtMilliseconds: now + lifetime,
             operation: operation,
             rootPID: getpid(),
             rootStartTime: snapshot.startTime,

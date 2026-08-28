@@ -158,6 +158,12 @@ public enum CompatibilityCommand {
                 reason: "Create-only stdin import for configured keychain-managed items."
             ),
             .init(
+                command: "item acquire",
+                kind: "extension",
+                status: "supported",
+                reason: "Return a managed credential, with an explicit Apple Passwords refresh option."
+            ),
+            .init(
                 command: "item get --id",
                 kind: "flag",
                 status: "unsupported",
@@ -225,9 +231,9 @@ public enum CompatibilityCommand {
             ),
             .init(
                 command: "item delete",
-                kind: "subcommand",
-                status: "unsupported",
-                reason: "Keychain CRUD is outside the MVP."
+                kind: "extension",
+                status: "supported",
+                reason: "Delete one configured managed item or all items in macop's private access group."
             ),
             .init(
                 command: "item move",
