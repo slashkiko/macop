@@ -144,7 +144,7 @@ shell aliasは対話shellだけに適用され、通常のshell scriptでは展�
 - 意味が異なるcommandやflagを互換と見なさない。たとえば1Password accountを返す`whoami`はローカルmacOS user情報で代用しない。
 - 本物の`op`へ暗黙に処理を転送しない。
 
-`ssh`、`config`、`doctor`、`compatibility`は`macop`固有のextensionであり、1Password CLI互換とは主張しない。alias経由で`op ssh`などと起動された場合も、`macop` extensionとして同じ動作をする。
+`ssh`、`config`、`doctor`、`compatibility`と`item import`は`macop`固有のextensionであり、1Password CLI互換とは主張しない。alias経由で`op ssh`などと起動された場合も、`macop` extensionとして同じ動作をする。
 
 ### 6.3 互換対象
 
@@ -162,7 +162,7 @@ shell aliasは対話shellだけに適用され、通常のshell scriptでは展�
 | `op item create/edit/delete/move/share/template` | 同名 | 未対応。Keychain item CRUDとshare/vault機能をMVP外とするため |
 | `op vault/account/user/group/service-account/connect/events-api/document/environment/plugin` | 同名 | 未対応。vault/cloud backendを持たないため |
 | `--account`, `--session`, `--cache`, `--iso-timestamps`、UTF-8以外の`--encoding` | 同名 | 未対応。無視やno-opにはしない |
-| — | `macop ssh`, `config`, `doctor`, `compatibility` | macop extensionとして対応。1Password CLI互換の機能ではない |
+| — | `macop ssh`, `config`, `doctor`, `compatibility`, `item import` | macop extensionとして対応。1Password CLI互換の機能ではない |
 
 ### 6.4 互換性の境界
 
@@ -202,7 +202,7 @@ op://$APP_ENV/GitHub/token
 }
 ```
 
-設定ファイルは`~/Library/Application Support/macop/config.json`に置く。親directoryはcurrent user所有の`0700`、fileはcurrent user所有の`0600`を厳密に要求し、extended ACLによる追加grantも拒否する。これ以外のowner、mode、ACLは読み込み時に拒否する。設定ファイルにはsecretそのものを保存しない。`macop config init`と`macop config validate`はこの非機密設定だけを作成・検証し、Keychain itemの作成はしない。
+設定ファイルは`~/Library/Application Support/macop/config.json`に置く。親directoryはcurrent user所有の`0700`、fileはcurrent user所有の`0600`を厳密に要求し、extended ACLによる追加grantも拒否する。これ以外のowner、mode、ACLは読み込み時に拒否する。設定ファイルにはsecretそのものを保存しない。`macop config init`と`macop config validate`はこの非機密設定だけを作成・検証する。`keychain-managed` itemは同じ`service`/`account`形式で設定し、`macop item import <item>`がstdinからcreate-onlyで登録する。
 
 読み込み時はconfig directoryと`config.json`を最終pathのsymbolic linkを辿らずにopenし、owner/mode/typeを検証した同じfile descriptorから読む。`keychain://internet/<server>/<account>`はpath/protocolなどで複数itemに一致し得るため、ちょうど1件でなければ値を選ばずにエラーにする。
 
@@ -273,9 +273,10 @@ op inject -i config.tpl
 op item list --format=json
 op item get GitHub --format=json
 op item get GitHub --fields label=token
+printf %s "$SECRET_FROM_A_SAFE_SOURCE" | macop item import GitHub
 ```
 
-MVPでは設定済みのKeychain itemのみを対象にする。`item list`は`--long`と`--format=json`を受け付ける。`item get`はitem名、`--fields label=<field>`、`--reveal`、`--format=json`を受け付け、`--reveal`がないsecret fieldはマスクする。
+MVPでは設定済みのKeychain itemのみを対象にする。`item list`は`--long`と`--format=json`を受け付ける。`item get`はitem名、`--fields label=<field>`、`--reveal`、`--format=json`を受け付け、`--reveal`がないsecret fieldはマスクする。macop固有の`item import`は`keychain-managed` itemだけを対象に、UTF-8 secretのstdinをData Protection Keychainへ登録する。既存itemは上書きせず、Touch IDまたはMac認証と`userPresence` access controlを要求する。
 
 1Password固有のitem ID、stdin入力、`--vault`、`--categories`、`--tags`、`--favorite`、`--include-archive`、`--otp`、`--share-link`は、vault/category/archive/share/OTPという対応するデータモデルがないため未対応エラーにする。
 
@@ -427,6 +428,9 @@ flowchart TD
     CLI["macop / op alias"] --> Parser["op互換Command Parser"]
     Parser --> Resolver["Secret Reference Resolver"]
     Resolver --> Keychain["Keychain Provider<br>Security.framework"]
+    Resolver --> Broker["Authenticated one-shot broker"]
+    Broker --> AuthApp["MacopAuth.app<br>Touch ID approval"]
+    AuthApp --> ManagedKeychain["Data Protection Keychain<br>userPresence"]
     Parser --> Runner["Process Runner"]
     Runner --> Redactor["Secret Output Redactor<br>Pipe / PTY relay"]
     Parser --> Injector["Template Injector"]
@@ -434,6 +438,9 @@ flowchart TD
     SSH --> CTK["sc_auth / CryptoTokenKit"]
     SSH --> AppleSSH["Apple ssh + ssh-keychain.dylib"]
     AppleSSH --> Key["Security.framework<br>SecKeyCreateSignature"]
+    SSH --> Agent["macop-agent<br>verified-session socket"]
+    Agent --> Broker
+    AuthApp --> Key
     Parser --> Unsupported["Unsupported Command Reporter"]
 ```
 
@@ -442,7 +449,7 @@ flowchart TD
 - Swift 6 language mode、Swift Package Manager、macOS専用とする。
 - package dependencyは持たない。使用するplatform frameworkはFoundation、CryptoKit、Security、CryptoTokenKit、LocalAuthentication、AppKit、Darwinだけとする。
 - argument parserは自前実装し、`swift-argument-parser`などの外部packageは追加しない。
-- executable targetは`MacopCLI`、`MacopAgent`、`MacopSelftest`、library targetは`MacopCore`とする。`MacopAgent`はverified-session agentとapplication別承認UIを提供するmenu bar appへ段階的に拡張する。
+- executable targetは`MacopCLI`、`MacopAgent`、`MacopAuth`、`MacopSelftest`、library targetは`MacopCore`とする。`MacopAgent`はUIを持たないverified-session agent、`MacopAuth`は要求時だけ起動するSwiftUI companionとする。
 
 ### 12.2 モジュール
 
@@ -460,7 +467,9 @@ flowchart TD
 - `SessionRegistry`: application / shell session別のsocket、nonce、root PID・開始時刻、code requirement、有効期限を管理する
 - `RequesterVerifier`: `LOCAL_PEERPID`、process ancestry、code identityを検証し、登録root外と終了済みsessionを拒否する
 - `AuthorizationStore`: session ID・process identity・鍵fingerprint・期限をkeyに、実行時メモリだけへ承認をcacheする
-- `AgentApp`: application・検証状態・鍵・session・期限を表示し、Touch IDまたは拒否を選ぶmenu bar app
+- `AuthBroker`: owner-onlyの一時Unix socket、同一Team・peer UID・code identityを検証するversioned protocol。要求元rootを保護操作の直前にも再検証する
+- `MacopAuth`: application icon・検証状態・鍵・要求内容を表示し、`LocalAuthenticationView`と同じ`LAContext`でTouch ID承認、Secure Enclave署名、managed Keychain操作を行うon-demand app
+- `ManagedKeychain`: Data Protection Keychainと`userPresence` access controlを使うcreate-only import / exact read。matching provisioning profileがないbuildではcapabilityを広告しない
 - `ErrorRenderer`: text / JSON形式の構造化エラー
 - `Doctor`: OS、純正バイナリ、provider、code signature、設定permissionの診断
 
@@ -522,7 +531,7 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 ### Phase 1: CLI・package基盤
 
 - Swift 6 / Swift Package Managerの`MacopCLI`、`MacopAgent`、`MacopCore`、`MacopSelftest`作成
-- `MacopAgent`のscaffoldをPhase 4でverified-session agentと承認UIへ拡張する
+- `MacopAgent`のscaffoldをPhase 4でverified-session agentへ拡張し、承認UIは独立した`MacopAuth` targetへ分離する
 - 外部依存なしの自前argument parser
 - `macop` / `op`互換command tree
 - global flagと全top-level commandのsupport/unsupported matrix
@@ -556,6 +565,7 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - OpenSSH session bindingを必須化し、`forwarding=1`と非協調clientをfail closedで拒否
 - application・検証状態・鍵・session・期限を表示するTouch ID承認UIとsession単位cache
 - Sourcetree / Terminalの製品別integration、実CTK identityでの署名・GitHub E2E
+- 2026-08-28にcertificate-backed same-Team build、要求元icon付きTouch ID UI、自作agent経由の実CTK identity署名、GitHub SSH認証をdogfood確認済み
 
 ### Phase 5: 安全性と互換性
 

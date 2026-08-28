@@ -4,12 +4,13 @@ Apple-native `op` compatibility CLI for macOS. It resolves configured Keychain
 references at the process boundary and uses Secure Enclave-backed SSH identities
 without exporting private-key files.
 
-This project is a source-build MVP for a personal macOS 14+ environment. It is
+This project is an early source-build preview for macOS 14+. It is
 not a 1Password backend, vault, or Apple Passwords reader.
 
 ## Install from source
 
-Build, sign, verify, and install both executables in a user-owned bin directory:
+Build, sign, verify, and install the CLI, agent, and `MacopAuth.app` companion
+in a user-owned bin directory:
 
 ```bash
 scripts/build-install.sh
@@ -32,12 +33,16 @@ scripts/build-install.sh --signing-identity 'Developer ID Application: Example (
 ```
 
 `MACOP_SIGNING_IDENTITY` is the equivalent environment setting. Stable signing
-keeps the binary identifiers and designated requirements stable across updates,
-which lets a Keychain item retain an operator-approved ACL decision. It does
-not rewrite Keychain ACLs, suppress system authentication, or grant access by
-itself; inspect the signature and approve the intended binary in Keychain
-Access. The installer rejects `-` as an explicitly requested stable identity
-instead of silently falling back to ad-hoc signing.
+keeps identifiers and designated requirements stable across updates. A
+certificate-backed build without a provisioning profile enables the native
+approval UI and verified SSH signing. Setting an absolute
+`MACOP_PROVISIONING_PROFILE` path additionally embeds the profile and enables
+the managed Data Protection Keychain capability. For that build, the auth
+bundle's application identifier and Keychain access-group entitlements are
+generated from the selected certificate's Team ID; no Team ID, certificate
+name, or profile is stored in the repository. The installer rejects `-` as an
+explicitly requested stable identity instead of silently falling back to
+ad-hoc signing.
 
 The install directory defaults to `~/.local/bin` and can be changed with
 `--bin-dir` or `MACOP_BIN_DIR`. The installer refuses to replace an existing
@@ -104,11 +109,12 @@ that block. Use the same `--bin-dir`, `MACOP_BIN_DIR`, `--shell-profile`, or
 
 ## Keychain and configuration
 
-Create the Keychain item before creating its macop mapping. Use Keychain Access
-to add a normal login-keychain password item, and enter the secret only in that
-UI; do not put a real secret in a shell command, repository file, or the JSON
-below. Record its service/account (generic password) or server/account
-(internet password), then initialize the non-secret configuration:
+macop supports legacy generic/internet Keychain mappings and a separate
+`keychain-managed` provider. Legacy items are created in Keychain Access. A
+managed item is stored by `MacopAuth.app` in the Data Protection Keychain with
+`userPresence` access control and is read only after the native approval UI and
+Mac authentication succeed. Never put a real secret in a shell command,
+repository file, or the JSON below. Initialize the non-secret configuration:
 
 ```bash
 macop config init
@@ -141,6 +147,35 @@ contains no secret value:
 }
 ```
 
+For a Touch ID-protected managed item, use the same non-secret selector shape
+with `"provider": "keychain-managed"`, then pass the secret only over stdin:
+
+```json
+{
+  "version": 1,
+  "items": {
+    "Local/GitHub": {
+      "provider": "keychain-managed",
+      "service": "example-github-token",
+      "account": "example-user",
+      "fields": ["token"]
+    }
+  }
+}
+```
+
+```bash
+printf %s "$SECRET_FROM_A_SAFE_SOURCE" | macop item import GitHub
+macop read op://Local/GitHub/token
+```
+
+`item import` is create-only: it refuses an existing selector and never deletes
+or overwrites the source item. The companion and CLI must be certificate-signed
+by the same Apple Developer team, and `MacopAuth.app` must be built with a
+matching provisioning profile via `MACOP_PROVISIONING_PROFILE`; builds without
+that profile do not advertise the managed Keychain capability. Ad-hoc builds
+deliberately fail closed.
+
 The supported secret boundary is deliberately narrow:
 
 - `read` writes the requested UTF-8 text secret to stdout.
@@ -148,7 +183,8 @@ The supported secret boundary is deliberately narrow:
   stdout/stderr by default, unless `--no-masking` is explicitly selected.
 - `inject` reads a template from stdin or an input file and writes the expanded
   result only to stdout; persistent secret output files are rejected.
-- `item list` and `item get` return macop metadata. Their JSON is a macop schema
+- `item list` and `item get` return macop metadata. `item import` accepts exact
+  UTF-8 secret bytes from stdin for a configured managed item. Their JSON is a macop schema
   with `schema_version`, not a complete 1Password item schema; `--reveal` is an
   explicit request to expose an item field.
 - Resolved secrets exist in process memory while a command is prepared and
