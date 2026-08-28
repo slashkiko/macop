@@ -1199,6 +1199,11 @@ private func agentSelftests() throws {
         throw SelftestFailure(message: "P-256 binding vector requires a local Security key")
     }
     let p256Host = try SSHWire.string("ecdsa-sha2-nistp256") + SSHWire.string("nistp256") + SSHWire.string(p256Point)
+    let signerPublicBlob = try CTKIdentitySigner.publicBlob(for: p256Public)
+    try expect(
+        signerPublicBlob == p256Host,
+        "CTK signer must encode a P-256 certificate key as an SSH public blob"
+    )
     let p256Session = Data("p256-session".utf8)
     guard let p256DER = SecKeyCreateSignature(
         p256Private,
@@ -1579,6 +1584,26 @@ func run() throws {
     )
     let createdIdentity = sshApp.run(argv: ["macop", "ssh", "create", "github", "--touch-id"], env: [:])
     try expect(createdIdentity.exitCode == 0, "ssh create should use the injectable Apple command executor")
+    let agentIdentityExecutor = SequencedSSHExecutor(
+        lists: [appleTableHeader + appleTableRow("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "github")],
+        providerResult: CommandResult(exitCode: 1)
+    )
+    let agentIdentity = try SSHCommand.verifiedSessionIdentity(
+        label: "github",
+        env: [:],
+        executor: agentIdentityExecutor,
+        publicKeyResolver: { label, hash in
+            guard label == "github", hash == String(repeating: "A", count: 40) else {
+                throw AgentProtocolError.denied
+            }
+            return agentTestKey
+        }
+    )
+    try expect(
+        agentIdentity.fingerprint == sshFingerprint(for: agentTestKey)
+            && !agentIdentityExecutor.invocations.contains { $0.path == SSHCommand.sshKeygen },
+        "verified-session identity selection must derive public material without the Apple SSH provider"
+    )
     let createdJSONExecutor = SequencedSSHExecutor(lists: [
         appleTableHeader,
         appleTableHeader + appleTableRow("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "new-github")

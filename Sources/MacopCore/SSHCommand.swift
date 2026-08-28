@@ -262,9 +262,9 @@ public enum SSHCommand {
         ]
     }
 
-    /// Selects one CTK identity without exporting private material.  The label
-    /// is resolved through `sc_auth`; its application-label hash and the SSH
-    /// public blob must agree in the Keychain query performed by the signer.
+    /// Selects one CTK identity without exporting private material. The label
+    /// must resolve uniquely through `sc_auth`, its public-key hash must select
+    /// one Keychain certificate, and the signer must reproduce that public blob.
     public static func makeVerifiedSessionSigner(
         label: String,
         env: [String: String] = ProcessInfo.processInfo.environment,
@@ -291,24 +291,26 @@ public enum SSHCommand {
     public static func verifiedSessionIdentity(
         label: String,
         env: [String: String] = ProcessInfo.processInfo.environment,
-        executor: CommandExecutor = SystemCommandExecutor()
+        executor: CommandExecutor = SystemCommandExecutor(),
+        publicKeyResolver: @Sendable (String, String) throws -> Data = {
+            try CTKIdentitySigner.publicKeyBlob(identityLabel: $0, publicKeyHash: $1)
+        }
     ) throws -> VerifiedSessionIdentity {
         let context = SSHContext(env: env, executor: executor)
         let identity = try self.identity(label, context: context)
-        guard let hash = identity.hash else {
+        guard let publicKeyHash = identity.hash else {
             throw CLIError.providerUnavailable(
                 provider: "CryptoTokenKit",
                 reason: "Selected identity has no SHA-1 public-key hash."
             )
         }
-        let candidates = try self.providerKeys(context: context.restricted(to: hash))
-        guard candidates.count == 1,
-              let line = candidates.first?.line,
-              let blob = Self.sshBlob(fromPublicLine: line)
-        else {
+        let blob: Data
+        do {
+            blob = try publicKeyResolver(label, publicKeyHash)
+        } catch {
             throw CLIError.providerUnavailable(
-                provider: "ssh-keychain",
-                reason: "The selected CTK identity must expose exactly one SSH public key with the matching label."
+                provider: "CryptoTokenKit",
+                reason: "Could not resolve exactly one Security identity for the selected CTK label."
             )
         }
         return VerifiedSessionIdentity(

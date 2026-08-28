@@ -1,12 +1,11 @@
+import CryptoKit
 import Foundation
 import LocalAuthentication
 import Security
 
 /// A non-exporting signer for one, already selected CryptoTokenKit identity.
 /// The CTK label is matched exactly and the resulting certificate public key
-/// must produce the selected SSH blob.  The `sc_auth` hash is used only for
-/// Apple provider selection; it is not assumed to equal Keychain's opaque
-/// application-label attribute.
+/// must produce the selected SSH blob.
 public struct CTKIdentitySigner: AgentKeySigning, @unchecked Sendable {
     public let publicKeyBlob: Data
     public let fingerprint: String
@@ -17,6 +16,39 @@ public struct CTKIdentitySigner: AgentKeySigning, @unchecked Sendable {
         expectedPublicKeyBlob: Data,
         authenticationContext: LAContext? = nil
     ) throws {
+        let matches = try Self.resolveIdentities(
+            identityLabel: identityLabel,
+            authenticationContext: authenticationContext
+        ).filter { $0.publicKeyBlob == expectedPublicKeyBlob }
+        guard matches.count == 1, let resolved = matches.first else { throw AgentProtocolError.denied }
+        var privateKey: SecKey?
+        guard SecIdentityCopyPrivateKey(resolved.identity, &privateKey) == errSecSuccess,
+              let privateKey else { throw AgentProtocolError.denied }
+        self.publicKeyBlob = expectedPublicKeyBlob
+        self.fingerprint = sshFingerprint(for: expectedPublicKeyBlob)
+        self.privateKey = privateKey
+    }
+
+    /// Resolves only public material from an exact Keychain identity label.
+    /// This path is used by the verified-session agent and intentionally does
+    /// not depend on Apple's PKCS#11 SSH provider.
+    public static func publicKeyBlob(identityLabel: String, publicKeyHash: String) throws -> Data {
+        let matches = try self.resolveIdentities(identityLabel: identityLabel, authenticationContext: nil)
+            .filter { $0.publicKeyHash == publicKeyHash.uppercased() }
+        guard matches.count == 1, let resolved = matches.first else { throw AgentProtocolError.denied }
+        return resolved.publicKeyBlob
+    }
+
+    private struct ResolvedIdentity {
+        let identity: SecIdentity
+        let publicKeyBlob: Data
+        let publicKeyHash: String
+    }
+
+    private static func resolveIdentities(
+        identityLabel: String,
+        authenticationContext: LAContext?
+    ) throws -> [ResolvedIdentity] {
         guard !identityLabel.isEmpty else { throw AgentProtocolError.denied }
         var query: [CFString: Any] = [
             kSecClass: kSecClassIdentity,
@@ -29,18 +61,28 @@ public struct CTKIdentitySigner: AgentKeySigning, @unchecked Sendable {
         }
         var result: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let identities = result as? [SecIdentity], identities.count == 1 else { throw AgentProtocolError.denied }
-        var certificate: SecCertificate?; guard SecIdentityCopyCertificate(identities[0], &certificate) ==
-            errSecSuccess,
-            let certificate,
-            let key = SecCertificateCopyKey(certificate)
+              let result,
+              CFGetTypeID(result) == CFArrayGetTypeID()
         else { throw AgentProtocolError.denied }
-        guard try Self.publicBlob(for: key) == expectedPublicKeyBlob else { throw AgentProtocolError.denied }
-        var privateKey: SecKey?; guard SecIdentityCopyPrivateKey(identities[0], &privateKey) == errSecSuccess,
-                                       let privateKey else { throw AgentProtocolError.denied }
-        self.publicKeyBlob = expectedPublicKeyBlob
-        self.fingerprint = sshFingerprint(for: expectedPublicKeyBlob)
-        self.privateKey = privateKey
+        let values = unsafeDowncast(result, to: CFArray.self)
+        return (0 ..< CFArrayGetCount(values)).compactMap { index in
+            let value = CFArrayGetValueAtIndex(values, index)
+            guard let value else { return nil }
+            let item = unsafeBitCast(value, to: CFTypeRef.self)
+            guard CFGetTypeID(item) == SecIdentityGetTypeID() else { return nil }
+            let identity = unsafeDowncast(item, to: SecIdentity.self)
+            var certificate: SecCertificate?
+            guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess,
+                  let certificate,
+                  let key = SecCertificateCopyKey(certificate),
+                  let material = try? self.publicMaterial(for: key)
+            else { return nil }
+            return ResolvedIdentity(
+                identity: identity,
+                publicKeyBlob: material.blob,
+                publicKeyHash: material.hash
+            )
+        }
     }
 
     public func sign(data: Data, flags: UInt32) throws -> Data {
@@ -65,11 +107,22 @@ public struct CTKIdentitySigner: AgentKeySigning, @unchecked Sendable {
     }
 
     public static func publicBlob(for publicKey: SecKey) throws -> Data {
-        guard SecKeyGetBlockSize(publicKey) == 32 else { throw AgentProtocolError.unsupported }
+        try self.publicMaterial(for: publicKey).blob
+    }
+
+    private static func publicMaterial(for publicKey: SecKey) throws -> (blob: Data, hash: String) {
+        guard let attributes = SecKeyCopyAttributes(publicKey) as? [CFString: Any],
+              let keyType = attributes[kSecAttrKeyType] as? String,
+              keyType == kSecAttrKeyTypeECSECPrimeRandom as String,
+              let keySize = attributes[kSecAttrKeySizeInBits] as? NSNumber,
+              keySize.intValue == 256
+        else { throw AgentProtocolError.unsupported }
         var error: Unmanaged<CFError>?
         guard let point = SecKeyCopyExternalRepresentation(publicKey, &error) as Data?, point.count == 65,
               point.first == 4 else { throw AgentProtocolError.denied }
-        return try SSHWire.string("ecdsa-sha2-nistp256") + SSHWire.string("nistp256") + SSHWire.string(point)
+        let blob = try SSHWire.string("ecdsa-sha2-nistp256") + SSHWire.string("nistp256") + SSHWire.string(point)
+        let hash = Insecure.SHA1.hash(data: point).map { String(format: "%02X", $0) }.joined()
+        return (blob, hash)
     }
 
     /// Requires canonical ASN.1 DER INTEGERs and exactly P-256-sized positive
