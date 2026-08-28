@@ -98,7 +98,10 @@ public struct MacopApp {
         do {
             let parsed = try ArgumentParser.parse(argv: argv, env: env)
             if parsed.command == .ssh {
-                if parsed.options.format == .json, parsed.commandArgs.first == "test" {
+                // `ssh test` is non-interactive even when invoked from a TTY.
+                // Keep it on the observed pipe relay so GitHub's documented
+                // success greeting can normalize raw exit 1 to success.
+                if parsed.commandArgs.first == "test" {
                     return nil
                 }
                 if let code = try SSHCommand.runInteractively(

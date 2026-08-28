@@ -13,8 +13,8 @@ trap cleanup EXIT
 
 install -m 755 .build/debug/macop "$fixture_root/macop"
 install -m 755 .build/debug/macop-agent "$fixture_root/macop-agent"
-codesign --force --sign - --identifier macop "$fixture_root/macop"
-codesign --force --sign - --identifier macop-agent "$fixture_root/macop-agent"
+codesign --force --options runtime --sign - --identifier macop "$fixture_root/macop"
+codesign --force --options runtime --sign - --identifier macop-agent "$fixture_root/macop-agent"
 
 stdout_file="$fixture_root/stdout"
 stderr_file="$fixture_root/stderr"
@@ -67,6 +67,7 @@ test "$(grep -Ec '^macop: debug exit_code=2 command=ssh$' "$stderr_file")" -eq 1
 
 MACOP_AGENT_RUN_LIFECYCLE_FIXTURES=1 "$fixture_root/macop-agent"
 /usr/bin/script -q /dev/null env MACOP_AGENT_RUN_LIFECYCLE_FIXTURES=1 "$fixture_root/macop-agent"
+MACOP_AGENT_RUN_GIT_SUSPENDED_FIXTURE=1 "$fixture_root/macop-agent"
 
 assert_signal_cleanup() {
   local signal_name="$1"

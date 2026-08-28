@@ -72,6 +72,6 @@ public enum VerifiedSessionLauncher {
 
     public static func notice(for session: VerifiedSession) -> String {
         "Verified session \(session.id.uuidString) expires \(ISO8601DateFormatter().string(from: session.expiresAt)). "
-            + "Approval applies only through macop-agent; direct Apple provider use is not controlled."
+            + "Approval applies only through macop-agent; direct CTK access outside it is not controlled."
     }
 }

@@ -21,6 +21,18 @@ public protocol SSHStreamingExecuting: CommandExecuting {
     ) throws -> Int32
 }
 
+/// Test seams may resolve public CTK material without accessing the caller's
+/// Keychain. Production executors deliberately use Security.framework.
+public protocol CTKPublicKeyResolving: CommandExecuting {
+    func publicKeyBlob(identityLabel: String, publicKeyHash: String) throws -> Data
+}
+
+/// Deterministic seam for validating xcrun output without trusting a fixture
+/// path as an Apple-signed Git image.
+public protocol AppleGitTrustValidating: CommandExecuting {
+    func validateAppleGitExecutable(path: String) throws
+}
+
 public typealias CommandExecutor = any CommandExecuting
 public typealias CommandEnvironment = [String: String]
 
@@ -103,9 +115,7 @@ public enum SSHCommand {
     }
 
     public static let scAuth = "/usr/sbin/sc_auth"
-    public static let sshKeygen = "/usr/bin/ssh-keygen"
     public static let ssh = "/usr/bin/ssh"
-    public static let provider = "/usr/lib/ssh-keychain.dylib"
 
     public static func run(
         args: [String],
@@ -194,6 +204,24 @@ public enum SSHCommand {
             ? self.runInvocation(Array(args.dropFirst()), context: context)
             : self.agentInvocation(Array(args.dropFirst()), context: context)
         let capture = BoundedCommandCapture(limit: 65536)
+        if subcommand == "test", let policy = invocation.trustedAgentPolicy {
+            let rawCode = try RunCommand.relayTrustedAgent(
+                argv: [invocation.path] + invocation.arguments,
+                environment: invocation.environment,
+                policy: policy,
+                stdout: { data in
+                    capture.append(data)
+                    try? FileHandle.standardOutput.write(contentsOf: data)
+                },
+                stderr: { data in
+                    capture.append(data)
+                    try? FileHandle.standardError.write(contentsOf: data)
+                }
+            )
+            return self.normalizedTestExitCode(
+                rawCode, output: capture.data, destination: self.testDestination(args)
+            )
+        }
         let observer: (@Sendable (Data) -> Void)? = if subcommand == "test" {
             { @Sendable data in capture.append(data) }
         } else {
@@ -233,30 +261,37 @@ public enum SSHCommand {
         return hashes
     }
 
-    static func validateSingleProviderKey(_ output: String) throws {
-        let keys = output.split(whereSeparator: \.isNewline).compactMap { ProviderKey(line: String($0)) }
-        guard keys.count == 1 else {
-            throw CLIError.providerUnavailable(
-                provider: "ssh-keychain",
-                reason: "The selected CTK identity must expose exactly one SSH public key."
-            )
+    static func validatedSecurityIdentityCount(
+        _ output: String,
+        executor: CommandExecutor
+    ) throws -> Int {
+        let identities = try self.parseIdentities(output)
+        for identity in identities {
+            guard let hash = identity.hash else { throw AgentProtocolError.denied }
+            let blob: Data = if let fixture = executor as? any CTKPublicKeyResolving {
+                try fixture.publicKeyBlob(identityLabel: identity.label, publicKeyHash: hash)
+            } else {
+                try CTKIdentitySigner.publicKeyBlob(identityLabel: identity.label, publicKeyHash: hash)
+            }
+            guard !blob.isEmpty else { throw AgentProtocolError.denied }
         }
+        return identities.count
     }
 
-    static func isolatedSSHOptions() -> [String] {
+    static func isolatedAgentSSHOptions() -> [String] {
         [
             "-F",
             "/dev/null",
             "-o",
-            "PKCS11Provider=\(self.provider)",
+            "PKCS11Provider=none",
             "-o",
             "ForwardAgent=no",
             "-o",
-            "IdentitiesOnly=yes",
+            "IdentitiesOnly=no",
             "-o",
             "IdentityFile=none",
             "-o",
-            "IdentityAgent=none",
+            "IdentityAgent=SSH_AUTH_SOCK",
             "-o",
             "PreferredAuthentications=publickey"
         ]
@@ -322,6 +357,14 @@ public enum SSHCommand {
 private extension SSHCommand {
     private static func agent(_ args: [String], context: SSHContext) throws -> CommandResult {
         let invocation = try self.agentInvocation(args, context: context)
+        return try self.execute(invocation, context: context)
+    }
+
+    /// Buffered callers must preserve the same suspended-launch verification
+    /// as the streaming and interactive entry points. Otherwise a direct
+    /// `SSHCommand.run` call could race replacement of the verified helper
+    /// between its on-disk inspection and an ordinary spawn.
+    private static func execute(_ invocation: SSHInvocation, context: SSHContext) throws -> CommandResult {
         if let policy = invocation.trustedAgentPolicy, context.executor is SystemCommandExecutor {
             return try RunCommand.captureTrustedAgent(
                 argv: [invocation.path] + invocation.arguments,
@@ -356,6 +399,13 @@ private extension SSHCommand {
                 throw CLIError
                     .invalidArguments(message: "Usage: macop ssh agent application <identity-label> <application-path>")
             }
+        }
+        return try self.trustedHelperInvocation(args, context: context)
+    }
+
+    private static func trustedHelperInvocation(_ args: [String], context: SSHContext) throws -> SSHInvocation {
+        guard context.executor is SystemCommandExecutor else {
+            return SSHInvocation(path: "macop-agent", arguments: args, environment: context.env)
         }
         let policy = try TrustedAgentHelperVerifier.resolveTrustedLaunch(of: RunningExecutable.path())
         return SSHInvocation(
@@ -434,24 +484,18 @@ private extension SSHCommand {
                     + "inspect CTK identities before retrying."
             )
         }
-        guard let hash = created.hash else {
+        guard created.hash != nil else {
             throw CLIError.providerUnavailable(
                 provider: "CryptoTokenKit",
                 reason: "The created identity has no unambiguous public-key hash. Inspect CTK identities before retrying."
             )
         }
         do {
-            let keys = try self.providerKeys(context: context.restricted(to: hash))
-            guard keys.count == 1 else {
-                throw CLIError.providerUnavailable(
-                    provider: "ssh-keychain",
-                    reason: "The selected identity did not expose exactly one provider key."
-                )
-            }
+            _ = try self.publicIdentity(created, context: context)
         } catch {
             throw CLIError.providerUnavailable(
-                provider: "ssh-keychain",
-                reason: "The CTK identity was created, but Apple's SSH provider cannot expose exactly one usable public key. "
+                provider: "CryptoTokenKit",
+                reason: "The CTK identity was created, but Security.framework cannot resolve exactly one public key. "
                     + "Inspect the identity and remove it with `macop ssh delete \(label)` before retrying."
             )
         }
@@ -474,18 +518,12 @@ private extension SSHCommand {
         guard args.count == 1,
               let label = args.first
         else { throw CLIError.invalidArguments(message: "Usage: macop ssh public-key <label>") }
-        let identity = try identity(label, context: context)
-        let keys = try providerKeys(context: context.restricted(to: identity.hash))
-        guard keys.count == 1, let key = keys.first else {
-            throw CLIError.providerUnavailable(
-                provider: "ssh-keychain",
-                reason: "The selected CTK public-key hash did not produce exactly one SSH public key."
-            )
-        }
+        let identity = try self.selectedPublicIdentity(label: label, context: context)
+        let line = "ecdsa-sha2-nistp256 \(identity.publicKeyBlob.base64EncodedString()) \(label)"
         switch options.format {
-        case .humanReadable: return CommandResult(exitCode: 0, stdout: key.line + "\n")
+        case .humanReadable: return CommandResult(exitCode: 0, stdout: line + "\n")
         case .json:
-            return self.json(SSHPublicKeyResponse(label: identity.label, publicKey: key.line))
+            return self.json(SSHPublicKeyResponse(label: label, publicKey: line))
         }
     }
 
@@ -518,7 +556,7 @@ private extension SSHCommand {
         let destination = args.count == 2 ? args[1] : "git@github.com"
         try self.validate(label: label); try self.validateDestination(destination)
         let invocation = try self.testInvocation(args, context: context)
-        let raw = try self.apple(context.executor, invocation.path, invocation.arguments, invocation.environment)
+        let raw = try self.execute(invocation, context: context)
         let combined = Data((raw.stdout + raw.stderr).utf8)
         let normalized = self.normalizedTestExitCode(raw.exitCode, output: combined, destination: destination)
         if options.format == .json {
@@ -537,7 +575,7 @@ private extension SSHCommand {
               separator == 1
         else { throw CLIError.invalidArguments(message: "Usage: macop ssh run <label> -- <command> [args...]") }
         let invocation = try self.runInvocation(args, context: context)
-        return try self.apple(context.executor, invocation.path, invocation.arguments, invocation.environment)
+        return try self.execute(invocation, context: context)
     }
 
     private static func runInvocation(_ args: [String], context: SSHContext) throws -> SSHInvocation {
@@ -548,19 +586,23 @@ private extension SSHCommand {
         guard !command.isEmpty
         else { throw CLIError.invalidArguments(message: "ssh run requires a command after \"--\".") }
         try self.validate(label: label)
-        let identity = try self.identity(label, context: context)
+        _ = try self.identity(label, context: context)
         // Git shell-interprets GIT_SSH_COMMAND. This value remains safe because
         // every token is a fixed internal constant and no user input is interpolated.
-        guard URL(fileURLWithPath: command[0]).lastPathComponent == "git" else {
+        guard command[0] == "git" || command[0] == "/usr/bin/git" else {
             throw CLIError.unsupportedCommand(
                 command: "ssh run",
-                reason: "This wrapper currently supports git commands only; it never shells out or exports a private key."
+                reason: "This wrapper accepts only `git` or Apple's `/usr/bin/git` entry point; "
+                    + "it never shells out or exports a private key."
             )
         }
-        var childEnv = context.restricted(to: identity.hash).env
-        childEnv["GIT_SSH_COMMAND"] = ([self.ssh] + self.isolatedSSHOptions()).joined(separator: " ")
-        let executable = try self.resolveExecutable(command[0], environment: childEnv)
-        return SSHInvocation(path: executable, arguments: Array(command.dropFirst()), environment: childEnv)
+        var childEnv = context.env
+        childEnv["GIT_SSH_COMMAND"] = ([self.ssh] + self.isolatedAgentSSHOptions()).joined(separator: " ")
+        let executable = try self.resolveGitExecutable(command[0], context: context, environment: childEnv)
+        return try self.trustedHelperInvocation(
+            ["git", label, "--", executable] + Array(command.dropFirst()),
+            context: SSHContext(env: childEnv, executor: context.executor)
+        )
     }
 
     private static func testInvocation(_ args: [String], context: SSHContext) throws -> SSHInvocation {
@@ -569,12 +611,10 @@ private extension SSHCommand {
         }
         let destination = args.count == 2 ? args[1] : "git@github.com"
         try self.validate(label: label); try self.validateDestination(destination)
-        let identity = try self.identity(label, context: context)
-        let selected = context.restricted(to: identity.hash)
-        return SSHInvocation(
-            path: self.ssh,
-            arguments: self.isolatedSSHOptions() + ["-T", destination],
-            environment: selected.env
+        _ = try self.identity(label, context: context)
+        return try self.agentInvocation(
+            ["shell", label, "--", self.ssh] + self.isolatedAgentSSHOptions() + ["-T", destination],
+            context: context
         )
     }
 
@@ -629,14 +669,6 @@ private extension SSHCommand {
                 )
         }
         return found
-    }
-
-    private static func providerKeys(context: SSHContext) throws -> [ProviderKey] {
-        let result = try apple(context.executor, self.sshKeygen, [
-            "-D",
-            self.provider
-        ], context.env); try self.requireSuccess(result, provider: "ssh-keychain", operation: "enumerate public keys")
-        return result.stdout.split(whereSeparator: \.isNewline).compactMap { ProviderKey(line: String($0)) }
     }
 
     private static func identities(context: SSHContext) throws -> [Identity] {
@@ -727,10 +759,41 @@ private extension SSHCommand {
         value.range(of: "^[0-9A-Fa-f]{40}$", options: .regularExpression) != nil
     }
 
-    private static func sshBlob(fromPublicLine line: String) -> Data? {
-        let fields = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-        guard fields.count >= 2 else { return nil }
-        return Data(base64Encoded: String(fields[1]))
+    private static func selectedPublicIdentity(
+        label: String,
+        context: SSHContext
+    ) throws -> VerifiedSessionIdentity {
+        try self.publicIdentity(self.identity(label, context: context), context: context)
+    }
+
+    private static func publicIdentity(
+        _ identity: Identity,
+        context: SSHContext
+    ) throws -> VerifiedSessionIdentity {
+        guard let publicKeyHash = identity.hash else {
+            throw CLIError.providerUnavailable(
+                provider: "CryptoTokenKit",
+                reason: "Selected identity has no SHA-1 public-key hash."
+            )
+        }
+        let fixture = context.executor as? any CTKPublicKeyResolving
+        let resolver: @Sendable (String, String) throws -> Data = if let fixture {
+            { try fixture.publicKeyBlob(identityLabel: $0, publicKeyHash: $1) }
+        } else {
+            { try CTKIdentitySigner.publicKeyBlob(identityLabel: $0, publicKeyHash: $1) }
+        }
+        let blob: Data
+        do {
+            blob = try resolver(identity.label, publicKeyHash)
+        } catch {
+            throw CLIError.providerUnavailable(
+                provider: "CryptoTokenKit",
+                reason: "Could not resolve exactly one Security identity for the selected CTK label."
+            )
+        }
+        return VerifiedSessionIdentity(
+            fingerprint: sshFingerprint(for: blob), label: identity.label, publicKeyBlob: blob
+        )
     }
 
     private static func resolveExecutable(_ command: String, environment: CommandEnvironment) throws -> String {
@@ -752,6 +815,52 @@ private extension SSHCommand {
             }
         }
         throw CLIError.notFound(message: "Command not found in PATH: \(command)")
+    }
+
+    private static func resolveGitExecutable(
+        _ command: String,
+        context: SSHContext,
+        environment: CommandEnvironment
+    ) throws -> String {
+        guard command == "git" || command == "/usr/bin/git" else {
+            throw CLIError.unsupportedCommand(
+                command: "ssh run",
+                reason: "Only the active Apple developer-tool Git image is supported."
+            )
+        }
+        guard context.executor is SystemCommandExecutor || context.executor is any AppleGitTrustValidating else {
+            return try self.resolveExecutable(command, environment: environment)
+        }
+        var lookupEnvironment = context.env
+        for key in ["DEVELOPER_DIR", "SDKROOT", "TOOLCHAINS", "xcrun_log", "xcrun_nocache", "xcrun_verbose"] {
+            lookupEnvironment.removeValue(forKey: key)
+        }
+        let resolved = try self.apple(
+            context.executor, "/usr/bin/xcrun", ["--no-cache", "--find", "git"], lookupEnvironment
+        )
+        try self.requireSuccess(resolved, provider: "xcode-select", operation: "resolve the Git executable")
+        let path = resolved.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard URL(fileURLWithPath: path).lastPathComponent == "git",
+              FileManager.default.isExecutableFile(atPath: path), path.hasPrefix("/")
+        else {
+            throw CLIError.providerUnavailable(
+                provider: "xcode-select",
+                reason: "xcrun did not return an executable Git path."
+            )
+        }
+        do {
+            if let fixture = context.executor as? any AppleGitTrustValidating {
+                try fixture.validateAppleGitExecutable(path: path)
+            } else {
+                _ = try LiveCodeIdentityInspector.inspectExpectedAppleGitStatic(path: path)
+            }
+        } catch {
+            throw CLIError.providerUnavailable(
+                provider: "apple-git",
+                reason: "xcrun did not resolve an Apple-signed, library-validated Git image."
+            )
+        }
+        return path
     }
 
     private static func render(_ identities: [Identity], action: String?, _ options: GlobalOptions) -> CommandResult {
@@ -783,15 +892,6 @@ private extension SSHCommand {
     }
 
     struct Identity { let label: String; let hash: String? }
-    struct ProviderKey { let line: String; let comment: String?; init?(line: String) {
-        let parts = line.split(
-            separator: " ",
-            maxSplits: 2
-        ).map(String.init); guard parts.count >= 2,
-                                  parts[0].hasPrefix("ecdsa-") || parts[0].hasPrefix("ssh-")
-        else { return nil }; self.line = line; self.comment = parts.count == 3 ? parts[2] : nil
-    }
-    }
 }
 
 private struct SSHInvocation {
@@ -833,7 +933,7 @@ private struct SSHPublicKeyResponse: Encodable {
     let schemaVersion = 1
     let label: String
     let publicKey: String
-    let provider = "ssh-keychain"
+    let provider = "security-framework"
     enum CodingKeys: String,
         CodingKey { case schemaVersion = "schema_version", label; case publicKey = "public_key"; case provider }
 }
@@ -880,12 +980,4 @@ private struct TableLayout {
 private struct SSHContext {
     let env: CommandEnvironment
     let executor: CommandExecutor
-
-    func restricted(to hash: String?) -> SSHContext {
-        var selectedEnvironment = self.env
-        if let hash {
-            selectedEnvironment["KEYCHAIN_CERTIFICATES"] = hash
-        }
-        return SSHContext(env: selectedEnvironment, executor: self.executor)
-    }
 }

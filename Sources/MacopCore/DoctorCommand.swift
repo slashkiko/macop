@@ -59,9 +59,7 @@ public enum DoctorCommand {
         }
         for (name, path) in [
             ("sc_auth", SSHCommand.scAuth),
-            ("ssh", SSHCommand.ssh),
-            ("ssh-keygen", SSHCommand.sshKeygen),
-            ("ssh-keychain", SSHCommand.provider)
+            ("ssh", SSHCommand.ssh)
         ] {
             add(name, FileManager.default.fileExists(atPath: path) ? .pass : .fail, path)
         }
@@ -75,6 +73,7 @@ public enum DoctorCommand {
         )
 
         var ctkIdentityHashes: [String]?
+        var ctkIdentityOutput: String?
         if FileManager.default.fileExists(atPath: SSHCommand.scAuth) {
             let ctk = diagnostic(SSHCommand.scAuth, ["list-ctk-identities", "-t", "sha1", "-e", "hex"])
             do {
@@ -86,6 +85,7 @@ public enum DoctorCommand {
                 }
                 let hashes = try SSHCommand.validatedIdentityHashes(ctk.stdout)
                 ctkIdentityHashes = hashes
+                ctkIdentityOutput = ctk.stdout
                 add(
                     "cryptotokenkit",
                     .pass,
@@ -106,46 +106,32 @@ public enum DoctorCommand {
 
         if let hashes = ctkIdentityHashes {
             if hashes.isEmpty {
-                add("ssh_provider_keys", .warn, "No CTK identity is available for an Apple SSH provider check")
+                add("security_identity_keys", .warn, "No CTK identity is available for a Security.framework check")
             } else {
-                var unusable = 0
-                for hash in hashes {
-                    var environment = context.env
-                    environment["KEYCHAIN_CERTIFICATES"] = hash
-                    let result = diagnostic(
-                        SSHCommand.sshKeygen,
-                        ["-D", SSHCommand.provider],
-                        environment: environment
+                do {
+                    let count = try SSHCommand.validatedSecurityIdentityCount(
+                        ctkIdentityOutput ?? "",
+                        executor: context.executor
                     )
-                    guard let result, result.exitCode == 0 else {
-                        unusable += 1
-                        continue
-                    }
-                    do {
-                        try SSHCommand.validateSingleProviderKey(result.stdout)
-                    } catch {
-                        unusable += 1
-                    }
+                    add("security_identity_keys", .pass, "Security.framework resolved \(count) CTK public key(s)")
+                } catch {
+                    add("security_identity_keys", .fail, "Security.framework could not resolve every CTK public key")
                 }
-                add(
-                    "ssh_provider_keys",
-                    unusable == 0 ? .pass : .fail,
-                    unusable == 0
-                        ? "Apple SSH provider exposes exactly one key for every CTK identity"
-                        : "Apple SSH provider cannot expose exactly one key for \(unusable) CTK identity item(s)"
-                )
             }
         } else {
-            add("ssh_provider_keys", .fail, "Skipped because CTK identity enumeration was invalid")
+            add("security_identity_keys", .fail, "Skipped because CTK identity enumeration was invalid")
         }
 
-        let sshG = diagnostic(SSHCommand.ssh, ["-G"] + SSHCommand.isolatedSSHOptions() + ["example.invalid"])
+        let sshG = diagnostic(SSHCommand.ssh, ["-G"] + SSHCommand.isolatedAgentSSHOptions() + ["example.invalid"])
         let effective = Set((sshG?.stdout ?? "").split(whereSeparator: \.isNewline).map { $0.lowercased() })
         let forward = effective.contains("forwardagent no")
-        let provider = effective.contains("pkcs11provider \(SSHCommand.provider)")
-        let identities = effective.contains("identitiesonly yes")
+        let providerRows = effective.filter { $0.hasPrefix("pkcs11provider ") }
+        // Apple SSH omits PKCS11Provider from `ssh -G` when its effective value
+        // is `none`; some fixture/tool versions print the explicit value.
+        let noExternalProvider = providerRows.isEmpty || providerRows == ["pkcs11provider none"]
+        let identities = effective.contains("identitiesonly no")
         let identityFile = effective.contains("identityfile none")
-        let identityAgent = effective.contains("identityagent none")
+        let identityAgent = effective.contains("identityagent ssh_auth_sock")
         let publicKeyOnly = effective.contains("preferredauthentications publickey")
         let sshConfigResolved = sshG?.exitCode == 0
         add(
@@ -154,12 +140,13 @@ public enum DoctorCommand {
             sshConfigResolved && forward ? "effective ForwardAgent=no" : "unable to verify ForwardAgent=no"
         )
         add(
-            "ssh_identity_selection",
-            sshConfigResolved && provider && identities && identityFile && identityAgent && publicKeyOnly ? .pass :
+            "ssh_agent_selection",
+            sshConfigResolved && noExternalProvider && identities && identityFile && identityAgent && publicKeyOnly ?
+                .pass :
                 .fail,
-            sshConfigResolved && provider && identities && identityFile && identityAgent && publicKeyOnly
-                ? "effective PKCS11Provider, publickey-only authentication, IdentitiesOnly=yes, IdentityFile=none, and IdentityAgent=none"
-                : "unable to verify isolated SSH identity selection"
+            sshConfigResolved && noExternalProvider && identities && identityFile && identityAgent && publicKeyOnly
+                ? "effective PKCS11Provider=none, publickey-only authentication, IdentityFile=none, and session agent selection"
+                : "unable to verify isolated SSH agent selection"
         )
         let sshVersion = diagnostic(SSHCommand.ssh, ["-V"])
         add(

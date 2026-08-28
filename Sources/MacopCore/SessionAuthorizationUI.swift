@@ -104,7 +104,7 @@ public struct LocalAuthenticationSessionPrompt: SessionAuthorizationResultPrompt
             + "signature: \(presentation.signingAuthority); cdhash: \(presentation.cdHash); "
             + "verification: \(presentation.verification); key: \(presentation.fingerprint); "
             + "session: \(presentation.sessionID.uuidString); expiry: \(expiry). "
-            + "Apple provider use outside macop-agent is not controlled."
+            + "Direct CTK access outside macop-agent is not controlled."
         context.value.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, _ in
             completion(SessionAuthorizationResult(
                 approved: success, authenticationContext: success ? context.value : nil
@@ -123,7 +123,7 @@ public struct LocalAuthenticationSessionPrompt: SessionAuthorizationResultPrompt
         Session: \(presentation.sessionID.uuidString)
         Expires: \(ISO8601DateFormatter().string(from: presentation.expiresAt))
 
-        This authorization applies only through macop-agent. Direct Apple provider use is not controlled.
+        This authorization applies only through macop-agent. Direct CTK access outside it is not controlled.
         """
         var approved = false
         let show = {

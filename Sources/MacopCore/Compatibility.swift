@@ -297,8 +297,8 @@ public enum CompatibilityCommand {
                 command: "ssh",
                 kind: "extension",
                 status: "partial",
-                reason: "Apple Secure Enclave provider wrapper; verified sessions require `ssh agent shell` or "
-                    + "`ssh agent application` and a newly launched cooperative root."
+                reason: "Secure Enclave operations use verified one-shot agents and require a newly launched "
+                    + "cooperative root; third-party application integration remains limited."
             ),
             .init(command: "--help", kind: "flag", status: "supported"),
             .init(command: "--version", kind: "flag", status: "supported"),

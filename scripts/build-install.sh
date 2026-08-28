@@ -257,8 +257,8 @@ trap cleanup EXIT
 install -m 755 "$source_macop" "$staged_macop"
 install -m 755 "$source_agent" "$staged_agent"
 cp -R "$source_auth_app/Contents" "$staged_auth_app/Contents"
-codesign --force --sign "$codesign_identity" --identifier macop "$staged_macop"
-codesign --force --sign "$codesign_identity" --identifier macop-agent "$staged_agent"
+codesign --force --options runtime --sign "$codesign_identity" --identifier macop "$staged_macop"
+codesign --force --options runtime --sign "$codesign_identity" --identifier macop-agent "$staged_agent"
 codesign --verify --strict "$staged_macop"
 codesign --verify --strict "$staged_agent"
 codesign --verify --strict "$staged_auth_app"
@@ -271,10 +271,28 @@ read_team_id() {
   codesign -d --verbose=4 "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -n 1
 }
 
+require_hardened_runtime() {
+  local target="$1"
+  local flags
+  flags="$(codesign -d --verbose=4 "$target" 2>&1 \
+    | sed -n 's/^CodeDirectory .* flags=\(0x[0-9A-Fa-f]*\).*/\1/p' \
+    | head -n 1)"
+  [[ "$flags" =~ ^0x[0-9A-Fa-f]+$ ]] \
+    || fail "unable to read code-signing flags from $target"
+  (( (flags & 0x10000) != 0 )) \
+    || fail "hardened runtime readback failed for $target"
+  if codesign -d --entitlements :- "$target" 2>/dev/null \
+      | grep -Fq 'com.apple.security.cs.disable-library-validation'; then
+    fail "library validation must not be disabled for $target"
+  fi
+}
+
 [[ "$(read_identifier "$staged_macop")" == "macop" ]] || fail "macop identifier readback failed."
 [[ "$(read_identifier "$staged_agent")" == "macop-agent" ]] || fail "macop-agent identifier readback failed."
 [[ "$(read_identifier "$staged_auth_app")" == "io.github.slashkiko.macop.auth" ]] \
   || fail "MacopAuth identifier readback failed."
+require_hardened_runtime "$staged_macop"
+require_hardened_runtime "$staged_agent"
 if [[ -n "$signing_identity" ]]; then
   macop_team="$(read_team_id "$staged_macop")"
   agent_team="$(read_team_id "$staged_agent")"

@@ -1,9 +1,11 @@
 # macop Design Document
 
 Status: Draft
-Last updated: 2026-08-14
+Last updated: 2026-08-28
 
 > **Phase 0 update (2026-08-14):** CTK identityをApple純正`ssh-keychain.dylib`から直接利用できるため、「macop-agentだけが署名できる」という排他性は不採用とする。共用socketから元applicationを推定する方式も採用しない。一方、Phase 0bでapplication別の短命socket、起動PID・code identity・process ancestry、OpenSSH session bindingを組み合わせるverified-session agentが条件付きで成立することを実機確認した。nonceはrootから観測できる証拠ではなく、launcher/registry内のopaque reservation capabilityに限定する。Section 9.3–9.4と[feasibility report](./macop-phase0-feasibility-2026-08-14.md)が、本文中の競合する旧記述より優先する。
+
+> **Dogfood update (2026-08-28):** 現行macOSでは作成済みCTK identityを`ssh-keychain.dylib`が列挙できなかったため、現行実装は同dylibへ依存しない。公開鍵はSecurity.frameworkで解決し、`ssh test/run`は要求ごとのverified-session agentを介して署名する。Phase 0記録のdylib記述は脅威境界を定めた当時の調査結果としてのみ残す。
 
 ## 1. 概要
 
@@ -290,7 +292,7 @@ MVPでは設定済みのKeychain itemのみを対象にする。`item list`は`-
 
 `macop compatibility [--format human-readable|json]`は、command・subcommand・flagごとの`supported`、`partial`、`unsupported`、理由、代替commandを返す。JSON出力は`schema_version`を含む`macop`固有schemaとする。
 
-`macop config init|validate`は非機密の`config.json`だけを作成・検証する。`macop doctor`はOS、Keychain、CryptoTokenKit、`ssh-keychain.dylib`、設定permissionを診断する。`macop ssh …`はSection 9のSecure Enclave SSH wrapperを提供する。
+`macop config init|validate`は非機密の`config.json`だけを作成・検証する。`macop doctor`はOS、Keychain、CryptoTokenKit、Security.frameworkによる公開鍵解決、短命agent用SSH設定、設定permissionを診断する。`macop ssh …`はSection 9のSecure Enclave SSH wrapperを提供する。
 
 ## 9. SSH設計
 
@@ -298,12 +300,11 @@ SSH秘密鍵はKeychainから取得して渡すのではなく、Secure Enclave�
 
 ```mermaid
 flowchart LR
-    A["macop ssh run / test"] -->|"PKCS11Provider + ForwardAgent=no"| B["Apple /usr/bin/ssh"]
-    B --> C["ssh-keychain.dylib"]
+    A["macop ssh run / test"] --> B["session専用proxy socket"]
+    B --> C["macop-agent<br/>application・key別承認"]
     E["macopから起動したapplication / shell session"] --> F["session専用proxy socket"]
-    F --> G["macop-agent<br/>application・key別承認"]
-    G --> C
-    C -->|"SecKeyCreateSignature + local authentication"| D["CryptoTokenKit / Secure Enclave"]
+    F --> C
+    C -->|"MacopAuth + SecKeyCreateSignature"| D["CryptoTokenKit / Secure Enclave"]
 ```
 
 ### 9.1 純正コマンド
@@ -315,7 +316,7 @@ ssh-keygen -D /usr/lib/ssh-keychain.dylib
 sc_auth delete-ctk-identity -h '<public-key-hash>'
 ```
 
-`ssh-keychain.dylib`は公開鍵列挙だけでなく、CTK identityの署名にも使われるApple純正providerである。`ssh-keychain(8)`は`ssh -o PKCS11Provider=/usr/lib/ssh-keychain.dylib ...`を正式な利用例として示し、binaryも`SecKeyCreateSignature`を呼ぶ。元設計の「macop-agentだけが同じCTK identityで署名する」という排他性は成立しない。
+`ssh-keychain.dylib`は公開鍵列挙だけでなく、CTK identityの署名にも使い得るApple純正providerである。ただし2026-08-28のdogfood環境では作成済みidentityを列挙できず、現行実装の依存先から外した。OSの別経路が同じ鍵へ到達し得るというPhase 0の脅威境界は維持する。
 
 ### 9.2 ラッパーコマンド
 
@@ -328,9 +329,9 @@ macop ssh run github -- git clone git@github.com:owner/repo.git
 macop ssh delete github
 ```
 
-`macop`が設定へ保存するのはidentity label、公開鍵、公開鍵ハッシュなどの非機密metadataだけであり、secret値やprivate keyは保存しない。`run`と`test`はApple純正`ssh`へ`-F /dev/null`、対象identity、`PKCS11Provider=/usr/lib/ssh-keychain.dylib`、`IdentitiesOnly=yes`、`IdentityFile=none`、`IdentityAgent=none`、`PreferredAuthentications=publickey`、`ForwardAgent=no`を固定指定する。ユーザーSSH設定、既定identity file、ssh-agent、非公開鍵認証へfallbackして成功する経路はfail closedで禁止する。`create`は`p-256-ne -t bio`を標準にし、作成後にApple SSH providerが選択hashから公開鍵を正確に1件列挙できることまで検証する。
+`macop`が扱うのはidentity label、公開鍵、公開鍵ハッシュなどの非機密metadataだけであり、secret値やprivate keyは保存しない。`public-key`は選択hashをSecurity.frameworkで正確に1件へ解決する。`run`と`test`は選択identityだけを公開する短命agentの下でApple純正`ssh`を起動し、`-F /dev/null`、`PKCS11Provider=none`、`IdentitiesOnly=no`、`IdentityFile=none`、`IdentityAgent=SSH_AUTH_SOCK`、`PreferredAuthentications=publickey`、`ForwardAgent=no`を固定指定する。ユーザーSSH設定、既定identity file、別agent、非公開鍵認証へfallbackして成功する経路はfail closedで禁止する。`create`は`p-256-ne -t bio`を標準にし、作成後にSecurity.frameworkが選択hashから公開鍵を正確に1件解決できることまで検証する。
 
-verified-session agentは`macop ssh agent shell <identity-label> -- <program> [arguments...]`と`macop ssh agent application <identity-label> <application-path>`で起動する。いずれも新規に起動した協調rootだけを対象とし、既存application、外部relay、実CTK/Touch ID/GitHub/Sourcetree/TerminalのE2E互換性は保証しない。Phase 4ではprovider wrapperとverified-session agentを内部的に分離し、既存のApple純正`op`互換commandには影響させない。
+verified-session agentは`macop ssh agent shell <identity-label> -- <program> [arguments...]`と`macop ssh agent application <identity-label> <application-path>`で起動する。`ssh test/run`も同じlauncherを内部利用する。いずれも新規に起動した協調rootだけを対象とし、既存application、外部relay、Sourcetree/Terminal固有のE2E互換性は保証しない。
 
 ### 9.3 Phase 0で確定した限界
 
@@ -343,12 +344,14 @@ verified-session agentは`macop ssh agent shell <identity-label> -- <program> [a
 
 ### 9.4 設計変更案
 
-Phase 4は二つの経路を提供する。
+Phase 4は一つのverified-session基盤に、CLI用とapplication用の入口を提供する。
 
-1. **Apple provider wrapper:** 秘密鍵fileなし、non-exportable private key、Touch ID、既存`macop ssh run/test`を提供する。Apple providerからの直接利用も可能であり、macopのapplication別承認は適用されない。
-2. **verified-session agent:** macopがapplicationまたはshell sessionごとに短命なproxy socketを発行する。共用のstable `SSH_AUTH_SOCK`は公開しない。sessionをroot PID・process開始時刻・bundle ID・code requirement・鍵fingerprint・期限へ結び付け、直接peerが登録rootまたは生存中の子孫であることを毎接続時に確認する。nonceはrootへ渡さず、launcherとregistryが同一reservationを取り違えないためだけに保持する。
+1. **CLI入口:** `ssh test/run`が、選択identityだけを公開する短命agentの下でApple SSHまたはGitを起動する。
+2. **application入口:** `ssh agent application`が、新規application rootへsession専用proxy socketを渡す。
 
-verified modeでは、有効なOpenSSH session bindingが署名要求より前に届くことを必須にし、`forwarding=1`、bindingなし、外部relay、終了済みroot sessionをfail closedで拒否する。承認画面には起動前に選択したものと一致したcanonical executable path、署名authority/team、短縮cdhash、鍵名とfingerprint、対象session、期限を表示する。Apple anchorとTeam IDを確認できた場合だけ「trusted signature + exact image pinned」、ad-hoc/unanchoredなら「exact image pinned; publisher unverified」とする。同一live snapshotのidentifier+cdhash（trusted時はApple anchor+Team IDも含む）から最終requirementを構築してlive `SecCode`へstrict検証し、その同じrequirementをregistryへ保存する。生のcode requirementは表示しない。「macop-agent経由だけに適用され、Apple providerからの直接利用は制御しない」と明記する。host bindingで受け入れるhost keyは`ssh-ed25519`と`ecdsa-sha2-nistp256`だけとし、RSAとhost certificateは互換fallbackなしで拒否する。
+いずれも共用のstable `SSH_AUTH_SOCK`は公開しない。sessionをroot PID・process開始時刻・bundle ID・code requirement・鍵fingerprint・期限へ結び付け、直接peerが登録rootまたは生存中の子孫であることを毎接続時に確認する。nonceはrootへ渡さず、launcherとregistryが同一reservationを取り違えないためだけに保持する。
+
+verified modeでは、有効なOpenSSH session bindingが署名要求より前に届くことを必須にし、`forwarding=1`、bindingなし、外部relay、終了済みroot sessionをfail closedで拒否する。承認画面には起動前に選択したものと一致したcanonical executable path、署名authority/team、短縮cdhash、鍵名とfingerprint、対象session、期限を表示する。Apple anchorとTeam IDを確認できた場合だけ「trusted signature + exact image pinned」、ad-hoc/unanchoredなら「exact image pinned; publisher unverified」とする。同一live snapshotのidentifier+cdhash（trusted時はApple anchor+Team IDも含む）から最終requirementを構築してlive `SecCode`へstrict検証し、その同じrequirementをregistryへ保存する。生のcode requirementは表示しない。「macop-agent経由だけに適用され、OSのalternate direct CTK accessは制御しない」と明記する。host bindingで受け入れるhost keyは`ssh-ed25519`と`ecdsa-sha2-nistp256`だけとし、RSAとhost certificateは互換fallbackなしで拒否する。
 
 Phase 0bでは、最小`.app`を`NSWorkspace.OpenConfiguration`から起動して専用`SSH_AUTH_SOCK`とnonce環境変数を渡し、launcherの起動PIDとsocket peer PID、bundle ID、および協調probeが自己申告したnonceが一致することを確認した。このnonce一致はproduction rootをagent側から認証した証拠ではない。macOSでは同一UIDでも`KERN_PROCARGS2`による他process環境の取得が許可されないため、productionではnonceを子processへ渡さず、rootから再観測して照合する設計も採用しない。process ancestry試験では正規の子processを許可し、socket pathを知る外部processとroot終了後の孤児processを拒否した。Sourcetree固有の挙動、Terminalタブ単位integration、実CTK identityでのTouch ID / GitHub E2EはPhase 4の未完了項目とする。
 
@@ -367,9 +370,9 @@ nonceはlauncher/registryが保持するreservation相関情報であり、root�
 | Keychain metadata検索 | Security.framework `SecItemCopyMatching` | `op item list` |
 | Secure Enclave鍵生成 | `sc_auth create-ctk-identity` | `macop ssh create` |
 | CTK identity一覧 | `sc_auth list-ctk-identities` | `macop ssh list` |
-| SSH公開鍵取得 | `ssh-keygen -D /usr/lib/ssh-keychain.dylib` | `macop ssh public-key` |
-| Secure Enclave署名 | `ssh-keychain.dylib` → Security.framework `SecKeyCreateSignature` | `macop ssh run/test` wrapper / verified-session agent |
-| 要求元application別承認 | Apple単独の同等機能なし | macopが起動・登録したverified sessionだけに提供。Apple provider直接利用は制御外 |
+| SSH公開鍵取得 | Security.framework | `macop ssh public-key` |
+| Secure Enclave署名 | Security.framework `SecKeyCreateSignature` | `macop ssh run/test` / verified-session agent |
+| 要求元application別承認 | Apple単独の同等機能なし | macopが起動・登録したverified sessionだけに提供。alternate direct CTK accessは制御外 |
 
 通常Keychainのsecret取得は`security -w`を子プロセスとして呼ばず、Security.frameworkを直接利用する。これにより不要なstdout出力を避ける。
 
@@ -436,11 +439,9 @@ flowchart TD
     Parser --> Injector["Template Injector"]
     Parser --> SSH["Secure Enclave SSH Controller"]
     SSH --> CTK["sc_auth / CryptoTokenKit"]
-    SSH --> AppleSSH["Apple ssh + ssh-keychain.dylib"]
-    AppleSSH --> Key["Security.framework<br>SecKeyCreateSignature"]
     SSH --> Agent["macop-agent<br>verified-session socket"]
     Agent --> Broker
-    AuthApp --> Key
+    AuthApp --> Key["Security.framework<br>SecKeyCreateSignature"]
     Parser --> Unsupported["Unsupported Command Reporter"]
 ```
 
@@ -462,7 +463,7 @@ flowchart TD
 - `TerminalRelay`: 非対話時のPipe、対話時の`openpty`、SIGINT/SIGTERM/terminal sizeのrelay
 - `OutputRedactor`: secret byte列を跨ぎchunkで検出しstdout/stderrをmaskする。`--no-masking`時は迂回
 - `Injector`: メモリ上でのtemplate置換
-- `SSHProvider`: `sc_auth`、CryptoTokenKit、public key照合、Apple `ssh-keychain.dylib`を使うwrapper。`run/test`では`ForwardAgent=no`を明示する
+- `SSHProvider`: `sc_auth`、Security.frameworkによるpublic key照合、短命agent launcher。`run/test`では`ForwardAgent=no`を明示する
 - `AgentProtocol`: OpenSSH agent framing、session binding、sign request。verified modeではbindingなしと`forwarding=1`を拒否する
 - `SessionRegistry`: application / shell session別のsocket、nonce、root PID・開始時刻、code requirement、有効期限を管理する
 - `RequesterVerifier`: `LOCAL_PEERPID`、process ancestry、code identityを検証し、登録root外と終了済みsessionを拒否する
@@ -471,7 +472,7 @@ flowchart TD
 - `MacopAuth`: application icon・検証状態・鍵・要求内容を表示し、`LocalAuthenticationView`と同じ`LAContext`でTouch ID承認、Secure Enclave署名、managed Keychain操作を行うon-demand app
 - `ManagedKeychain`: Data Protection Keychainと`userPresence` access controlを使うcreate-only import / exact read。matching provisioning profileがないbuildではcapabilityを広告しない
 - `ErrorRenderer`: text / JSON形式の構造化エラー
-- `Doctor`: OS、純正バイナリ、provider、code signature、設定permissionの診断
+- `Doctor`: OS、純正バイナリ、Security.framework公開鍵解決、code signature、設定permissionの診断
 
 ### 12.3 secretの型とプロセス境界
 
@@ -483,9 +484,9 @@ Swiftの通常メモリを完全にzeroizeできるとは主張しない。secre
 
 ### 12.4 code signingと導入
 
-MVPの通常CLIは本人のMacでのsource buildを対象とし、`swift build -c release`後に`~/.local/bin/macop`へ配置する。script互換用の`op`は同directoryのsymlinkとする。通常CLIはad-hoc signature（`codesign --sign -`）を使えるが、更新ごとにdesignated requirementが変わり得るため、legacy login Keychainではitem ACL確認に加えてad-hoc clientのXARA partition確認が表示されることがある。installerは既存のcodesigning identityを明示して同一identityを更新後も再利用する導線を提供するが、Keychain ACLを自動変更しない。ただしverified-session agentはsame-UIDのad-hoc binary replacementを防げないため、ad-hoc source buildではfail closedとする。production verified modeにはApple anchor付きの同一Developer Team署名と、`macop`/`macop-agent`の固定identifierを要求する。helperは`POSIX_SPAWN_START_SUSPENDED`でexec後・user code実行前に停止し、親がlive `SecCode`を固定identifier/Team/Apple anchor要件で検証してから再開する。Developer ID signing、notarizationはこのproduction配布境界を満たす後続スコープとする。
+MVPの通常CLIは本人のMacでのsource buildを対象とし、`swift build -c release`後に`~/.local/bin/macop`へ配置する。script互換用の`op`は同directoryのsymlinkとする。通常CLIはad-hoc signature（`codesign --sign -`）を使えるが、更新ごとにdesignated requirementが変わり得るため、legacy login Keychainではitem ACL確認に加えてad-hoc clientのXARA partition確認が表示されることがある。installerは既存のcodesigning identityを明示して同一identityを更新後も再利用する導線を提供するが、Keychain ACLを自動変更しない。ただしverified-session agentはsame-UIDのad-hoc binary replacementを防げないため、ad-hoc source buildではfail closedとする。production verified modeにはApple anchor付きの同一Developer Team署名、`macop`/`macop-agent`の固定identifier、hardened runtime、およびlibrary validation無効化entitlementがないことを要求する。installerは両CLIを`--options runtime`で署名してreadbackする。helperは`POSIX_SPAWN_START_SUSPENDED`でexec後・user code実行前に停止し、親がlive `SecCode`を固定identifier/Team/Apple anchor/runtime要件で検証してから再開する。Developer ID signing、notarizationはこのproduction配布境界を満たす後続スコープとする。
 
-Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain設定に依存するため、MVPの実機integration testで確認する。`doctor`はinstall path、code signature、Keychain / CTK access結果、`ssh-keychain.dylib`の存在、選択されるSSH client、実効`ForwardAgent`設定を表示する。`doctor`自身はsecret値を表示しない。
+Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain設定に依存するため、MVPの実機integration testで確認する。`doctor`はinstall path、code signature、Keychain / CTK access結果、Security.frameworkによる公開鍵解決、選択されるSSH client、短命agent用の実効設定を表示する。`doctor`自身はsecret値を表示しない。
 
 ### 12.5 custom SSH agentの扱い
 
@@ -504,13 +505,13 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - 独自の復号鍵・master passwordを持たない。
 - SSH秘密鍵を取得・exportしない。
 - Secure Enclave鍵はnon-exportable variantを標準とする。
-- `macop ssh run/test`が起動するApple純正SSHでは`ForwardAgent=no`を明示する。
+- `macop ssh run/test`が短命agent内で起動するApple純正SSHでは`ForwardAgent=no`を明示する。
 - 共用のstable `SSH_AUTH_SOCK`を公開しない。
 - application名はmacopが作成したverified sessionの登録情報から表示し、接続後の親process推定だけでは決定しない。
 - verified modeはroot PID・開始時刻・code identity・鍵fingerprint・期限へ承認を結び付ける。nonceはlauncher/registry内の予約相関だけに使う。
 - verified modeは有効なOpenSSH session bindingを必須にし、`forwarding=1`とbindingなしを拒否する。
 - 登録applicationの侵害、process injection、登録process tree内の悪意あるrelayを防げるとは主張しない。
-- Apple純正providerを含む同一user session内の別processからCTK identity利用を排他的に禁止できるとは主張しない。
+- alternate direct CTK accessを含む同一user session内の別processからCTK identity利用を排他的に禁止できるとは主張しない。
 - `--out-file`は標準で禁止する。
 - 未対応操作を別処理へfallbackしない。
 - identity selectionは公開鍵ハッシュなど非機密情報で行う。
@@ -525,7 +526,7 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - 共用socketではrelayより前の元clientを識別できないため、stable socket案は不採用とした
 - Phase 0 spikeのapplication別専用socketでは、起動PID・peer PID・bundle IDと協調probeが自己申告したnonceの一致、外部relayと終了済みsessionの拒否を確認した。nonce自己申告はproductionのroot認証証拠にせず、productionではlauncher/registry内部の予約相関に限定した
 - Apple OpenSSH 10.2のsession bindingでAgent Forwardingを`forwarding=1`として検出できた
-- verified-session agentを条件付きGoとした。Sourcetree、Terminalタブ、実CTK identity / Touch ID / GitHub E2Eは未検証
+- verified-session agentを条件付きGoとした。当時はSourcetree、Terminalタブ、実CTK identity / Touch ID / GitHub E2Eが未検証だった
 - 詳細は[Phase 0 feasibility report](./macop-phase0-feasibility-2026-08-14.md)を参照する
 
 ### Phase 1: CLI・package基盤
@@ -560,12 +561,14 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 
 ### Phase 4: Secure Enclave SSH
 
-- identity作成・一覧・公開鍵取得・削除、Apple `ssh-keychain.dylib`を使う`run/test`、wrapperでの`ForwardAgent=no`、`doctor`診断
+- identity作成・一覧・Security.frameworkによる公開鍵取得・削除、短命agentを使う`run/test`、`ForwardAgent=no`、`doctor`診断
 - 共用socketを持たないsession registry、application / shell session別proxy socket、process / code identity検証
 - OpenSSH session bindingを必須化し、`forwarding=1`と非協調clientをfail closedで拒否
 - application・検証状態・鍵・session・期限を表示するTouch ID承認UIとsession単位cache
 - Sourcetree / Terminalの製品別integration、実CTK identityでの署名・GitHub E2E
-- 2026-08-28にcertificate-backed same-Team build、要求元icon付きTouch ID UI、自作agent経由の実CTK identity署名、GitHub SSH認証をdogfood確認済み
+- 2026-08-28にcertificate-backed same-Team build、要求元icon付きTouch ID UI、自作agent経由の実CTK identity署名、GitHub SSHの`shell/test/run`をdogfood確認済み
+- `/usr/bin/git`はdeveloper-tool shimであるため、`ssh run`はlookup overrideを除去した`xcrun --no-cache --find git`で実体imageを解決する。Gitは`POSIX_SPAWN_START_SUSPENDED`で起動し、`anchor apple`・`com.apple.git`・library validationをlive processで検証してexact requirement/cdhashをregistryへ固定する。registry activation・承認・agent authorization後だけ`SIGCONT`し、拒否時は一度も再開せずkill/reapする
+- `ssh run`は`git`と`/usr/bin/git`だけを入口として受け入れ、同名の任意実行ファイルへverified-session socketを渡さない
 
 ### Phase 5: 安全性と互換性
 
@@ -575,7 +578,7 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - `op`互換fixture test
 - 1Password JSON schemaを完全互換と誤認しない`item` metadata contract test
 - OS/version診断
-- UTF-8拒否、CTK identityのnon-exportability、`ForwardAgent=no`の実効値、Apple provider利用経路のintegration test
+- UTF-8拒否、CTK identityのnon-exportability、`ForwardAgent=no`の実効値、短命agent利用経路のintegration test
 - ad-hoc code signing、`~/.local/bin`へのinstall、binary更新後のKeychain認可を含むREADMEとsource build手順
 
 ## 15. MVP完了条件
@@ -586,9 +589,9 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - `op run`がstdout/stderrへ出たsecretをデフォルトでmaskし、`--no-masking`でだけ解除できる。
 - `op inject`でディスクへsecretを書かずstdoutへ展開できる。
 - Secure Enclave鍵で`git@github.com`へ認証できる。
-- `macop ssh run/test`がApple純正providerを使い、`ForwardAgent=no`を明示する。
+- `macop ssh run/test`が短命agentを使い、nested SSHで`ForwardAgent=no`を明示する。
 - verified-session agent経由では、macopが起動・登録したapplication / shell sessionと鍵ごとの承認UXを提供する。
-- Apple provider直接利用、未登録application、非協調clientにapplication別承認を提供するとは主張しない。
+- alternate direct CTK access、未登録application、非協調clientにapplication別承認を提供するとは主張しない。
 - `~/.ssh`に秘密鍵ファイルが存在しない。
 - `macop`独自ストレージにsecretが存在しない。
 - 未対応`op`コマンドが理由付きの終了コード`3`を返す。

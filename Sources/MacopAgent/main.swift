@@ -257,8 +257,10 @@ private struct LaunchCodeIdentity {
     let snapshot: LiveCodeIdentity
 }
 
-private func identity(for pid: Int32, expectedPath: String) throws -> LaunchCodeIdentity {
-    let inspection = try LiveCodeIdentityInspector.inspect(pid: pid, expectedPath: expectedPath)
+private func identity(for pid: Int32, expectedPath: String, mode: String) throws -> LaunchCodeIdentity {
+    let inspection = try mode == "git"
+        ? LiveCodeIdentityInspector.inspectExpectedAppleGit(pid: pid, expectedPath: expectedPath)
+        : LiveCodeIdentityInspector.inspect(pid: pid, expectedPath: expectedPath)
     return LaunchCodeIdentity(
         bundleID: inspection.identity.identifier,
         requirement: inspection.codeRequirement,
@@ -287,6 +289,105 @@ private func expectedExecutable(mode: String, target: [String], environment: [St
     throw AgentProtocolError.denied
 }
 
+private struct PreparedRootLaunch {
+    let owned: OwnedProcess
+    let code: LaunchCodeIdentity
+    let suspended: SuspendedProcessController?
+}
+
+private func prepareRootLaunch(
+    mode: String,
+    target: [String],
+    environment: [String: String],
+    inspect: (Int32, String, String) throws -> LaunchCodeIdentity
+) throws -> PreparedRootLaunch {
+    let expectedPath = try expectedExecutable(mode: mode, target: target, environment: environment)
+    let shellLike = mode == "shell" || mode == "git"
+    let lifecycleMode = shellLike ? "shell" : mode
+    let owned: OwnedProcess
+    var suspended: SuspendedProcessController?
+    if shellLike {
+        let isolatedProcessGroup = !hasInteractiveTerminal()
+        let pid: Int32
+        if mode == "git" {
+            pid = try spawnSuspended(
+                target, environment: environment, isolatedProcessGroup: isolatedProcessGroup
+            )
+            suspended = SuspendedProcessController(pid: pid)
+        } else {
+            pid = try spawn(target, environment: environment, isolatedProcessGroup: isolatedProcessGroup)
+        }
+        do {
+            owned = try capture(pid, mode: lifecycleMode)
+        } catch {
+            if suspended?.cancelBeforeResume() != true {
+                abandon(pid, mode: lifecycleMode, isolated: isolatedProcessGroup)
+            }
+            throw error
+        }
+    } else if mode == "application" {
+        let application = try launchApplication(target[0], environment: environment)
+        do {
+            owned = try capture(application.processIdentifier, mode: mode, app: application)
+        } catch {
+            abandon(application.processIdentifier, mode: mode, app: application)
+            throw error
+        }
+    } else {
+        throw AgentProtocolError.denied
+    }
+    do {
+        let code = try inspect(owned.pid, expectedPath, mode)
+        return PreparedRootLaunch(owned: owned, code: code, suspended: suspended)
+    } catch {
+        if suspended?.cancelBeforeResume() != true {
+            terminateOwnedRoot(owned)
+        }
+        throw error
+    }
+}
+
+#if DEBUG
+    private func runGitSuspendedLaunchFixture() -> Bool {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("macop-git-suspended-\(UUID().uuidString)", isDirectory: true)
+        let rejectedSideEffect = root.appendingPathComponent("rejected-ran")
+        let resumedSideEffect = root.appendingPathComponent("resumed-ran")
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            do {
+                _ = try prepareRootLaunch(
+                    mode: "git", target: ["/usr/bin/touch", rejectedSideEffect.path],
+                    environment: ProcessInfo.processInfo.environment,
+                    inspect: { _, _, _ in throw AgentProtocolError.denied }
+                )
+                return false
+            } catch AgentProtocolError.denied {}
+            guard !FileManager.default.fileExists(atPath: rejectedSideEffect.path) else { return false }
+            let prepared = try prepareRootLaunch(
+                mode: "git", target: ["/usr/bin/touch", resumedSideEffect.path],
+                environment: ProcessInfo.processInfo.environment,
+                inspect: { _, expectedPath, _ in
+                    LaunchCodeIdentity(
+                        bundleID: "fixture.git", requirement: "identifier fixture.git",
+                        snapshot: LiveCodeIdentity(
+                            canonicalPath: expectedPath, identifier: "fixture.git", teamID: nil,
+                            signingAuthority: nil, cdHash: "00112233", hasTrustedPublisher: false
+                        )
+                    )
+                }
+            )
+            guard let suspended = prepared.suspended else { return false }
+            try suspended.resume()
+            guard try waitForShellExit(prepared.owned.pid) == 0 else { return false }
+            return FileManager.default.fileExists(atPath: resumedSideEffect.path)
+        } catch {
+            return false
+        }
+    }
+#endif
+
 private func run(mode: String, label: String, target: [String], signals: SignalCoordinator) throws -> Int32 {
     let root = rootDirectory()
     let registry = try SessionRegistry(root: root)
@@ -295,58 +396,34 @@ private func run(mode: String, label: String, target: [String], signals: SignalC
         selectIdentity: { try SSHCommand.verifiedSessionIdentity(label: $0) },
         launch: { reservation in
             let launchEnvironment = environment(for: reservation)
-            let expectedPath = try expectedExecutable(mode: mode, target: target, environment: launchEnvironment)
-            let owned: OwnedProcess
-            if mode == "shell" {
-                let isolatedProcessGroup = !hasInteractiveTerminal()
-                let pid = try spawn(
-                    target, environment: launchEnvironment, isolatedProcessGroup: isolatedProcessGroup
-                )
-                // Capture the start time and group before any operation that
-                // could fail. Never re-read ownership in a deferred cleanup:
-                // a recycled PID must not be signalled.
-                do {
-                    owned = try capture(pid, mode: mode)
-                } catch {
-                    abandon(pid, mode: mode, isolated: isolatedProcessGroup)
-                    throw error
-                }
-            } else if mode == "application" {
-                let application = try launchApplication(target[0], environment: launchEnvironment)
-                do {
-                    owned = try capture(application.processIdentifier, mode: mode, app: application)
-                } catch {
-                    abandon(application.processIdentifier, mode: mode, app: application)
-                    throw error
-                }
-            } else {
-                throw AgentProtocolError.denied
-            }
-            var established = false
-            signals.installOwned(owned)
-            defer {
-                if !established {
-                    terminateOwnedRoot(owned)
-                }
-            }
-            let code = try identity(for: owned.pid, expectedPath: expectedPath)
-            established = true
+            let shellLike = mode == "shell" || mode == "git"
+            let prepared = try prepareRootLaunch(
+                mode: mode, target: target, environment: launchEnvironment, inspect: identity
+            )
+            signals.installOwned(prepared.owned)
             return VerifiedSessionRuntimeLaunch(
-                request: VerifiedSessionLaunchRequest(rootPID: owned.pid, rootStartTime: owned.startTime,
-                                                      bundleID: code.bundleID, codeRequirement: code.requirement,
-                                                      codeIdentity: code.snapshot),
+                request: VerifiedSessionLaunchRequest(
+                    rootPID: prepared.owned.pid, rootStartTime: prepared.owned.startTime,
+                    bundleID: prepared.code.bundleID, codeRequirement: prepared.code.requirement,
+                    codeIdentity: prepared.code.snapshot
+                ),
                 waitForExit: {
-                    if mode == "shell" {
+                    // VerifiedSessionRuntime calls this only after activation,
+                    // approval, signer installation, and registry authorization.
+                    try prepared.suspended?.resume()
+                    if shellLike {
                         signals.beginRootWait()
                         defer { signals.endRootWait() }
-                        return try waitForShellExit(owned.pid) { signals.isCancellationRequested() }
+                        return try waitForShellExit(prepared.owned.pid) { signals.isCancellationRequested() }
                     }
                     signals.beginRootWait()
                     defer { signals.endRootWait() }
-                    return try waitForApplicationExit(owned) { signals.isCancellationRequested() }
+                    return try waitForApplicationExit(prepared.owned) { signals.isCancellationRequested() }
                 },
                 cancel: {
-                    signals.cancelLaunch(owned)
+                    if prepared.suspended?.cancelBeforeResume() != true {
+                        signals.cancelLaunch(prepared.owned)
+                    }
                 }
             )
         },
@@ -373,6 +450,10 @@ private func run(mode: String, label: String, target: [String], signals: SignalC
 }
 
 #if DEBUG
+    if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_GIT_SUSPENDED_FIXTURE"] == "1" {
+        exit(runGitSuspendedLaunchFixture() ? ExitCode.success.rawValue : ExitCode.denied.rawValue)
+    }
+
     if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_LIFECYCLE_FIXTURES"] == "1" {
         exit(runLifecycleFixtures() ? ExitCode.success.rawValue : ExitCode.denied.rawValue)
     }
@@ -393,7 +474,7 @@ let label = args[1]
 do {
     try TrustedAgentHelperVerifier.requireTrustedRunningHelper()
     switch mode {
-    case "shell":
+    case "shell", "git":
         guard let separator = args.firstIndex(of: "--"), separator >= 2, separator + 1 < args.count else { fail(usage) }
         let status = try run(mode: mode, label: label, target: Array(args[(separator + 1)...]), signals: signals)
         debugSuccess(status)

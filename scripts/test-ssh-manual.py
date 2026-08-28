@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Non-mutating check that macop parses this Mac's sc_auth table faithfully."""
+"""Non-mutating check of CTK parsing and Security.framework public-key resolution."""
 import json
 import os
 import re
@@ -7,8 +7,8 @@ import subprocess
 import sys
 
 SC_AUTH = "/usr/sbin/sc_auth"
-SSH_KEYGEN = "/usr/bin/ssh-keygen"
-PROVIDER = "/usr/lib/ssh-keychain.dylib"
+SSH = "/usr/bin/ssh"
+MACOP = ".build/debug/macop"
 
 
 def run(arguments, environment=None):
@@ -65,8 +65,8 @@ def offline_fixture():
 
 def main():
     offline_fixture()
-    if not (os.path.exists(SC_AUTH) and os.path.exists(SSH_KEYGEN) and os.path.exists(PROVIDER)):
-        print("SKIP: required Apple SSH tooling is unavailable")
+    if not (os.path.exists(SC_AUTH) and os.path.exists(SSH) and os.path.exists(MACOP)):
+        print("SKIP: required macop/Apple SSH tooling is unavailable")
         return 0
     raw = run([SC_AUTH, "list-ctk-identities", "-t", "sha1", "-e", "hex"])
     if raw.returncode:
@@ -80,7 +80,7 @@ def main():
     if not identities:
         print("SKIP: no CTK identities")
     else:
-        listed = run([".build/debug/macop", "ssh", "list", "--format=json"])
+        listed = run([MACOP, "ssh", "list", "--format=json"])
         if listed.returncode:
             print(listed.stderr, file=sys.stderr)
             return listed.returncode
@@ -88,18 +88,17 @@ def main():
         if parsed != identities:
             print("macop identity JSON differs from raw sc_auth table", file=sys.stderr)
             return 1
-        for label, public_hash in identities:
-            environment = os.environ | {"KEYCHAIN_CERTIFICATES": public_hash}
-            keys = run([SSH_KEYGEN, "-D", PROVIDER], environment)
-            key_rows = [line for line in keys.stdout.splitlines() if line.startswith(("ecdsa-", "ssh-"))]
-            if keys.returncode or len(key_rows) != 1:
-                print(f"provider did not return one selected key for {label}", file=sys.stderr)
+        for label, _ in identities:
+            public_key = run([MACOP, "ssh", "public-key", label])
+            fields = public_key.stdout.strip().split(maxsplit=2)
+            if public_key.returncode or len(fields) != 3 or fields[0] != "ecdsa-sha2-nistp256" or fields[2] != label:
+                print(f"Security.framework did not resolve one selected key for {label}", file=sys.stderr)
                 return 1
-    config = run([".build/debug/macop", "config", "validate"])
+    config = run([MACOP, "config", "validate"])
     if config.returncode not in (0, 6):
         print(config.stderr, file=sys.stderr)
         return config.returncode
-    doctor = run([".build/debug/macop", "doctor", "--format=json"])
+    doctor = run([MACOP, "doctor", "--format=json"])
     if doctor.returncode:
         print(doctor.stderr or doctor.stdout, file=sys.stderr)
         return doctor.returncode

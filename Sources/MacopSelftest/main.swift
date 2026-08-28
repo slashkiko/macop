@@ -57,7 +57,14 @@ private func openFileDescriptorCount() throws -> Int {
 final class RecordingSSHExecutor: SSHStreamingExecuting, @unchecked Sendable {
     struct Invocation { let path: String; let arguments: [String]; let environment: [String: String] }
     var invocations = [Invocation]()
-    private var listCount = 0
+    private var listCount: Int
+    private let appleGitTrusted: Bool
+
+    init(identityAlreadyExists: Bool = false, appleGitTrusted: Bool = true) {
+        self.listCount = identityAlreadyExists ? 1 : 0
+        self.appleGitTrusted = appleGitTrusted
+    }
+
     func execute(path: String, arguments: [String], environment: CommandEnvironment) throws -> CommandResult {
         self.invocations.append(Invocation(path: path, arguments: arguments, environment: environment))
         if path == SSHCommand.scAuth, arguments.first == "list-ctk-identities" {
@@ -68,20 +75,28 @@ final class RecordingSSHExecutor: SSHStreamingExecuting, @unchecked Sendable {
                     : appleTableHeader + appleTableRow("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "github")
             )
         }
-        if path == SSHCommand.sshKeygen {
-            return CommandResult(exitCode: 0, stdout: "ecdsa-sha2-nistp256 AAAA github\n")
-        }
         if path == SSHCommand.ssh, arguments.first == "-G" {
             return CommandResult(
                 exitCode: 0,
-                stdout: "forwardagent no\npkcs11provider /usr/lib/ssh-keychain.dylib\nidentitiesonly yes\n"
-                    + "identityfile none\nidentityagent none\npreferredauthentications publickey\n"
+                stdout: "forwardagent no\npkcs11provider none\nidentitiesonly no\n"
+                    + "identityfile none\nidentityagent SSH_AUTH_SOCK\npreferredauthentications publickey\n"
             )
         }
         if path == "/usr/bin/codesign" {
             return CommandResult(exitCode: 0, stderr: "Signature=adhoc\n")
         }
+        if path == "/usr/bin/xcrun" {
+            return CommandResult(exitCode: 0, stdout: "/usr/bin/git\n")
+        }
         return CommandResult(exitCode: 0)
+    }
+
+    func validateAppleGitExecutable(path: String) throws {
+        guard self.appleGitTrusted, path == "/usr/bin/git" else { throw AgentProtocolError.denied }
+    }
+
+    func publicKeyBlob(identityLabel _: String, publicKeyHash _: String) throws -> Data {
+        Data([0, 0, 0, 4, 1, 2, 3, 4])
     }
 
     func executeStreaming(
@@ -93,6 +108,8 @@ final class RecordingSSHExecutor: SSHStreamingExecuting, @unchecked Sendable {
         return 23
     }
 }
+
+extension RecordingSSHExecutor: CTKPublicKeyResolving, AppleGitTrustValidating {}
 
 private struct AgentTestInspector: RequesterInspecting {
     func snapshot(of pid: Int32) -> ProcessSnapshot? {
@@ -264,11 +281,13 @@ private func runtimeSelftests() throws {
     let trustedMain = LiveCodeIdentity(
         canonicalPath: "/Applications/macop", identifier: "macop", teamID: "TEAM123",
         signingAuthority: "Developer ID Application: Example", cdHash: "aabbccdd",
+        signatureFlags: LiveCodeIdentity.hardenedRuntimeFlag,
         hasTrustedPublisher: true
     )
     let trustedHelper = LiveCodeIdentity(
         canonicalPath: "/Applications/macop-agent", identifier: "macop-agent", teamID: "TEAM123",
         signingAuthority: "Developer ID Application: Example", cdHash: "eeff0011",
+        signatureFlags: LiveCodeIdentity.hardenedRuntimeFlag,
         hasTrustedPublisher: true
     )
     try expect(
@@ -315,6 +334,25 @@ private func runtimeSelftests() throws {
     try expect(
         !TrustedAgentHelperVerifier.isTrustedPair(main: emptyTeamMain, helper: trustedHelper),
         "an empty signing Team ID must be rejected"
+    )
+    let nonRuntimeHelper = LiveCodeIdentity(
+        canonicalPath: trustedHelper.canonicalPath, identifier: trustedHelper.identifier,
+        teamID: trustedHelper.teamID, signingAuthority: trustedHelper.signingAuthority,
+        cdHash: trustedHelper.cdHash, hasTrustedPublisher: true
+    )
+    try expect(
+        !TrustedAgentHelperVerifier.isTrustedPair(main: trustedMain, helper: nonRuntimeHelper),
+        "a team-signed helper without hardened runtime must be rejected"
+    )
+    let libraryValidationDisabledHelper = LiveCodeIdentity(
+        canonicalPath: trustedHelper.canonicalPath, identifier: trustedHelper.identifier,
+        teamID: trustedHelper.teamID, signingAuthority: trustedHelper.signingAuthority,
+        cdHash: trustedHelper.cdHash, signatureFlags: LiveCodeIdentity.hardenedRuntimeFlag,
+        hasTrustedPublisher: true, disablesLibraryValidation: true
+    )
+    try expect(
+        !TrustedAgentHelperVerifier.isTrustedPair(main: trustedMain, helper: libraryValidationDisabledHelper),
+        "a helper that disables library validation must be rejected"
     )
     try expect(
         !LiveCodeIdentityInspector.matchesExpectedPath(actual: "/tmp/other-root", expected: "/tmp/test-agent"),
@@ -548,6 +586,24 @@ private func agentSelftests() throws {
             && !liveInspection.codeRequirement.contains("com.apple.Terminal"),
         "live inspection must return its exact identifier+cdhash-bound requirement"
     )
+    let activeGitResult = try RunCommand.capture(
+        argv: ["/usr/bin/xcrun", "--no-cache", "--find", "git"],
+        environment: ProcessInfo.processInfo.environment, limit: 4096
+    )
+    let activeGitPath = activeGitResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    try expect(activeGitResult.exitCode == 0 && !activeGitPath.isEmpty, "xcrun must resolve active Apple Git")
+    let activeGitIdentity = try LiveCodeIdentityInspector.inspectExpectedAppleGitStatic(path: activeGitPath)
+    try expect(
+        activeGitIdentity.identifier == "com.apple.git" && activeGitIdentity.requiresLibraryValidation,
+        "resolved Git must satisfy Apple's Git requirement and library validation before launch"
+    )
+    let liveGit = try RunCommand.captureSuspendedFixture(
+        argv: [activeGitPath, "--version"], environment: ProcessInfo.processInfo.environment, limit: 4096,
+        validate: { pid in
+            _ = try LiveCodeIdentityInspector.inspectExpectedAppleGit(pid: pid, expectedPath: activeGitPath)
+        }
+    )
+    try expect(liveGit.exitCode == 0, "suspended active Git must satisfy the live Apple requirement")
     let mismatchedPathCandidate = LiveCodeIdentity(
         canonicalPath: "/tmp/macop-forged-main-executable",
         identifier: liveSigning.identifier,
@@ -1386,7 +1442,7 @@ private func agentSelftests() throws {
     } catch AgentProtocolError.malformed {}
 }
 
-final class SequencedSSHExecutor: CommandExecuting, @unchecked Sendable {
+final class SequencedSSHExecutor: CTKPublicKeyResolving, @unchecked Sendable {
     struct Invocation { let path: String; let arguments: [String]; let environment: CommandEnvironment }
     var invocations = [Invocation]()
     var lists: [String]
@@ -1411,13 +1467,18 @@ final class SequencedSSHExecutor: CommandExecuting, @unchecked Sendable {
         if path == SSHCommand.scAuth, arguments.first == "list-ctk-identities" {
             return CommandResult(exitCode: 0, stdout: self.lists.isEmpty ? "" : self.lists.removeFirst())
         }
-        if path == SSHCommand.sshKeygen {
-            return self.providerResult
-        }
         if path == SSHCommand.scAuth, arguments.first == "create-ctk-identity" {
             return self.createResult
         }
         return CommandResult(exitCode: 0)
+    }
+
+    func publicKeyBlob(identityLabel _: String, publicKeyHash _: String) throws -> Data {
+        guard self.providerResult.exitCode == 0,
+              let encoded = self.providerResult.stdout.split(separator: " ").dropFirst().first,
+              let blob = Data(base64Encoded: String(encoded))
+        else { throw AgentProtocolError.denied }
+        return blob
     }
 }
 
@@ -1524,6 +1585,24 @@ private func runHarnessIfRequested() -> Never? {
         write(result.stdout, to: .standardOutput)
         write(result.stderr, to: .standardError)
         exit(result.exitCode)
+    case "--pty-ssh-test":
+        let greeting = "Hi user! You've successfully authenticated, but GitHub does not provide shell access.\n"
+        let sshApp = MacopApp(
+            keychainClient: FakeKeychainClient(response: .success(Data())),
+            commandExecutor: GitHubTestExecutor(output: greeting, code: 1)
+        )
+        let argv = ["macop", "ssh", "test", "github"]
+        let result = sshApp.runInteractivelyIfNeeded(argv: argv, env: harnessEnvironment)
+            ?? sshApp.runStreamingIfNeeded(
+                argv: argv,
+                env: harnessEnvironment,
+                stdout: { try? FileHandle.standardOutput.write(contentsOf: $0) },
+                stderr: { try? FileHandle.standardError.write(contentsOf: $0) }
+            )
+            ?? sshApp.run(argv: argv, env: harnessEnvironment)
+        write(result.stdout, to: .standardOutput)
+        write(result.stderr, to: .standardError)
+        exit(result.exitCode)
     case "--inject-stdin":
         let input = FileHandle.standardInput.readDataToEndOfFile()
         let argv = ["macop"] + Array(arguments.dropFirst()) + ["inject"]
@@ -1593,8 +1672,8 @@ func run() throws {
         "verified-session launcher must pass only the dedicated socket"
     )
     try expect(
-        VerifiedSessionLauncher.notice(for: verifiedSession).contains("direct Apple provider use is not controlled"),
-        "verified-session notice must state the Apple-provider boundary"
+        VerifiedSessionLauncher.notice(for: verifiedSession).contains("direct CTK access outside it is not controlled"),
+        "verified-session notice must state the direct-CTK-access boundary"
     )
     let presentation = SessionAuthorizationPresentation(
         identityLabel: "test",
@@ -1731,8 +1810,7 @@ func run() throws {
         }
     )
     try expect(
-        agentIdentity.fingerprint == sshFingerprint(for: agentTestKey)
-            && !agentIdentityExecutor.invocations.contains { $0.path == SSHCommand.sshKeygen },
+        agentIdentity.fingerprint == sshFingerprint(for: agentTestKey),
         "verified-session identity selection must derive public material without the Apple SSH provider"
     )
     let createdJSONExecutor = SequencedSSHExecutor(lists: [
@@ -1864,26 +1942,27 @@ func run() throws {
         duplicatePostCreate.exitCode == 4,
         "ssh create must fail when post-create identity verification is ambiguous"
     )
-    let unusableProviderExecutor = SequencedSSHExecutor(
+    let unusableSecurityIdentityExecutor = SequencedSSHExecutor(
         lists: [
             emptyTable,
             appleTableHeader + appleTableRow("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "unsupported-key")
         ],
         providerResult: CommandResult(exitCode: 0)
     )
-    let unusableProviderApp = MacopApp(
+    let unusableSecurityIdentityApp = MacopApp(
         keychainClient: FakeKeychainClient(response: .success(Data())),
-        commandExecutor: unusableProviderExecutor,
+        commandExecutor: unusableSecurityIdentityExecutor,
         biometricChecker: AvailableBiometricChecker()
     )
-    let unusableProviderCreate = unusableProviderApp.run(
+    let unusableSecurityIdentityCreate = unusableSecurityIdentityApp.run(
         argv: ["macop", "ssh", "create", "unsupported-key"], env: [:]
     )
     try expect(
-        unusableProviderCreate.exitCode == 4
-            && unusableProviderCreate.stderr.contains("identity was created")
-            && unusableProviderCreate.stderr.contains("cannot expose exactly one usable public key"),
-        "ssh create must report a persisted identity that the Apple SSH provider cannot use"
+        unusableSecurityIdentityCreate.exitCode == 4
+            && unusableSecurityIdentityCreate.stderr.contains("identity was created")
+            && unusableSecurityIdentityCreate.stderr
+            .contains("Security.framework cannot resolve exactly one public key"),
+        "ssh create must report a persisted identity that Security.framework cannot resolve"
     )
     let failedCreateExecutor = SequencedSSHExecutor(
         lists: [emptyTable, emptyTable],
@@ -1957,7 +2036,8 @@ func run() throws {
     let publicKeyJSON = try JSONSerialization.jsonObject(with: Data(publicKey.stdout.utf8)) as? [String: Any]
     try expect(
         publicKeyJSON?["schema_version"] as? Int == 1 && publicKeyJSON?["label"] as? String == "github"
-            && publicKeyJSON?["public_key"] is String && publicKeyJSON?["provider"] as? String == "ssh-keychain",
+            && publicKeyJSON?["public_key"] is String
+            && publicKeyJSON?["provider"] as? String == "security-framework",
         "ssh public-key JSON must conform to its typed schema"
     )
     let deletedIdentity = sshApp.run(argv: ["macop", "ssh", "delete", "github"], env: [:])
@@ -1974,26 +2054,71 @@ func run() throws {
     )
     try expect(gitRun.exitCode == 0, "ssh run should invoke git without a shell")
     let notGitRun = sshApp.run(argv: ["macop", "ssh", "run", "github", "--", "notgit", "status"], env: [:])
-    try expect(notGitRun.exitCode == 3, "ssh run must reject executables whose basename is not exactly git")
+    try expect(notGitRun.exitCode == 3, "ssh run must reject non-Git executables")
+    let renamedGitRun = sshApp.run(
+        argv: ["macop", "ssh", "run", "github", "--", "/tmp/git", "status"], env: [:]
+    )
+    try expect(
+        renamedGitRun.exitCode == 3,
+        "ssh run must not treat an arbitrary executable named git as a trusted Git image"
+    )
     let absoluteGitRun = sshApp.run(
         argv: ["macop", "ssh", "run", "github", "--", "/usr/bin/git", "status"], env: [:]
     )
     try expect(absoluteGitRun.exitCode == 0, "ssh run should accept an absolute executable whose basename is git")
     try expect(
-        sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?
-            .contains("PKCS11Provider=/usr/lib/ssh-keychain.dylib") == true
+        sshExecutor.invocations.last?.path == "macop-agent"
+            && sshExecutor.invocations.last?.arguments.prefix(4) == ["git", "github", "--", "/usr/bin/git"]
+            && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?
+            .contains("PKCS11Provider=none") == true
             && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?.contains("ForwardAgent=no") == true
             && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?.contains("-F /dev/null") == true
             && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?.contains("IdentityFile=none") == true
-            && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?.contains("IdentityAgent=none") == true
+            && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?
+            .contains("IdentityAgent=SSH_AUTH_SOCK") == true
+            && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?.contains("IdentitiesOnly=no") == true
             && sshExecutor.invocations.last?.environment["GIT_SSH_COMMAND"]?
             .contains("PreferredAuthentications=publickey") == true,
-        "ssh run must isolate the Apple provider from user config, identity files, and agents"
+        "ssh run must launch git under the one-shot agent and isolate SSH from user identities"
+    )
+    let controlledLookupExecutor = RecordingSSHExecutor(identityAlreadyExists: true)
+    let controlledLookupApp = MacopApp(
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: controlledLookupExecutor
+    )
+    let controlledLookup = controlledLookupApp.run(
+        argv: ["macop", "ssh", "run", "github", "--", "git", "status"],
+        env: [
+            "DEVELOPER_DIR": "/tmp/forged-developer",
+            "SDKROOT": "/tmp/forged-sdk",
+            "TOOLCHAINS": "forged",
+            "xcrun_log": "1",
+            "xcrun_nocache": "0",
+            "xcrun_verbose": "1"
+        ]
+    )
+    let xcrunInvocation = controlledLookupExecutor.invocations.first { $0.path == "/usr/bin/xcrun" }
+    try expect(
+        controlledLookup.exitCode == 0
+            && xcrunInvocation?.arguments == ["--no-cache", "--find", "git"]
+            && xcrunInvocation?.environment["DEVELOPER_DIR"] == nil
+            && xcrunInvocation?.environment["SDKROOT"] == nil
+            && xcrunInvocation?.environment["TOOLCHAINS"] == nil
+            && xcrunInvocation?.environment.keys.contains(where: { $0.hasPrefix("xcrun_") }) == false,
+        "ssh run must remove xcrun lookup overrides and bypass its mutable cache"
+    )
+    let untrustedGitExecutor = RecordingSSHExecutor(identityAlreadyExists: true, appleGitTrusted: false)
+    let untrustedGitApp = MacopApp(
+        keychainClient: FakeKeychainClient(response: .success(Data())), commandExecutor: untrustedGitExecutor
+    )
+    let untrustedGit = untrustedGitApp.run(
+        argv: ["macop", "ssh", "run", "github", "--", "git", "status"], env: [:]
     )
     try expect(
-        sshExecutor.invocations.last?
-            .environment["KEYCHAIN_CERTIFICATES"] == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "ssh run must restrict the Apple provider to the selected public-key hash"
+        untrustedGit.exitCode == ExitCode.providerUnavailable.rawValue
+            && untrustedGit.stderr.contains("Apple-signed, library-validated Git image")
+            && !untrustedGitExecutor.invocations.contains(where: { $0.path == "macop-agent" }),
+        "ssh run must reject untrusted xcrun output before launching the agent"
     )
     let streamedSSH = StreamCollector()
     let streamingSSH = sshApp.runStreamingIfNeeded(
@@ -2019,17 +2144,19 @@ func run() throws {
         "GitHub's documented authenticated greeting at raw exit 1 must normalize to success"
     )
     try expect(
-        greetingExecutor.invocations.last?.arguments == [
-            "-F", "/dev/null",
-            "-o", "PKCS11Provider=/usr/lib/ssh-keychain.dylib",
-            "-o", "ForwardAgent=no",
-            "-o", "IdentitiesOnly=yes",
-            "-o", "IdentityFile=none",
-            "-o", "IdentityAgent=none",
-            "-o", "PreferredAuthentications=publickey",
-            "-T", "git@github.com"
-        ],
-        "ssh test must ignore user config and disable file and agent identities"
+        greetingExecutor.invocations.last?.path == "macop-agent"
+            && greetingExecutor.invocations.last?.arguments == [
+                "shell", "github", "--", "/usr/bin/ssh",
+                "-F", "/dev/null",
+                "-o", "PKCS11Provider=none",
+                "-o", "ForwardAgent=no",
+                "-o", "IdentitiesOnly=no",
+                "-o", "IdentityFile=none",
+                "-o", "IdentityAgent=SSH_AUTH_SOCK",
+                "-o", "PreferredAuthentications=publickey",
+                "-T", "git@github.com"
+            ],
+        "ssh test must run through the one-shot agent and ignore user identities"
     )
     let greetingStream = StreamCollector()
     let streamedGreeting = greetingApp.runStreamingIfNeeded(
@@ -2102,7 +2229,7 @@ func run() throws {
     )
     let unusableDoctorExecutor = SequencedSSHExecutor(
         lists: [appleTableHeader + appleTableRow("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "github")],
-        providerResult: CommandResult(exitCode: 0)
+        providerResult: CommandResult(exitCode: 1)
     )
     let unusableDoctor = MacopApp(
         keychainClient: FakeKeychainClient(response: .success(Data())),
@@ -2115,12 +2242,8 @@ func run() throws {
     try expect(
         unusableDoctor.exitCode == 4
             && unusableDoctorChecks?
-            .first(where: { $0["name"] as? String == "ssh_provider_keys" })?["status"] as? String == "fail"
-            && unusableDoctorExecutor.invocations.contains {
-                $0.path == SSHCommand.sshKeygen
-                    && $0.environment["KEYCHAIN_CERTIFICATES"] == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-            },
-        "doctor must fail when a CTK identity produces no selected Apple SSH provider key"
+            .first(where: { $0["name"] as? String == "security_identity_keys" })?["status"] as? String == "fail",
+        "doctor must fail when Security.framework cannot resolve a selected CTK public key"
     )
 
     let compatibilityEquals = app.run(argv: ["macop", "compatibility", "--format=json"], env: [:])

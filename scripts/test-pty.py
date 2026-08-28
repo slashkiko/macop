@@ -207,6 +207,17 @@ def check_basic_pty() -> None:
         os.close(sentinel)
 
 
+def check_interactive_ssh_test_normalization() -> None:
+    greeting = "Hi user! You've successfully authenticated, but GitHub does not provide shell access.\n"
+    harness = PTYProcess([], mode="--pty-ssh-test")
+    try:
+        status, output = harness.finish()
+    finally:
+        harness.close()
+    require_equal(status, 0, "interactive SSH test normalized status")
+    require_equal(normalized(output), greeting, "interactive SSH test greeting")
+
+
 def check_masking() -> None:
     status, output, _ = run_pty(["run", "--", "/bin/sh", "-c", 'printf "%s" "$GH_TOKEN"'])
     require_equal(status, 0, "masked PTY exit status")
@@ -489,6 +500,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="macop-pty-") as temporary:
         tmpdir = Path(temporary)
         check_basic_pty()
+        check_interactive_ssh_test_normalization()
         check_masking()
         check_signal_forwarding(tmpdir, signal.SIGINT, 41)
         check_signal_forwarding(tmpdir, signal.SIGTERM, 42)

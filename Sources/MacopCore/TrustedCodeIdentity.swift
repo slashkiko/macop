@@ -13,7 +13,10 @@ public struct LiveCodeIdentity: Sendable, Equatable {
     public let cdHash: String?
     public let signatureFlags: UInt32
     public let hasTrustedPublisher: Bool
-
+    public let disablesLibraryValidation: Bool
+    // Stable cs_blobs ABI flags used by Apple's codesign and Security.framework.
+    public static let hardenedRuntimeFlag: UInt32 = 0x0001_0000 // CS_RUNTIME
+    public static let libraryValidationFlag: UInt32 = 0x0000_2000 // CS_REQUIRE_LV
     public init(
         canonicalPath: String,
         identifier: String,
@@ -21,7 +24,8 @@ public struct LiveCodeIdentity: Sendable, Equatable {
         signingAuthority: String?,
         cdHash: String?,
         signatureFlags: UInt32 = 0,
-        hasTrustedPublisher: Bool
+        hasTrustedPublisher: Bool,
+        disablesLibraryValidation: Bool = false
     ) {
         self.canonicalPath = canonicalPath
         self.identifier = identifier
@@ -30,6 +34,15 @@ public struct LiveCodeIdentity: Sendable, Equatable {
         self.cdHash = cdHash
         self.signatureFlags = signatureFlags
         self.hasTrustedPublisher = hasTrustedPublisher
+        self.disablesLibraryValidation = disablesLibraryValidation
+    }
+
+    public var enforcesHardenedRuntimeLibraryValidation: Bool {
+        self.signatureFlags & Self.hardenedRuntimeFlag != 0 && !self.disablesLibraryValidation
+    }
+
+    public var requiresLibraryValidation: Bool {
+        self.signatureFlags & Self.libraryValidationFlag != 0 && !self.disablesLibraryValidation
     }
 
     public var provenanceSummary: String {
@@ -109,9 +122,55 @@ public enum LiveCodeIdentityInspector {
         let candidate = try self.snapshot(
             staticCode: staticCode, expectedPath: expectedPath, staticallyValidated: false
         )
-        guard candidate.identifier == identifier, candidate.teamID == teamID, candidate.hasTrustedPublisher else {
+        guard candidate.identifier == identifier, candidate.teamID == teamID, candidate.hasTrustedPublisher,
+              candidate.enforcesHardenedRuntimeLibraryValidation
+        else {
             throw AgentProtocolError.denied
         }
+        return try self.validateLiveCandidate(code: code, candidate: candidate)
+    }
+
+    /// Requires Apple's platform Git identity before it is launched. Xcode's
+    /// Git uses the platform `anchor apple` requirement and CS_REQUIRE_LV,
+    /// rather than the third-party hardened-runtime contract used by macop.
+    public static func inspectExpectedAppleGitStatic(path: String) throws -> LiveCodeIdentity {
+        let canonical = self.canonicalPath(path)
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: canonical) as CFURL, [], &staticCode) == errSecSuccess,
+              let staticCode
+        else { throw AgentProtocolError.denied }
+        let candidate = try self.snapshot(
+            staticCode: staticCode, expectedPath: canonical, staticallyValidated: true
+        )
+        let requirement = try self.expectedAppleGitRequirement()
+        guard candidate.identifier == self.appleGitIdentifier, candidate.requiresLibraryValidation,
+              SecStaticCodeCheckValidity(
+                  staticCode, SecCSFlags(rawValue: kSecCSStrictValidate), requirement
+              ) == errSecSuccess
+        else { throw AgentProtocolError.denied }
+        return candidate
+    }
+
+    /// Rechecks the same Apple requirement against the suspended live Git
+    /// image, then pins its exact cdhash for the verified session.
+    public static func inspectExpectedAppleGit(pid: Int32, expectedPath: String) throws -> LiveCodeInspection {
+        guard pid > 0 else { throw AgentProtocolError.denied }
+        var code: SecCode?
+        guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid: pid] as CFDictionary, [], &code) ==
+            errSecSuccess,
+            let code
+        else { throw AgentProtocolError.denied }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else {
+            throw AgentProtocolError.denied
+        }
+        let candidate = try self.snapshot(
+            staticCode: staticCode, expectedPath: expectedPath, staticallyValidated: false
+        )
+        let requirement = try self.expectedAppleGitRequirement()
+        guard candidate.identifier == self.appleGitIdentifier, candidate.requiresLibraryValidation,
+              SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), requirement) == errSecSuccess
+        else { throw AgentProtocolError.denied }
         return try self.validateLiveCandidate(code: code, candidate: candidate)
     }
 
@@ -158,12 +217,16 @@ public enum LiveCodeIdentityInspector {
         }
         let cdHash = (info[kSecCodeInfoUnique] as? Data)?.map { String(format: "%02x", $0) }.joined()
         let flags = (info[kSecCodeInfoFlags] as? NSNumber)?.uint32Value ?? 0
+        let entitlements = info[kSecCodeInfoEntitlementsDict] as? [String: Any]
+        let disablesLibraryValidation = entitlements?["com.apple.security.cs.disable-library-validation"] as? Bool
+            ?? false
         // Team IDs are assigned only to a certificate-backed identity.  Still
         // require Apple anchoring below before treating it as publisher proof.
         let trusted = teamID.map { self.isAppleAnchored(staticCode, teamID: $0, identifier: identifier) } ?? false
         return LiveCodeIdentity(
             canonicalPath: canonicalPath, identifier: identifier, teamID: teamID,
-            signingAuthority: authority, cdHash: cdHash, signatureFlags: flags, hasTrustedPublisher: trusted
+            signingAuthority: authority, cdHash: cdHash, signatureFlags: flags, hasTrustedPublisher: trusted,
+            disablesLibraryValidation: disablesLibraryValidation
         )
     }
 
@@ -221,6 +284,17 @@ public enum LiveCodeIdentityInspector {
         return requirement
     }
 
+    private static let appleGitIdentifier = "com.apple.git"
+
+    private static func expectedAppleGitRequirement() throws -> SecRequirement {
+        var requirement: SecRequirement?
+        let text = "anchor apple and identifier \"\(self.appleGitIdentifier)\""
+        guard SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess,
+              let requirement
+        else { throw AgentProtocolError.denied }
+        return requirement
+    }
+
     fileprivate static func isAppleAnchored(_ code: SecStaticCode, teamID: String, identifier: String) -> Bool {
         guard let requirement = try? self.trustedRequirement(identifier: identifier, teamID: teamID) else {
             return false
@@ -237,7 +311,6 @@ public struct TrustedAgentLaunchPolicy: Sendable, Equatable {
     public let executablePath: String
     public let teamID: String
     public let identifier: String
-
     public init(executablePath: String, teamID: String, identifier: String) {
         self.executablePath = executablePath
         self.teamID = teamID
@@ -300,6 +373,8 @@ public enum TrustedAgentHelperVerifier {
         else { return false }
         return main.identifier == self.mainIdentifier && helper.identifier == self.helperIdentifier
             && main.hasTrustedPublisher && helper.hasTrustedPublisher
+            && main.enforcesHardenedRuntimeLibraryValidation
+            && helper.enforcesHardenedRuntimeLibraryValidation
             && mainTeam == helperTeam
     }
 
@@ -310,13 +385,16 @@ public enum TrustedAgentHelperVerifier {
         let path = try RunningExecutable.path()
         let identity = try LiveCodeIdentityInspector.inspect(pid: getpid(), expectedPath: path).identity
         guard identity.identifier == self.helperIdentifier,
-              identity.hasTrustedPublisher else { throw self.unavailable() }
+              identity.hasTrustedPublisher,
+              identity.enforcesHardenedRuntimeLibraryValidation
+        else { throw self.unavailable() }
     }
 
     private static func unavailable() -> CLIError {
         .unsupportedCommand(
             command: "ssh agent",
-            reason: "Verified SSH sessions require a trusted team-signed macop and macop-agent package; ad-hoc source builds are not eligible."
+            reason: "Verified SSH sessions require a trusted team-signed, hardened-runtime macop and "
+                + "macop-agent package with library validation enabled; ad-hoc source builds are not eligible."
         )
     }
 }

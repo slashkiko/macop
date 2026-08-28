@@ -75,7 +75,9 @@ appropriate for the ordinary Keychain and `ssh` wrapper commands, but ad-hoc
 signing is deliberately **not** eligible for `macop ssh agent`: same-user
 replacement cannot be made safe with an ad-hoc signature. Verified sessions
 require a production pair signed by one Apple Developer team (Apple-anchored,
-same Team ID, `macop` and `macop-agent` identifiers). Keep the helper as a
+same Team ID, `macop` and `macop-agent` identifiers), with hardened runtime
+enabled and library validation not disabled. The installer applies and reads
+back those signing properties. Keep the helper as a
 regular user-owned, non-group/world-writable sibling; macop resolves its own
 image rather than `PATH`, validates both static signatures, and the helper
 is spawned suspended. Before any helper code can execute, the parent validates
@@ -227,39 +229,35 @@ macop ssh test github
 `create` uses a Secure Enclave `p-256-ne` identity with Touch ID. The private
 key is non-exportable: it is not written under `~/.ssh`, cannot be exported as
 an OpenSSH key, and cannot be moved or synchronized to another Mac. After
-creation, macop also requires Apple's SSH provider to expose exactly one public
-key for the new identity. Some macOS/provider combinations create the CTK
-identity but reject its algorithm; that returns exit 4 and leaves the identity
+creation, macop requires Security.framework to resolve exactly one public key
+for the new identity. Resolution failure returns exit 4 and leaves the identity
 visible for inspection and explicit `macop ssh delete <label>` cleanup rather
 than claiming a usable SSH setup.
 
-For the Apple provider in a normal SSH configuration, use the macOS provider
-and turn forwarding off for that host. Select a host-specific stanza rather
-than applying the provider globally:
+`macop ssh run` and `macop ssh test` launch the requested command under a
+one-shot verified-session agent. The nested Apple SSH process uses an empty
+config (`-F /dev/null`), `PKCS11Provider=none`, `ForwardAgent=no`,
+`IdentityFile=none`, `IdentityAgent=SSH_AUTH_SOCK`, and public-key-only
+authentication. The session socket exposes exactly the selected identity and
+is revoked with the launched root or its fixed deadline. These commands fail
+rather than authenticating with a key from the user's SSH config, a default
+identity file, another ssh-agent, or a non-public-key fallback.
+On macOS, `ssh run` resolves the `/usr/bin/git` developer-tool shim to the
+active Xcode/Command Line Tools Git image with xcrun lookup overrides removed
+and its mutable cache bypassed. Before launch and again on the suspended live
+process, Security.framework requires Apple's `com.apple.git` code requirement
+and library-validation flag, then pins the exact image as the verified root.
+Git remains suspended through registry activation and approval, and receives
+`SIGCONT` only after the session is authorized; rejection kills and reaps it
+without allowing its first instruction to run.
+It accepts only the `git` and `/usr/bin/git` entry points; renamed or alternate
+executables are rejected rather than receiving the verified-session socket.
 
-```sshconfig
-Host github.com
-  User git
-  PKCS11Provider /usr/lib/ssh-keychain.dylib
-  IdentitiesOnly yes
-  ForwardAgent no
-```
+`macop doctor` enumerates each CTK identity by its public hash, resolves its
+public key through Security.framework, and checks the effective isolated SSH
+configuration. It does not depend on `/usr/lib/ssh-keychain.dylib`.
 
-Alternatively, `macop ssh run` and `macop ssh test` invoke Apple SSH with an
-empty config (`-F /dev/null`), the provider, selected identity,
-`IdentitiesOnly=yes`, `IdentityFile=none`, `IdentityAgent=none`, and
-`PreferredAuthentications=publickey`, plus `ForwardAgent=no`. They fail rather
-than authenticating with a key from the user's SSH config, a default identity
-file, an ssh-agent, or a non-public-key fallback.
-Direct use of `/usr/lib/ssh-keychain.dylib` remains possible for the current
-user and is outside macop's agent-level controls.
-
-`macop doctor` enumerates each CTK identity by its public hash and requires the
-Apple provider to return exactly one selected key. An identity that exists in
-CryptoTokenKit but is unusable by `ssh-keychain.dylib` is therefore a failed
-diagnostic, not a passing provider check.
-
-The verified-session agent is a separate, deliberately constrained path. It
+The verified-session agent is deliberately constrained. It
 may present application- and key-specific approval only for a cooperating
 client that macop newly launched or registered. Existing applications,
 unregistered clients, non-cooperating clients, external relays, stale sessions,
@@ -344,7 +342,7 @@ authenticate, the launched root. Requests remain pending until activation;
 signing requires OpenSSH session binding and is revoked when the root exits or
 the fixed ten-minute session deadline shown in the approval prompt expires. Existing
 applications, manually exported socket paths, relays outside the launched
-process tree, and direct `ssh-keychain.dylib` use are intentionally outside
+process tree, and alternate direct CTK access paths are intentionally outside
 this verified-session contract.
 
 The approval prompt shows the launched root's canonical executable path, the
@@ -367,7 +365,8 @@ Focused/manual checks:
 
 - `MACOP_TEAM_SIGNED_MAIN=/path/to/macop MACOP_TEAM_SIGNED_HELPER=/path/to/macop-agent swift run macop-selftest`
   enables the gated integration check for a production Apple-anchored,
-  same-Team signed pair, including a suspended live helper launch; ordinary
+  same-Team, hardened-runtime signed pair with library validation enabled,
+  including a suspended live helper launch; ordinary
   ad-hoc CI exercises the negative policy and suspended pre-execution rejection
   instead.
 - `make test-keychain-integration` creates and removes a dedicated local test

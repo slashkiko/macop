@@ -95,6 +95,16 @@ test "$(codesign -d --verbose=4 "$bin_dir/macop" 2>&1 | sed -n 's/^Identifier=//
 test "$(codesign -d --verbose=4 "$bin_dir/macop-agent" 2>&1 | sed -n 's/^Identifier=//p')" = "macop-agent"
 test "$(codesign -d --verbose=4 "$bin_dir/MacopAuth.app" 2>&1 | sed -n 's/^Identifier=//p')" = \
   "io.github.slashkiko.macop.auth"
+macop_flags="$(codesign -d --verbose=4 "$bin_dir/macop" 2>&1 \
+  | sed -n 's/^CodeDirectory .* flags=\(0x[0-9A-Fa-f]*\).*/\1/p')"
+agent_flags="$(codesign -d --verbose=4 "$bin_dir/macop-agent" 2>&1 \
+  | sed -n 's/^CodeDirectory .* flags=\(0x[0-9A-Fa-f]*\).*/\1/p')"
+(( (macop_flags & 0x10000) != 0 ))
+(( (agent_flags & 0x10000) != 0 ))
+! codesign -d --entitlements :- "$bin_dir/macop" 2>/dev/null \
+  | grep -Fq 'com.apple.security.cs.disable-library-validation'
+! codesign -d --entitlements :- "$bin_dir/macop-agent" 2>/dev/null \
+  | grep -Fq 'com.apple.security.cs.disable-library-validation'
 grep -Fqx '# >>> macop PATH >>>' "$shell_profile"
 grep -Fqx "export PATH=$bin_dir:\"\$PATH\"" "$shell_profile"
 grep -Fqx 'export EXISTING_SETTING=preserved' "$shell_profile"

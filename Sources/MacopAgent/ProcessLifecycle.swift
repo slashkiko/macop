@@ -7,7 +7,9 @@ func snapshot(_ pid: Int32) -> ProcessSnapshot? {
     SystemRequesterInspector().snapshot(of: pid)
 }
 
-func spawn(_ argv: [String], environment: [String: String], isolatedProcessGroup: Bool) throws -> Int32 {
+private func spawnProcess(
+    _ argv: [String], environment: [String: String], isolatedProcessGroup: Bool, suspended: Bool
+) throws -> Int32 {
     guard let program = argv.first, !argv.isEmpty else { throw AgentProtocolError.denied }
     var arguments = argv.map { strdup($0) } + [nil]
     var variables = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
@@ -35,6 +37,9 @@ func spawn(_ argv: [String], environment: [String: String], isolatedProcessGroup
           posix_spawnattr_getflags(&attributes, &flags) == 0
     else { throw AgentProtocolError.denied }
     flags |= Int16(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_CLOEXEC_DEFAULT)
+    if suspended {
+        flags |= Int16(POSIX_SPAWN_START_SUSPENDED)
+    }
     if isolatedProcessGroup {
         guard posix_spawnattr_setflags(&attributes, flags | Int16(POSIX_SPAWN_SETPGROUP)) == 0,
               // A zero process-group argument asks posix_spawn to establish a
@@ -52,6 +57,57 @@ func spawn(_ argv: [String], environment: [String: String], isolatedProcessGroup
     }
     guard result == 0 else { throw AgentProtocolError.denied }
     return Int32(pid)
+}
+
+func spawn(_ argv: [String], environment: [String: String], isolatedProcessGroup: Bool) throws -> Int32 {
+    try spawnProcess(argv, environment: environment, isolatedProcessGroup: isolatedProcessGroup, suspended: false)
+}
+
+func spawnSuspended(_ argv: [String], environment: [String: String], isolatedProcessGroup: Bool) throws -> Int32 {
+    try spawnProcess(argv, environment: environment, isolatedProcessGroup: isolatedProcessGroup, suspended: true)
+}
+
+/// Owns the pre-execution state of one child created with
+/// POSIX_SPAWN_START_SUSPENDED. Cancellation kills and reaps that exact child
+/// without resuming it, so rejected code cannot run a first instruction.
+final class SuspendedProcessController: @unchecked Sendable {
+    private enum State { case suspended, resumed, cancelled }
+    private let lock = NSLock()
+    private let pid: Int32
+    private var state = State.suspended
+
+    init(pid: Int32) {
+        self.pid = pid
+    }
+
+    func resume() throws {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        guard self.state == .suspended, kill(pid_t(self.pid), SIGCONT) == 0 else {
+            throw AgentProtocolError.denied
+        }
+        self.state = .resumed
+    }
+
+    /// Returns true when the child was still suspended (or had already been
+    /// cancelled) and no general process-tree cleanup should follow.
+    func cancelBeforeResume() -> Bool {
+        self.lock.lock()
+        if self.state == .resumed {
+            self.lock.unlock()
+            return false
+        }
+        if self.state == .cancelled {
+            self.lock.unlock()
+            return true
+        }
+        self.state = .cancelled
+        self.lock.unlock()
+        _ = kill(pid_t(self.pid), SIGKILL)
+        var status: Int32 = 0
+        while waitpid(pid_t(self.pid), &status, 0) == -1, errno == EINTR {}
+        return true
+    }
 }
 
 final class ApplicationLaunchBox: @unchecked Sendable {
