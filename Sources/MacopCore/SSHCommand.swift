@@ -104,8 +104,8 @@ private final class BoundedCommandCapture: @unchecked Sendable {
 public enum SSHCommand {
     public struct VerifiedSessionIdentity: Sendable {
         public let fingerprint: String
-        fileprivate let label: String
-        fileprivate let publicKeyBlob: Data
+        public let label: String
+        public let publicKeyBlob: Data
 
         public init(fingerprint: String, label: String, publicKeyBlob: Data) {
             self.fingerprint = fingerprint
@@ -147,6 +147,10 @@ public enum SSHCommand {
         case "test": return try self.test(Array(args.dropFirst()), options: options, context: context)
         case "run": return try self.runWrapped(Array(args.dropFirst()), context: context)
         case "agent": return try self.agent(Array(args.dropFirst()), context: context)
+        case "shell-init": return try self.shellInit(Array(args.dropFirst()))
+        case "git-signing-config": return try self.gitSigningConfig(
+                Array(args.dropFirst()), options: options, context: context
+            )
         default: throw CLIError.invalidArguments(message: "Unknown ssh subcommand: \(subcommand)")
         }
     }
@@ -354,7 +358,83 @@ public enum SSHCommand {
     }
 }
 
+public extension SSHCommand {
+    static func verifiedSessionIdentity(
+        matchingPublicKeyBlob expected: Data,
+        env: [String: String] = ProcessInfo.processInfo.environment,
+        executor: CommandExecutor = SystemCommandExecutor()
+    ) throws -> VerifiedSessionIdentity {
+        let context = SSHContext(env: env, executor: executor)
+        let identities = try self.identities(context: context)
+        let matches = try identities.compactMap { identity -> VerifiedSessionIdentity? in
+            guard let hash = identity.hash else { return nil }
+            let blob: Data = if let fixture = executor as? any CTKPublicKeyResolving {
+                try fixture.publicKeyBlob(identityLabel: identity.label, publicKeyHash: hash)
+            } else {
+                try CTKIdentitySigner.publicKeyBlob(identityLabel: identity.label, publicKeyHash: hash)
+            }
+            guard constantTimeEqual(blob, expected) else { return nil }
+            return VerifiedSessionIdentity(
+                fingerprint: sshFingerprint(for: blob),
+                label: identity.label,
+                publicKeyBlob: blob
+            )
+        }
+        guard matches.count == 1, let match = matches.first else {
+            throw matches.isEmpty
+                ? CLIError.notFound(message: "No Secure Enclave identity matches the configured Git signing key.")
+                : CLIError.providerUnavailable(
+                    provider: "CryptoTokenKit",
+                    reason: "The configured Git signing key matches more than one identity."
+                )
+        }
+        return match
+    }
+}
+
 private extension SSHCommand {
+    private static func shellInit(_ args: [String]) throws -> CommandResult {
+        guard args.count == 1, let shell = args.first else {
+            throw CLIError.invalidArguments(message: "Usage: macop ssh shell-init <zsh|bash|fish>")
+        }
+        return try CommandResult(exitCode: 0, stdout: ShellIntegration.render(shell: shell) + "\n")
+    }
+
+    private static func gitSigningConfig(
+        _ args: [String],
+        options: GlobalOptions,
+        context: SSHContext
+    ) throws -> CommandResult {
+        guard args.count == 1, let label = args.first else {
+            throw CLIError.invalidArguments(message: "Usage: macop ssh git-signing-config <label>")
+        }
+        let identity = try self.selectedPublicIdentity(label: label, context: context)
+        let publicKey = "ecdsa-sha2-nistp256 \(identity.publicKeyBlob.base64EncodedString()) \(label)"
+        let program = try RunningExecutable.path()
+        if options.format == .json {
+            let payload: [String: Any] = [
+                "schema_version": 1,
+                "gpg_format": "ssh",
+                "signing_key": "key::\(publicKey)",
+                "signing_program": program
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            return CommandResult(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n")
+        }
+        return CommandResult(
+            exitCode: 0,
+            stdout: [
+                "git config --local gpg.format ssh",
+                "git config --local user.signingkey \(self.shellQuote("key::\(publicKey)"))",
+                "git config --local gpg.ssh.program \(self.shellQuote(program))"
+            ].joined(separator: "\n") + "\n"
+        )
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
     private static func agent(_ args: [String], context: SSHContext) throws -> CommandResult {
         let invocation = try self.agentInvocation(args, context: context)
         return try self.execute(invocation, context: context)

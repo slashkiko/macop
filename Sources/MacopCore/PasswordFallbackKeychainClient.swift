@@ -33,12 +33,13 @@ final class PasswordFallbackKeychainClient: KeychainClient, @unchecked Sendable 
             return .success(secret)
         case let .failure(failure):
             guard failure.status == errSecItemNotFound,
-                  case let .managed(service, account) = query
+                  case let .managed(service, account, synchronizable) = query
             else { return .failure(failure) }
             do {
                 let credential = try self.passwordAutoFillProvider.acquire(
                     service: service,
                     account: account,
+                    synchronizable: synchronizable,
                     command: self.command
                 )
                 guard !credential.secret.isEmpty,

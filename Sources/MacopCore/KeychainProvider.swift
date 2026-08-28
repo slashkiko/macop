@@ -5,7 +5,7 @@ import Security
 public enum KeychainQuery: Sendable, Hashable {
     case generic(service: String, account: String)
     case internet(server: String, account: String)
-    case managed(service: String, account: String)
+    case managed(service: String, account: String, synchronizable: Bool = false)
 }
 
 public struct KeychainFailure: Error, Sendable {
@@ -66,11 +66,12 @@ public struct SystemKeychainSecurityAccess: KeychainSecurityAccess {
             securityQuery[kSecClass] = kSecClassInternetPassword
             securityQuery[kSecAttrServer] = server
             securityQuery[kSecAttrAccount] = account
-        case let .managed(service, account):
+        case let .managed(service, account, synchronizable):
             securityQuery[kSecClass] = kSecClassGenericPassword
             securityQuery[kSecAttrService] = service
             securityQuery[kSecAttrAccount] = account
             securityQuery[kSecUseDataProtectionKeychain] = true
+            securityQuery[kSecAttrSynchronizable] = synchronizable
         }
         securityQuery[kSecReturnPersistentRef] = true
         securityQuery[kSecMatchLimit] = kSecMatchLimitAll

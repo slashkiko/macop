@@ -47,7 +47,11 @@ enum CredentialAcquireCommand {
         let service = item.value.service!
         let account = item.value.account!
         if !forcePasswords {
-            switch client.read(.managed(service: service, account: account)) {
+            switch client.read(.managed(
+                service: service,
+                account: account,
+                synchronizable: item.value.managedKeychainSynchronizable
+            )) {
             case let .success(secret):
                 guard !secret.isEmpty, secret.count <= ManagedKeychainStore.maximumSecretLength else {
                     throw CLIError.runtimeError(message: "Managed Keychain returned an invalid credential.")
@@ -62,6 +66,7 @@ enum CredentialAcquireCommand {
         let credential = try passwordAutoFillProvider.acquire(
             service: service,
             account: account,
+            synchronizable: item.value.managedKeychainSynchronizable,
             command: forcePasswords ? "macop item acquire --from-passwords" : "macop item acquire"
         )
         return try self.render(credential.secret, options: options)

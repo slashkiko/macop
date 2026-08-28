@@ -8,13 +8,25 @@ public enum ItemCommand {
         client: any KeychainClient,
         importer: any ManagedKeychainImporting = CompanionManagedKeychainImporter(),
         deleter: any ManagedKeychainDeleting = CompanionManagedKeychainDeleter(),
+        mutator: any KeychainMutating = SystemKeychainMutator(),
         passwordAutoFillProvider: any PasswordAutoFillProviding = CompanionPasswordAutoFillProvider()
     ) throws -> CommandResult {
         guard let subcommand = args.first
-        else { throw CLIError.invalidArguments(message: "item requires list, get, import, acquire, or delete.") }
+        else {
+            throw CLIError.invalidArguments(
+                message: "item requires list, get, create, edit, import, acquire, or delete."
+            )
+        }
         switch subcommand {
         case "list": return try self.list(Array(args.dropFirst()), options: options)
         case "get": return try self.get(Array(args.dropFirst()), options: options, client: client)
+        case "create", "edit": return try KeychainMutationCommand.run(
+                subcommand,
+                args: Array(args.dropFirst()),
+                options: options,
+                input: input,
+                mutator: mutator
+            )
         case "import": return try self.importItem(
                 Array(args.dropFirst()), options: options, input: input, importer: importer
             )
@@ -25,7 +37,7 @@ public enum ItemCommand {
                 passwordAutoFillProvider: passwordAutoFillProvider
             )
         case "delete": return try ManagedKeychainDeleteCommand.run(
-                Array(args.dropFirst()), options: options, deleter: deleter
+                Array(args.dropFirst()), options: options, deleter: deleter, mutator: mutator
             )
         default:
             if let reason = self.unsupportedSubcommandReason(subcommand) {
@@ -52,7 +64,12 @@ public enum ItemCommand {
         let item = try ManagedItemLocator.item(named: name, options: options)
         let service = item.value.service!
         let account = item.value.account!
-        try importer.importSecret(input, service: service, account: account)
+        try importer.importSecret(
+            input,
+            service: service,
+            account: account,
+            synchronizable: item.value.managedKeychainSynchronizable
+        )
         if options.format == .json {
             return CommandResult(exitCode: 0, stdout: "{\"schema_version\":1,\"status\":\"imported\"}\n")
         }
@@ -165,7 +182,11 @@ public enum ItemCommand {
             )
         }
         if item.provider == "keychain-managed", let service = item.service, let account = item.account {
-            return .managed(service: service, account: account)
+            return .managed(
+                service: service,
+                account: account,
+                synchronizable: item.managedKeychainSynchronizable
+            )
         }
         throw CLIError.unsupportedProvider(
             provider: item.provider,

@@ -49,6 +49,7 @@ public enum AuthBrokerOperation: UInt8, Sendable {
     case managedKeychainImport = 4
     case passwordAutoFill = 5
     case managedKeychainDelete = 6
+    case gitSSHSign = 7
 }
 
 public struct AuthBrokerApprovalRequest: Sendable, Equatable {
@@ -67,6 +68,7 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
     public let host: String
     public let keychainService: String
     public let keychainAccount: String
+    public let keychainSynchronizable: Bool
 
     public init(
         requestID: UUID,
@@ -83,7 +85,8 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
         credentialFingerprint: String,
         host: String,
         keychainService: String = "",
-        keychainAccount: String = ""
+        keychainAccount: String = "",
+        keychainSynchronizable: Bool = false
     ) {
         self.requestID = requestID
         self.issuedAtMilliseconds = issuedAtMilliseconds
@@ -100,6 +103,7 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
         self.host = host
         self.keychainService = keychainService
         self.keychainAccount = keychainAccount
+        self.keychainSynchronizable = keychainSynchronizable
     }
 }
 
@@ -256,6 +260,7 @@ public enum AuthBrokerWire {
             value += try self.text(request.host, maximum: self.maximumMetadataLength)
             value += try self.text(request.keychainService, maximum: self.maximumMetadataLength)
             value += try self.text(request.keychainAccount, maximum: self.maximumMetadataLength)
+            value.append(request.keychainSynchronizable ? 1 : 0)
         case let .approvalResponse(response):
             value.append(4)
             value += try self.text(response.requestID.uuidString, maximum: 36)
@@ -341,8 +346,10 @@ public enum AuthBrokerWire {
             let host = try cursor.text(maximum: self.maximumMetadataLength)
             let keychainService = try cursor.text(maximum: self.maximumMetadataLength)
             let keychainAccount = try cursor.text(maximum: self.maximumMetadataLength)
+            let keychainSynchronizable = try cursor.byte()
             guard cursor.isAtEnd, rootPID > 0, rootStartTime > 0,
-                  !rootIdentifier.isEmpty, !rootCodeRequirement.isEmpty, !rootExecutablePath.isEmpty
+                  !rootIdentifier.isEmpty, !rootCodeRequirement.isEmpty, !rootExecutablePath.isEmpty,
+                  keychainSynchronizable <= 1
             else { throw AuthBrokerProtocolError.malformed }
             return .approvalRequest(AuthBrokerApprovalRequest(
                 requestID: requestID,
@@ -359,7 +366,8 @@ public enum AuthBrokerWire {
                 credentialFingerprint: credentialFingerprint,
                 host: host,
                 keychainService: keychainService,
-                keychainAccount: keychainAccount
+                keychainAccount: keychainAccount,
+                keychainSynchronizable: keychainSynchronizable == 1
             ))
         case 4:
             guard let requestID = try UUID(uuidString: cursor.text(maximum: 36)),

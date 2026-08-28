@@ -15,6 +15,11 @@ public struct ConfigItem: Codable, Sendable {
     public let server: String?
     public let label: String?
     public let fields: [String]?
+    public let synchronization: String?
+
+    public var managedKeychainSynchronizable: Bool {
+        self.provider == "keychain-managed" && self.synchronization == "icloud"
+    }
 }
 
 public struct ConfigDocument: Codable, Sendable {
@@ -186,7 +191,7 @@ public enum ConfigStore {
                     message: "keychain-generic requires service and account in config item."
                 )
             }
-            guard item.server == nil, item.label == nil else {
+            guard item.server == nil, item.label == nil, item.synchronization == nil else {
                 throw CLIError
                     .invalidArguments(message: "keychain-generic does not allow server or label in config item.")
             }
@@ -197,7 +202,7 @@ public enum ConfigStore {
                     message: "keychain-internet requires server and account in config item."
                 )
             }
-            guard item.service == nil, item.label == nil else {
+            guard item.service == nil, item.label == nil, item.synchronization == nil else {
                 throw CLIError
                     .invalidArguments(message: "keychain-internet does not allow service or label in config item.")
             }
@@ -213,12 +218,21 @@ public enum ConfigStore {
                     message: "keychain-managed does not allow server or label in config item."
                 )
             }
+            guard item.synchronization == nil || item.synchronization == "local"
+                || item.synchronization == "icloud"
+            else {
+                throw CLIError.invalidArguments(
+                    message: "keychain-managed synchronization must be local or icloud."
+                )
+            }
             return .keychainManaged
         case "secure-enclave":
             guard self.hasValue(item.label) else {
                 throw CLIError.invalidArguments(message: "secure-enclave requires label in config item.")
             }
-            guard item.service == nil, item.account == nil, item.server == nil, item.fields == nil else {
+            guard item.service == nil, item.account == nil, item.server == nil, item.fields == nil,
+                  item.synchronization == nil
+            else {
                 throw CLIError.invalidArguments(message: "secure-enclave config items only allow provider and label.")
             }
             return .secureEnclave
@@ -275,7 +289,7 @@ public enum ConfigStore {
     }
 
     private static func validateJSONSchema(data: Data) throws {
-        guard !self.containsDuplicateObjectKey(in: data) else {
+        guard !StrictJSONDuplicateKeyScanner.containsDuplicateObjectKey(in: data) else {
             throw CLIError.invalidArguments(message: "Config file must not contain duplicate keys.")
         }
         let rootObject: Any
@@ -300,7 +314,8 @@ public enum ConfigStore {
                 throw CLIError.invalidArguments(message: "Config item \"\(key)\" must be an object with a provider.")
             }
             let allowed: Set<String> = switch provider {
-            case "keychain-generic", "keychain-managed": ["provider", "service", "account", "fields"]
+            case "keychain-generic": ["provider", "service", "account", "fields"]
+            case "keychain-managed": ["provider", "service", "account", "fields", "synchronization"]
             case "keychain-internet": ["provider", "server", "account", "fields"]
             case "secure-enclave": ["provider", "label"]
             default: ["provider"]
@@ -309,7 +324,7 @@ public enum ConfigStore {
                 throw CLIError
                     .invalidArguments(message: "Config item \"\(key)\" contains an unknown or secret-looking key.")
             }
-            for name in ["service", "account", "server", "label"] where item[name] != nil {
+            for name in ["service", "account", "server", "label", "synchronization"] where item[name] != nil {
                 guard item[name] is String else {
                     throw CLIError
                         .invalidArguments(message: "Config item \"\(key)\" field \"\(name)\" must be a string.")
@@ -323,65 +338,5 @@ public enum ConfigStore {
                 try self.validateFields(values)
             }
         }
-    }
-
-    private static func containsDuplicateObjectKey(in data: Data) -> Bool {
-        guard let text = String(data: data, encoding: .utf8) else { return false }
-        var stack: [Set<String>] = []
-        var index = text.startIndex
-        var expectingKey = false
-        while index < text.endIndex {
-            let character = text[index]
-            if character == "\"" {
-                let start = text.index(after: index)
-                var cursor = start
-                var escaped = false
-                while cursor < text.endIndex {
-                    let current = text[cursor]
-                    if current == "\"", !escaped {
-                        break
-                    }
-                    if current == "\\", !escaped {
-                        escaped = true
-                    } else {
-                        escaped = false
-                    }
-                    cursor = text.index(after: cursor)
-                }
-                guard cursor < text.endIndex else { return false }
-                guard let string = self.decodeJSONString(String(text[start ..< cursor])) else {
-                    return false
-                }
-                var after = text.index(after: cursor)
-                while after < text.endIndex, text[after].isWhitespace {
-                    after = text.index(after: after)
-                }
-                if expectingKey, after < text.endIndex, text[after] == ":" {
-                    if stack.last?.contains(string) == true {
-                        return true
-                    }
-                    stack[stack.count - 1].insert(string)
-                    expectingKey = false
-                }
-                index = text.index(after: cursor)
-                continue
-            }
-            if character == "{" {
-                stack.append([]); expectingKey = true
-            }
-            if character == "}" {
-                _ = stack.popLast(); expectingKey = false
-            }
-            if character == ",", !stack.isEmpty {
-                expectingKey = true
-            }
-            index = text.index(after: index)
-        }
-        return false
-    }
-
-    private static func decodeJSONString(_ rawValue: String) -> String? {
-        let data = Data("[\"\(rawValue)\"]".utf8)
-        return try? JSONDecoder().decode([String].self, from: data).first
     }
 }

@@ -251,6 +251,8 @@ private final class AuthApprovalCoordinator: ObservableObject {
             "Passwordsから選んだ資格情報をmacopで使用します。"
         case .managedKeychainDelete:
             "macop管理のKeychain項目を削除します。"
+        case .gitSSHSign:
+            "Secure EnclaveのSSH鍵でGit commitまたはtagへ署名します。"
         }
     }
 
@@ -344,7 +346,7 @@ private enum AuthBrokerAppServer {
         ) else { throw AgentProtocolError.denied }
         guard request.operation != .sshSign else { throw AgentProtocolError.denied }
         let requiredCapability = switch request.operation {
-        case .sshSession, .sshSign:
+        case .sshSession, .sshSign, .gitSSHSign:
             AuthBrokerCapability.sshSigning.rawValue
         case .managedKeychainRead, .managedKeychainImport, .passwordAutoFill, .managedKeychainDelete:
             AuthBrokerCapability.managedKeychain.rawValue
@@ -370,7 +372,8 @@ private enum AuthBrokerAppServer {
         var resultStatus = outcome.status == .approved ? errSecSuccess : errSecAuthFailed
         var resultData = Data()
         var resultMessage = ""
-        if outcome.status == .approved, let context = outcome.context, request.operation == .sshSession {
+        let isSigningRequest = request.operation == .sshSession || request.operation == .gitSSHSign
+        if outcome.status == .approved, let context = outcome.context, isSigningRequest {
             try self.validateRoot(request)
             let candidate = try SSHCommand.makeVerifiedSessionSigner(
                 label: request.credentialLabel,
@@ -391,6 +394,7 @@ private enum AuthBrokerAppServer {
             switch ManagedKeychainStore.read(
                 service: request.keychainService,
                 account: request.keychainAccount,
+                synchronizable: request.keychainSynchronizable,
                 authenticationContext: context
             ) {
             case let .success(secret):
@@ -412,6 +416,7 @@ private enum AuthBrokerAppServer {
                     credential,
                     service: request.keychainService,
                     account: request.keychainAccount,
+                    synchronizable: request.keychainSynchronizable,
                     authenticationContext: context
                 )
                 resultMessage = resultStatus == errSecSuccess ? "saved" : "save_failed"
@@ -431,6 +436,7 @@ private enum AuthBrokerAppServer {
                 resultStatus = ManagedKeychainStore.delete(
                     service: request.keychainService,
                     account: request.keychainAccount,
+                    synchronizable: request.keychainSynchronizable,
                     authenticationContext: context
                 )
             }
@@ -453,6 +459,8 @@ private enum AuthBrokerAppServer {
             }
         } else if request.operation == .managedKeychainDelete {
             resultStatus == errSecSuccess ? "Keychainから削除しました" : "Keychain項目の削除に失敗しました"
+        } else if request.operation == .gitSSHSign {
+            "Git SSH署名を許可しました"
         } else {
             "許可しました"
         }
@@ -489,6 +497,7 @@ private enum AuthBrokerAppServer {
             importRequest.secret,
             service: request.keychainService,
             account: request.keychainAccount,
+            synchronizable: request.keychainSynchronizable,
             authenticationContext: context
         )
         try AuthBrokerSocketIO.writeMessage(.managedKeychainImportResponse(
@@ -836,6 +845,9 @@ private struct ApprovalRequestView: View {
     private var requestTitle: String {
         if self.isManagedKeychainRequest {
             return "\(self.requesterName) がKeychain項目の\(self.managedKeychainAction)を要求しています"
+        }
+        if self.pending.request.operation == .gitSSHSign {
+            return "\(self.requesterName) がGit SSH署名を要求しています"
         }
         return "\(self.requesterName) がSSH鍵を要求しています"
     }

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import LocalAuthentication
 import Security
@@ -8,6 +9,7 @@ public enum ManagedKeychainStore {
     public static func read(
         service: String,
         account: String,
+        synchronizable: Bool,
         authenticationContext: LAContext
     ) -> Result<Data, KeychainFailure> {
         guard self.validSelector(service), self.validSelector(account) else {
@@ -17,6 +19,7 @@ public enum ManagedKeychainStore {
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
+            kSecAttrSynchronizable: synchronizable,
             kSecUseDataProtectionKeychain: true,
             kSecUseAuthenticationContext: authenticationContext,
             kSecMatchLimit: kSecMatchLimitOne,
@@ -37,6 +40,7 @@ public enum ManagedKeychainStore {
         _ secret: Data,
         service: String,
         account: String,
+        synchronizable: Bool,
         authenticationContext: LAContext
     ) -> OSStatus {
         guard !secret.isEmpty, secret.count <= self.maximumSecretLength,
@@ -45,7 +49,7 @@ public enum ManagedKeychainStore {
         var error: Unmanaged<CFError>?
         guard let accessControl = SecAccessControlCreateWithFlags(
             nil,
-            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            synchronizable ? kSecAttrAccessibleWhenUnlocked : kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
             .userPresence,
             &error
         ) else { return errSecParam }
@@ -53,6 +57,7 @@ public enum ManagedKeychainStore {
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
+            kSecAttrSynchronizable: synchronizable,
             kSecAttrLabel: "macop managed: \(service)",
             kSecAttrAccessControl: accessControl,
             kSecUseDataProtectionKeychain: true,
@@ -61,7 +66,12 @@ public enum ManagedKeychainStore {
         ]
         let status = SecItemAdd(attributes as CFDictionary, nil)
         guard status == errSecSuccess else { return status }
-        switch self.read(service: service, account: account, authenticationContext: authenticationContext) {
+        switch self.read(
+            service: service,
+            account: account,
+            synchronizable: synchronizable,
+            authenticationContext: authenticationContext
+        ) {
         case let .success(readback):
             return constantTimeEqual(secret, readback) ? errSecSuccess : errSecDecode
         case let .failure(failure):
@@ -73,6 +83,7 @@ public enum ManagedKeychainStore {
         _ secret: Data,
         service: String,
         account: String,
+        synchronizable: Bool,
         authenticationContext: LAContext
     ) -> OSStatus {
         guard !secret.isEmpty, secret.count <= self.maximumSecretLength,
@@ -82,6 +93,7 @@ public enum ManagedKeychainStore {
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
+            kSecAttrSynchronizable: synchronizable,
             kSecUseDataProtectionKeychain: true,
             kSecUseAuthenticationContext: authenticationContext
         ]
@@ -91,11 +103,17 @@ public enum ManagedKeychainStore {
                 secret,
                 service: service,
                 account: account,
+                synchronizable: synchronizable,
                 authenticationContext: authenticationContext
             )
         }
         guard status == errSecSuccess else { return status }
-        switch self.read(service: service, account: account, authenticationContext: authenticationContext) {
+        switch self.read(
+            service: service,
+            account: account,
+            synchronizable: synchronizable,
+            authenticationContext: authenticationContext
+        ) {
         case let .success(readback):
             return constantTimeEqual(secret, readback) ? errSecSuccess : errSecDecode
         case let .failure(failure):
@@ -106,6 +124,7 @@ public enum ManagedKeychainStore {
     public static func delete(
         service: String,
         account: String,
+        synchronizable: Bool,
         authenticationContext: LAContext
     ) -> OSStatus {
         guard self.validSelector(service), self.validSelector(account) else { return errSecParam }
@@ -113,6 +132,7 @@ public enum ManagedKeychainStore {
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
+            kSecAttrSynchronizable: synchronizable,
             kSecUseDataProtectionKeychain: true,
             kSecUseAuthenticationContext: authenticationContext
         ]
@@ -122,6 +142,7 @@ public enum ManagedKeychainStore {
     public static func deleteAll(authenticationContext: LAContext) -> OSStatus {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
+            kSecAttrSynchronizable: kSecAttrSynchronizableAny,
             kSecUseDataProtectionKeychain: true,
             kSecUseAuthenticationContext: authenticationContext
         ]
@@ -139,7 +160,7 @@ public struct CompanionManagedKeychainClient: KeychainClient {
     public init() {}
 
     public func read(_ query: KeychainQuery) -> Result<Data, KeychainFailure> {
-        guard case let .managed(service, account) = query else {
+        guard case let .managed(service, account, synchronizable) = query else {
             return .failure(KeychainFailure(errSecParam))
         }
         do {
@@ -151,7 +172,8 @@ public struct CompanionManagedKeychainClient: KeychainClient {
                 command: "macop read",
                 credentialLabel: account,
                 service: service,
-                account: account
+                account: account,
+                keychainSynchronizable: synchronizable
             )
             guard case let .approvalResponse(response) = try connection.send(.approvalRequest(request)),
                   response.requestID == request.requestID
@@ -172,26 +194,26 @@ public struct CompanionManagedKeychainClient: KeychainClient {
 }
 
 public protocol ManagedKeychainImporting: Sendable {
-    func importSecret(_ secret: Data, service: String, account: String) throws
+    func importSecret(_ secret: Data, service: String, account: String, synchronizable: Bool) throws
 }
 
 public protocol ManagedKeychainDeleting: Sendable {
-    func delete(service: String, account: String) throws
+    func delete(service: String, account: String, synchronizable: Bool) throws
     func deleteAll() throws
 }
 
 public struct CompanionManagedKeychainDeleter: ManagedKeychainDeleting {
     public init() {}
 
-    public func delete(service: String, account: String) throws {
-        try self.deleteRequest(service: service, account: account, all: false)
+    public func delete(service: String, account: String, synchronizable: Bool) throws {
+        try self.deleteRequest(service: service, account: account, synchronizable: synchronizable, all: false)
     }
 
     public func deleteAll() throws {
-        try self.deleteRequest(service: "", account: "", all: true)
+        try self.deleteRequest(service: "", account: "", synchronizable: false, all: true)
     }
 
-    private func deleteRequest(service: String, account: String, all: Bool) throws {
+    private func deleteRequest(service: String, account: String, synchronizable: Bool, all: Bool) throws {
         let connection = try AuthBrokerClientConnection.launchAndConnect(
             requiredCapabilities: AuthBrokerCapability.managedKeychain.rawValue
         )
@@ -200,7 +222,8 @@ public struct CompanionManagedKeychainDeleter: ManagedKeychainDeleting {
             command: all ? "macop item delete --all-managed" : "macop item delete",
             credentialLabel: all ? "all managed items" : account,
             service: service,
-            account: account
+            account: account,
+            keychainSynchronizable: synchronizable
         )
         guard case let .approvalResponse(response) = try connection.send(.approvalRequest(request)),
               response.requestID == request.requestID
@@ -240,13 +263,23 @@ public struct PasswordAutoFillCredential: Sendable {
 }
 
 public protocol PasswordAutoFillProviding: Sendable {
-    func acquire(service: String, account: String, command: String) throws -> PasswordAutoFillCredential
+    func acquire(
+        service: String,
+        account: String,
+        synchronizable: Bool,
+        command: String
+    ) throws -> PasswordAutoFillCredential
 }
 
 public struct CompanionPasswordAutoFillProvider: PasswordAutoFillProviding {
     public init() {}
 
-    public func acquire(service: String, account: String, command: String) throws -> PasswordAutoFillCredential {
+    public func acquire(
+        service: String,
+        account: String,
+        synchronizable: Bool,
+        command: String
+    ) throws -> PasswordAutoFillCredential {
         let required = AuthBrokerCapability.managedKeychain.rawValue
             | AuthBrokerCapability.passwordAutoFill.rawValue
         let connection = try AuthBrokerClientConnection.launchAndConnect(requiredCapabilities: required)
@@ -255,7 +288,8 @@ public struct CompanionPasswordAutoFillProvider: PasswordAutoFillProviding {
             command: command,
             credentialLabel: account,
             service: service,
-            account: account
+            account: account,
+            keychainSynchronizable: synchronizable
         )
         guard case let .approvalResponse(response) = try connection.send(
             .approvalRequest(request),
@@ -277,7 +311,12 @@ public struct CompanionPasswordAutoFillProvider: PasswordAutoFillProviding {
 public struct CompanionManagedKeychainImporter: ManagedKeychainImporting {
     public init() {}
 
-    public func importSecret(_ secret: Data, service: String, account: String) throws {
+    public func importSecret(
+        _ secret: Data,
+        service: String,
+        account: String,
+        synchronizable: Bool
+    ) throws {
         guard !secret.isEmpty, secret.count <= ManagedKeychainStore.maximumSecretLength else {
             throw CLIError.invalidArguments(message: "Managed Keychain secret must be 1 to 65536 bytes.")
         }
@@ -289,7 +328,8 @@ public struct CompanionManagedKeychainImporter: ManagedKeychainImporting {
             command: "macop item import",
             credentialLabel: account,
             service: service,
-            account: account
+            account: account,
+            keychainSynchronizable: synchronizable
         )
         guard case let .approvalResponse(approval) = try connection.send(.approvalRequest(request)),
               approval.requestID == request.requestID else { throw CLIError.denied(message: "Import was denied.") }
@@ -316,40 +356,5 @@ public struct CompanionManagedKeychainImporter: ManagedKeychainImporting {
         default:
             throw CLIError.runtimeError(message: "Managed Keychain import failed (OSStatus \(response.status)).")
         }
-    }
-}
-
-public enum AuthBrokerRequester {
-    public static func approvalRequest(
-        operation: AuthBrokerOperation,
-        command: String,
-        credentialLabel: String,
-        service: String,
-        account: String
-    ) throws -> AuthBrokerApprovalRequest {
-        let executable = try RunningExecutable.path()
-        let inspection = try LiveCodeIdentityInspector.inspect(pid: getpid(), expectedPath: executable)
-        guard inspection.identity.hasTrustedPublisher,
-              let snapshot = SystemRequesterInspector().snapshot(of: getpid())
-        else { throw AgentProtocolError.denied }
-        let now = UInt64(Date().timeIntervalSince1970 * 1000)
-        let lifetime: UInt64 = operation == .passwordAutoFill ? 600_000 : 120_000
-        return AuthBrokerApprovalRequest(
-            requestID: UUID(),
-            issuedAtMilliseconds: now,
-            expiresAtMilliseconds: now + lifetime,
-            operation: operation,
-            rootPID: getpid(),
-            rootStartTime: snapshot.startTime,
-            rootIdentifier: inspection.identity.identifier,
-            rootCodeRequirement: inspection.codeRequirement,
-            rootExecutablePath: inspection.identity.canonicalPath,
-            command: command,
-            credentialLabel: credentialLabel,
-            credentialFingerprint: "",
-            host: "",
-            keychainService: service,
-            keychainAccount: account
-        )
     }
 }

@@ -10,6 +10,7 @@ func runKeychainIntegrationIfRequested() throws {
     let suffix = UUID().uuidString
     let account = "macop-selftest-\(suffix)"
     let genericService = "macop-selftest-generic-\(suffix)"
+    let mutationService = "macop-selftest-mutation-\(suffix)"
     let internetServer = "macop-selftest-\(suffix).invalid"
     let generic = [kSecClass: kSecClassGenericPassword, kSecAttrService: genericService,
                    kSecAttrAccount: account] as [CFString: Any]
@@ -48,6 +49,34 @@ func runKeychainIntegrationIfRequested() throws {
             client: client
         )
         try expect(internetValue == "internet", "internet Security integration read")
+        let mutator = SystemKeychainMutator()
+        let mutationQuery = KeychainQuery.generic(service: mutationService, account: account)
+        let mutationCleanup = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: mutationService,
+            kSecAttrAccount: account
+        ] as [CFString: Any]
+        try mutator.create(Data("created".utf8), query: mutationQuery)
+        added.append(mutationCleanup)
+        let createdValue = try KeychainProvider.readText(mutationQuery, client: client)
+        try expect(
+            createdValue == "created",
+            "generic Security integration create"
+        )
+        try mutator.edit(Data("edited".utf8), query: mutationQuery)
+        let editedValue = try KeychainProvider.readText(mutationQuery, client: client)
+        try expect(
+            editedValue == "edited",
+            "generic Security integration edit"
+        )
+        try mutator.delete(query: mutationQuery)
+        _ = added.popLast()
+        do {
+            _ = try KeychainProvider.readText(mutationQuery, client: client)
+            throw SelftestFailure(message: "deleted Keychain item must not be readable")
+        } catch let error as CLIError {
+            guard case .notFound = error else { throw error }
+        }
         let duplicateStatus = SecItemAdd(
             (duplicateInternet.merging([kSecValueData: Data("other-internet".utf8)]) { _, new in new }) as CFDictionary,
             nil

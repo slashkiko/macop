@@ -77,6 +77,18 @@ private let compatibilitySSHEntries: [CompatibilityEntry] = [
         kind: "subcommand",
         status: "partial",
         reason: "Requires a newly launched cooperative application; existing applications and external relays are rejected."
+    ),
+    .init(
+        command: "ssh shell-init",
+        kind: "extension",
+        status: "supported",
+        reason: "Generate per-tab zsh, bash, or fish verified-session integration."
+    ),
+    .init(
+        command: "ssh git-signing-config",
+        kind: "extension",
+        status: "supported",
+        reason: "Generate repository-local Git SSH signing configuration for a CTK identity."
     )
 ]
 
@@ -95,11 +107,13 @@ private let compatibilityReferenceQueryEntries: [CompatibilityEntry] = [
     )
 ]
 
-public enum CompatibilityCommand {
-    private static let cloudUnavailable = "macop has no cloud account backend."
-    private static let filePolicy = "Writing secrets to persistent files is disabled by policy."
+private let compatibilityCloudUnavailable = "macop has no cloud account backend."
+private let compatibilityFilePolicy = "Writing secrets to persistent files is disabled by policy."
 
-    public static let entries: [CompatibilityEntry] = (
+public enum CompatibilityCommand {}
+
+public extension CompatibilityCommand {
+    static let entries: [CompatibilityEntry] = (
         [
             .init(command: "read", kind: "command", status: "supported"),
             .init(command: "read --no-newline", kind: "flag", status: "supported"),
@@ -115,9 +129,9 @@ public enum CompatibilityCommand {
                 status: "unsupported",
                 reason: "Exporting SSH private keys is disabled by policy."
             ),
-            .init(command: "read --out-file", kind: "flag", status: "unsupported", reason: filePolicy),
-            .init(command: "read --file-mode", kind: "flag", status: "unsupported", reason: filePolicy),
-            .init(command: "read --force", kind: "flag", status: "unsupported", reason: filePolicy),
+            .init(command: "read --out-file", kind: "flag", status: "unsupported", reason: compatibilityFilePolicy),
+            .init(command: "read --file-mode", kind: "flag", status: "unsupported", reason: compatibilityFilePolicy),
+            .init(command: "read --force", kind: "flag", status: "unsupported", reason: compatibilityFilePolicy),
             .init(command: "run", kind: "command", status: "supported"),
             .init(command: "run --env-file", kind: "flag", status: "supported"),
             .init(command: "run --stdin", kind: "flag", status: "supported"),
@@ -131,9 +145,9 @@ public enum CompatibilityCommand {
             .init(command: "inject", kind: "command", status: "supported"),
             .init(command: "inject -i", kind: "flag", status: "supported"),
             .init(command: "inject --in-file", kind: "flag", status: "supported"),
-            .init(command: "inject --out-file", kind: "flag", status: "unsupported", reason: filePolicy),
-            .init(command: "inject --file-mode", kind: "flag", status: "unsupported", reason: filePolicy),
-            .init(command: "inject --force", kind: "flag", status: "unsupported", reason: filePolicy),
+            .init(command: "inject --out-file", kind: "flag", status: "unsupported", reason: compatibilityFilePolicy),
+            .init(command: "inject --file-mode", kind: "flag", status: "unsupported", reason: compatibilityFilePolicy),
+            .init(command: "inject --force", kind: "flag", status: "unsupported", reason: compatibilityFilePolicy),
             .init(
                 command: "item list",
                 kind: "subcommand",
@@ -162,6 +176,19 @@ public enum CompatibilityCommand {
                 kind: "extension",
                 status: "supported",
                 reason: "Return a managed credential, with an explicit Apple Passwords refresh option."
+            ),
+            .init(
+                command: "item acquire --from-passwords",
+                kind: "flag",
+                status: "supported",
+                reason: "Open the user-initiated system AutoFill chooser and bypass a cached managed item."
+            ),
+            .init(
+                command: "passwords direct-provider",
+                kind: "provider",
+                status: "unsupported",
+                reason: "macOS exposes no public API for silently enumerating or querying the Passwords database.",
+                alternative: "Use item acquire --from-passwords and the system AutoFill chooser."
             ),
             .init(
                 command: "item get --id",
@@ -219,21 +246,21 @@ public enum CompatibilityCommand {
             ),
             .init(
                 command: "item create",
-                kind: "subcommand",
-                status: "unsupported",
-                reason: "Keychain CRUD is outside the MVP."
+                kind: "extension",
+                status: "supported",
+                reason: "Create one configured generic or internet password from secret stdin."
             ),
             .init(
                 command: "item edit",
-                kind: "subcommand",
-                status: "unsupported",
-                reason: "Keychain CRUD is outside the MVP."
+                kind: "extension",
+                status: "supported",
+                reason: "Update exactly one configured generic or internet password from secret stdin."
             ),
             .init(
                 command: "item delete",
                 kind: "extension",
                 status: "supported",
-                reason: "Delete one configured managed item or all items in macop's private access group."
+                reason: "Delete one configured Keychain item or all items in macop's private access group."
             ),
             .init(
                 command: "item move",
@@ -271,17 +298,27 @@ public enum CompatibilityCommand {
                 status: "unsupported",
                 reason: "macop does not model a 1Password account."
             ),
-            .init(command: "signin", kind: "command", status: "unsupported", reason: cloudUnavailable),
-            .init(command: "signout", kind: "command", status: "unsupported", reason: cloudUnavailable),
+            .init(command: "signin", kind: "command", status: "unsupported", reason: compatibilityCloudUnavailable),
+            .init(command: "signout", kind: "command", status: "unsupported", reason: compatibilityCloudUnavailable),
             .init(command: "update", kind: "command", status: "unsupported", reason: "macop does not self-update."),
-            .init(command: "vault", kind: "command", status: "unsupported", reason: cloudUnavailable),
-            .init(command: "vault list", kind: "subcommand", status: "unsupported", reason: cloudUnavailable),
-            .init(command: "account", kind: "command", status: "unsupported", reason: cloudUnavailable),
-            .init(command: "user", kind: "command", status: "unsupported", reason: cloudUnavailable),
-            .init(command: "group", kind: "command", status: "unsupported", reason: cloudUnavailable),
-            .init(command: "service-account", kind: "command", status: "unsupported", reason: cloudUnavailable),
-            .init(command: "connect", kind: "command", status: "unsupported", reason: cloudUnavailable),
-            .init(command: "events-api", kind: "command", status: "unsupported", reason: cloudUnavailable),
+            .init(command: "vault", kind: "command", status: "unsupported", reason: compatibilityCloudUnavailable),
+            .init(
+                command: "vault list",
+                kind: "subcommand",
+                status: "unsupported",
+                reason: compatibilityCloudUnavailable
+            ),
+            .init(command: "account", kind: "command", status: "unsupported", reason: compatibilityCloudUnavailable),
+            .init(command: "user", kind: "command", status: "unsupported", reason: compatibilityCloudUnavailable),
+            .init(command: "group", kind: "command", status: "unsupported", reason: compatibilityCloudUnavailable),
+            .init(
+                command: "service-account",
+                kind: "command",
+                status: "unsupported",
+                reason: compatibilityCloudUnavailable
+            ),
+            .init(command: "connect", kind: "command", status: "unsupported", reason: compatibilityCloudUnavailable),
+            .init(command: "events-api", kind: "command", status: "unsupported", reason: compatibilityCloudUnavailable),
             .init(
                 command: "document",
                 kind: "command",

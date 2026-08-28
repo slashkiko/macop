@@ -80,19 +80,19 @@ final class QuerySensitiveKeychainClient: KeychainClient, @unchecked Sendable {
 }
 
 final class RecordingManagedKeychainImporter: ManagedKeychainImporting, @unchecked Sendable {
-    private(set) var imports = [(secret: Data, service: String, account: String)]()
+    private(set) var imports = [(secret: Data, service: String, account: String, synchronizable: Bool)]()
 
-    func importSecret(_ secret: Data, service: String, account: String) throws {
-        self.imports.append((secret, service, account))
+    func importSecret(_ secret: Data, service: String, account: String, synchronizable: Bool) throws {
+        self.imports.append((secret, service, account, synchronizable))
     }
 }
 
 final class RecordingManagedKeychainDeleter: ManagedKeychainDeleting, @unchecked Sendable {
-    private(set) var deletes = [(service: String, account: String)]()
+    private(set) var deletes = [(service: String, account: String, synchronizable: Bool)]()
     private(set) var deleteAllCount = 0
 
-    func delete(service: String, account: String) throws {
-        self.deletes.append((service, account))
+    func delete(service: String, account: String, synchronizable: Bool) throws {
+        self.deletes.append((service, account, synchronizable))
     }
 
     func deleteAll() throws {
@@ -100,8 +100,26 @@ final class RecordingManagedKeychainDeleter: ManagedKeychainDeleting, @unchecked
     }
 }
 
+final class RecordingKeychainMutator: KeychainMutating, @unchecked Sendable {
+    private(set) var creates = [(secret: Data, query: KeychainQuery)]()
+    private(set) var edits = [(secret: Data, query: KeychainQuery)]()
+    private(set) var deletes = [KeychainQuery]()
+
+    func create(_ secret: Data, query: KeychainQuery) throws {
+        self.creates.append((secret, query))
+    }
+
+    func edit(_ secret: Data, query: KeychainQuery) throws {
+        self.edits.append((secret, query))
+    }
+
+    func delete(query: KeychainQuery) throws {
+        self.deletes.append(query)
+    }
+}
+
 final class RecordingPasswordAutoFillProvider: PasswordAutoFillProviding, @unchecked Sendable {
-    private(set) var requests = [(service: String, account: String, command: String)]()
+    private(set) var requests = [(service: String, account: String, synchronizable: Bool, command: String)]()
     let credential: PasswordAutoFillCredential
 
     init(
@@ -111,14 +129,24 @@ final class RecordingPasswordAutoFillProvider: PasswordAutoFillProviding, @unche
         self.credential = PasswordAutoFillCredential(secret: secret, saveStatus: saveStatus)
     }
 
-    func acquire(service: String, account: String, command: String) throws -> PasswordAutoFillCredential {
-        self.requests.append((service, account, command))
+    func acquire(
+        service: String,
+        account: String,
+        synchronizable: Bool,
+        command: String
+    ) throws -> PasswordAutoFillCredential {
+        self.requests.append((service, account, synchronizable, command))
         return self.credential
     }
 }
 
 struct DenyingPasswordAutoFillProvider: PasswordAutoFillProviding {
-    func acquire(service _: String, account _: String, command _: String) throws -> PasswordAutoFillCredential {
+    func acquire(
+        service _: String,
+        account _: String,
+        synchronizable _: Bool,
+        command _: String
+    ) throws -> PasswordAutoFillCredential {
         throw CLIError.denied(message: "Password AutoFill was denied for this fixture.")
     }
 }

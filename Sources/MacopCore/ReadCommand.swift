@@ -113,7 +113,11 @@ public enum ReadCommand {
             return .generic(service: service, account: account)
         }
         if item.provider == "keychain-managed", let service = item.service, let account = item.account {
-            return .managed(service: service, account: account)
+            return .managed(
+                service: service,
+                account: account,
+                synchronizable: item.managedKeychainSynchronizable
+            )
         }
         throw CLIError.unsupportedProvider(provider: item.provider, reason: "This provider cannot supply secret text.")
     }

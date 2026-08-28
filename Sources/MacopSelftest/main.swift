@@ -111,6 +111,75 @@ final class RecordingSSHExecutor: SSHStreamingExecuting, @unchecked Sendable {
 
 extension RecordingSSHExecutor: CTKPublicKeyResolving, AppleGitTrustValidating {}
 
+private final class GitSigningExecutor: CommandExecuting, CTKPublicKeyResolving, @unchecked Sendable {
+    private let publicKey: Data
+
+    init(publicKey: Data) {
+        self.publicKey = publicKey
+    }
+
+    func execute(path: String, arguments: [String], environment _: CommandEnvironment) throws -> CommandResult {
+        guard path == SSHCommand.scAuth, arguments.first == "list-ctk-identities" else {
+            return CommandResult(exitCode: 1)
+        }
+        return CommandResult(
+            exitCode: 0,
+            stdout: appleTableHeader + appleTableRow("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "git-signing")
+        )
+    }
+
+    func publicKeyBlob(identityLabel: String, publicKeyHash: String) throws -> Data {
+        guard identityLabel == "git-signing",
+              publicKeyHash == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        else { throw AgentProtocolError.denied }
+        return self.publicKey
+    }
+}
+
+private final class RecordingGitSigningProvider: GitSSHSigningProviding, @unchecked Sendable {
+    private(set) var identity: SSHCommand.VerifiedSessionIdentity?
+    private(set) var signedData = Data()
+    private let privateKey: P256.Signing.PrivateKey
+    let publicKeyBlob: Data
+
+    init() throws {
+        let privateKey = P256.Signing.PrivateKey()
+        self.privateKey = privateKey
+        self.publicKeyBlob = try SSHWire.string("ecdsa-sha2-nistp256")
+            + SSHWire.string("nistp256")
+            + SSHWire.string(privateKey.publicKey.x963Representation)
+    }
+
+    func sign(
+        identity: SSHCommand.VerifiedSessionIdentity,
+        data: Data,
+        requesterPID _: Int32
+    ) throws -> GitSSHSignature {
+        self.identity = identity
+        self.signedData = data
+        let der = try self.privateKey.signature(for: data).derRepresentation
+        let raw = try CTKIdentitySigner.strictDERToRawP256(der)
+        let signature = try SSHWire.string("ecdsa-sha2-nistp256")
+            + SSHWire.string(
+                SSHWire.string(self.mpint(raw.prefix(32)))
+                    + SSHWire.string(self.mpint(raw.suffix(32)))
+            )
+        return GitSSHSignature(publicKeyBlob: identity.publicKeyBlob, signatureBlob: signature)
+    }
+
+    private func mpint(_ bytes: Data.SubSequence) -> Data {
+        let trimmed = bytes.drop { $0 == 0 }
+        let value = trimmed.isEmpty ? Data([0]) : Data(trimmed)
+        return value.first! & 0x80 == 0 ? value : Data([0]) + value
+    }
+}
+
+private struct AllowingGitSigningRequesterValidator: GitSSHSigningRequesterValidating {
+    func validateRequester() throws -> Int32 {
+        42
+    }
+}
+
 private struct AgentTestInspector: RequesterInspecting {
     func snapshot(of pid: Int32) -> ProcessSnapshot? {
         pid == 42 ? ProcessSnapshot(pid: 42, parentPID: 1, startTime: 7) : ProcessSnapshot(
@@ -1683,6 +1752,76 @@ func run() throws {
     try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: true)
     let configDirectory = tempRoot.path
 
+    let gitSigningDirectory = tempRoot.appendingPathComponent("git-signing", isDirectory: true)
+    try fileManager.createDirectory(at: gitSigningDirectory, withIntermediateDirectories: false)
+    let gitSigningKey = gitSigningDirectory.appendingPathComponent("key.pub")
+    let gitSigningMessage = gitSigningDirectory.appendingPathComponent("message")
+    let gitSigningProvider = try RecordingGitSigningProvider()
+    let publicKeyBlob = gitSigningProvider.publicKeyBlob
+    let publicKeyText = "ecdsa-sha2-nistp256 \(publicKeyBlob.base64EncodedString()) git-signing\n"
+    try Data(publicKeyText.utf8).write(to: gitSigningKey)
+    let gitMessage = Data("tree 0000000000000000000000000000000000000000\n".utf8)
+    try gitMessage.write(to: gitSigningMessage)
+    let gitSigningResult = GitSSHSigningCommand.run(
+        argv: [
+            "macop", "-Y", "sign", "-n", "git", "-f", gitSigningKey.path, gitSigningMessage.path
+        ],
+        env: [:],
+        executor: GitSigningExecutor(publicKey: publicKeyBlob),
+        provider: gitSigningProvider,
+        requesterValidator: AllowingGitSigningRequesterValidator()
+    )
+    try expect(gitSigningResult.exitCode == 0, "Git SSH adapter must accept Git's exact ssh-keygen invocation")
+    try expect(
+        gitSigningProvider.identity?.label == "git-signing"
+            && gitSigningProvider.identity?.publicKeyBlob == publicKeyBlob,
+        "Git SSH adapter must select exactly the CTK identity matching user.signingKey"
+    )
+    var signedCursor = SSHCursor(Data(gitSigningProvider.signedData.dropFirst("SSHSIG".utf8.count)))
+    let signedNamespace = try signedCursor.string()
+    let signedReserved = try signedCursor.string()
+    let signedHashAlgorithm = try signedCursor.string()
+    let signedDigest = try signedCursor.string()
+    try expect(
+        gitSigningProvider.signedData.starts(with: Data("SSHSIG".utf8))
+            && String(data: signedNamespace, encoding: .utf8) == "git"
+            && signedReserved.isEmpty
+            && String(data: signedHashAlgorithm, encoding: .utf8) == "sha256"
+            && signedDigest == Data(SHA256.hash(data: gitMessage))
+            && signedCursor.isAtEnd,
+        "Git SSH adapter must sign the canonical SSHSIG preimage with the git namespace"
+    )
+    let signaturePath = URL(fileURLWithPath: gitSigningMessage.path + ".sig")
+    let armored = try String(contentsOf: signaturePath, encoding: .utf8)
+    try expect(
+        armored.hasPrefix("-----BEGIN SSH SIGNATURE-----\n")
+            && armored.hasSuffix("-----END SSH SIGNATURE-----\n"),
+        "Git SSH adapter must write OpenSSH armored signature output"
+    )
+    let signatureValidation = try RunCommand.capture(
+        argv: [
+            "/bin/sh", "-c",
+            "exec /usr/bin/ssh-keygen -Y check-novalidate -n git -s \"$2\" < \"$1\"",
+            "macop-selftest", gitSigningMessage.path, signaturePath.path
+        ],
+        environment: [:],
+        limit: 4096
+    )
+    try expect(
+        signatureValidation.exitCode == 0,
+        "OpenSSH must validate the generated SSHSIG envelope and signature"
+    )
+    let repeatedGitSigning = GitSSHSigningCommand.run(
+        argv: [
+            "macop", "-Y", "sign", "-n", "git", "-f", gitSigningKey.path, gitSigningMessage.path
+        ],
+        env: [:],
+        executor: GitSigningExecutor(publicKey: publicKeyBlob),
+        provider: gitSigningProvider,
+        requesterValidator: AllowingGitSigningRequesterValidator()
+    )
+    try expect(repeatedGitSigning.exitCode == 5, "Git SSH adapter must not overwrite an existing signature file")
+
     let sentinel = open("/dev/null", O_RDONLY)
     guard sentinel >= 3 else { throw SelftestFailure(message: "ambient FD sentinel must be available") }
     defer { _ = close(sentinel) }
@@ -1787,12 +1926,12 @@ func run() throws {
         "inject --force", "item list", "item list --long", "item list --format", "item list --vault",
         "item list --categories", "item list --tags", "item list --favorite", "item list --include-archive",
         "item list --otp", "item list --share-link", "item get", "item get --fields",
-        "item get --reveal", "item import", "item acquire",
+        "item get --reveal", "item import", "item acquire", "item acquire --from-passwords",
         "item get --format", "item get --id", "item get --stdin", "item get --vault", "item get --categories",
         "item get --tags",
         "item get --favorite",
         "item get --include-archive", "item get --otp", "item get --share-link", "item create", "item edit",
-        "item delete",
+        "item delete", "passwords direct-provider",
         "item move", "item share", "item template", "completion", "completion bash", "completion zsh",
         "completion fish",
         "completion powershell", "help", "version", "whoami",
@@ -1803,7 +1942,7 @@ func run() throws {
         "plugin", "compatibility", "config init", "config validate", "doctor", "ssh", "ssh create",
         "ssh create --touch-id",
         "ssh list", "ssh public-key", "ssh test", "ssh run", "ssh delete", "ssh agent", "ssh agent shell",
-        "ssh agent application",
+        "ssh agent application", "ssh shell-init", "ssh git-signing-config",
         "reference ?attribute=otp", "reference ?ssh-format=openssh", "--help", "--version",
         "--format",
         "--config", "--no-color", "--debug", "--encoding=utf-8", "--account", "--session", "--cache",
@@ -1826,7 +1965,9 @@ func run() throws {
     )
     try expect(
         compatibilityHuman.stdout
-            .contains("Macop extensions: item import, item acquire, item delete, compatibility, config init"),
+            .contains(
+                "Macop extensions: item import, item acquire, item create, item edit, item delete, compatibility"
+            ),
         "human matrix should label extensions"
     )
     try expect(compatibilityHuman.stdout.contains("Flags:"), "human matrix should label flags separately")
@@ -1840,6 +1981,36 @@ func run() throws {
         keychainClient: FakeKeychainClient(response: .success(Data())),
         commandExecutor: sshExecutor,
         biometricChecker: AvailableBiometricChecker()
+    )
+    let zshIntegration = sshApp.run(argv: ["macop", "ssh", "shell-init", "zsh"], env: [:])
+    try expect(zshIntegration.exitCode == 0, "zsh shell integration must render without CTK access")
+    try expect(
+        zshIntegration.stdout.contains("MACOP_SHELL_INTEGRATION_ACTIVE")
+            && zshIntegration.stdout.contains("exec macop ssh agent shell")
+            && zshIntegration.stdout.contains("$MACOP_SSH_IDENTITY"),
+        "shell integration must be guarded against recursion and bind each tab to a verified root"
+    )
+    let fishIntegration = sshApp.run(argv: ["macop", "ssh", "shell-init", "fish"], env: [:])
+    try expect(
+        fishIntegration.exitCode == 0 && fishIntegration.stdout.contains("status is-interactive"),
+        "fish shell integration must render its native guard"
+    )
+    let unsupportedShell = sshApp.run(argv: ["macop", "ssh", "shell-init", "tcsh"], env: [:])
+    try expect(unsupportedShell.exitCode == 2, "unsupported shell integration must fail explicitly")
+    let gitConfigApp = MacopApp(
+        keychainClient: FakeKeychainClient(response: .success(Data())),
+        commandExecutor: RecordingSSHExecutor(identityAlreadyExists: true),
+        biometricChecker: AvailableBiometricChecker()
+    )
+    let gitSigningConfig = gitConfigApp.run(
+        argv: ["macop", "ssh", "git-signing-config", "github"], env: [:]
+    )
+    try expect(
+        gitSigningConfig.exitCode == 0
+            && gitSigningConfig.stdout.contains("git config --local gpg.format ssh")
+            && gitSigningConfig.stdout.contains("user.signingkey")
+            && gitSigningConfig.stdout.contains("gpg.ssh.program"),
+        "Git signing config must emit repository-local commands without changing Git config"
     )
     let createdIdentity = sshApp.run(argv: ["macop", "ssh", "create", "github", "--touch-id"], env: [:])
     try expect(createdIdentity.exitCode == 0, "ssh create should use the injectable Apple command executor")
@@ -2950,7 +3121,7 @@ func run() throws {
     )
     let unknownItem = app.run(argv: ["macop", "item", "frobnicate", "potential-secret"], env: [:])
     try expect(unknownItem.exitCode == 2, "an arbitrary item subcommand must be syntax, not unsupported")
-    let unsupportedItem = app.run(argv: ["macop", "item", "create", "potential-secret"], env: [:])
+    let unsupportedItem = app.run(argv: ["macop", "item", "move", "potential-secret"], env: [:])
     try expect(unsupportedItem.exitCode == 3, "a documented unsupported item subcommand must exit 3")
     try expect(
         unsupportedItem.stderr.contains("macop compatibility") && !unsupportedItem.stderr.contains("potential-secret"),
@@ -3131,10 +3302,75 @@ func run() throws {
         "valid section/field selector must resolve its Keychain mapping"
     )
 
+    let mutationConfig = """
+    { "version": 1, "items": {
+      "Local/Generic": {
+        "provider": "keychain-generic", "service": "mutation-service", "account": "mutation-account"
+      },
+      "Local/Internet": {
+        "provider": "keychain-internet", "server": "example.invalid", "account": "mutation-account"
+      }
+    } }
+    """
+    try mutationConfig.data(using: .utf8)!.write(to: configPath, options: [.atomic])
+    let keychainMutator = RecordingKeychainMutator()
+    let mutationApp = MacopApp(
+        keychainClient: RecordingKeychainClient(.success(Data())),
+        keychainMutator: keychainMutator
+    )
+    let createSecret = Data("create-secret".utf8)
+    let createResult = mutationApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "create", "Generic"],
+        env: [:],
+        input: createSecret
+    )
+    try expect(createResult.exitCode == 0, "item create must accept exact generic selectors")
+    try expect(
+        keychainMutator.creates.count == 1
+            && keychainMutator.creates[0].secret == createSecret
+            && keychainMutator.creates[0].query == .generic(
+                service: "mutation-service",
+                account: "mutation-account"
+            ),
+        "item create must forward only secret stdin and the configured selector"
+    )
+    let editSecret = Data("edit-secret".utf8)
+    let editResult = mutationApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "edit", "Internet"],
+        env: [:],
+        input: editSecret
+    )
+    try expect(editResult.exitCode == 0, "item edit must accept exact internet selectors")
+    try expect(
+        keychainMutator.edits.count == 1
+            && keychainMutator.edits[0].secret == editSecret
+            && keychainMutator.edits[0].query == .internet(
+                server: "example.invalid",
+                account: "mutation-account"
+            ),
+        "item edit must forward only secret stdin and the configured selector"
+    )
+    let deleteResult = mutationApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "delete", "Generic"], env: [:]
+    )
+    try expect(deleteResult.exitCode == 0, "item delete must accept configured generic items")
+    try expect(
+        keychainMutator.deletes == [.generic(service: "mutation-service", account: "mutation-account")],
+        "item delete must forward the exact configured generic selector"
+    )
+    let emptyCreate = mutationApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "create", "Generic"], env: [:]
+    )
+    try expect(emptyCreate.exitCode == 2, "item create must reject empty stdin before Keychain access")
+
     let managedConfig = """
     { "version": 1, "items": {
       "Local/Managed": {
         "provider": "keychain-managed", "service": "github-token", "account": "me", "fields": ["token"]
+      },
+      "Local/Cloud": {
+        "provider": "keychain-managed", "service": "cloud-token", "account": "me",
+        "fields": ["token"], "synchronization": "icloud"
       }
     } }
     """
@@ -3166,13 +3402,26 @@ func run() throws {
         managedImporter.imports.count == 1
             && managedImporter.imports[0].secret == managedSecret
             && managedImporter.imports[0].service == "github-token"
-            && managedImporter.imports[0].account == "me",
+            && managedImporter.imports[0].account == "me"
+            && !managedImporter.imports[0].synchronizable,
         "item import must forward exact stdin and configured selectors"
     )
     let emptyManagedImport = managedApp.run(
         argv: ["macop", "--config", configDirectory, "item", "import", "Managed"], env: [:]
     )
     try expect(emptyManagedImport.exitCode == 2, "item import must reject empty stdin before broker access")
+    let cloudImport = managedApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "import", "Cloud"],
+        env: [:],
+        input: managedSecret
+    )
+    try expect(cloudImport.exitCode == 0, "item import must accept an explicit iCloud managed item")
+    try expect(
+        managedImporter.imports.count == 2
+            && managedImporter.imports[1].service == "cloud-token"
+            && managedImporter.imports[1].synchronizable,
+        "iCloud synchronization must be explicit and reach the managed Keychain boundary"
+    )
     let managedDelete = managedApp.run(
         argv: ["macop", "--config", configDirectory, "item", "delete", "Managed"], env: [:]
     )
@@ -3180,7 +3429,8 @@ func run() throws {
     try expect(
         managedDeleter.deletes.count == 1
             && managedDeleter.deletes[0].service == "github-token"
-            && managedDeleter.deletes[0].account == "me",
+            && managedDeleter.deletes[0].account == "me"
+            && !managedDeleter.deletes[0].synchronizable,
         "item delete must forward the exact configured selectors"
     )
     let managedDeleteAll = managedApp.run(

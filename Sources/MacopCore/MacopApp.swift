@@ -51,6 +51,7 @@ public struct MacopApp {
     private let biometricChecker: any BiometricAvailabilityChecking
     private let managedKeychainImporter: any ManagedKeychainImporting
     private let managedKeychainDeleter: any ManagedKeychainDeleting
+    private let keychainMutator: any KeychainMutating
     private let passwordAutoFillProvider: any PasswordAutoFillProviding
 
     public init(
@@ -59,6 +60,7 @@ public struct MacopApp {
         biometricChecker: any BiometricAvailabilityChecking = SystemBiometricAvailabilityChecker(),
         managedKeychainImporter: any ManagedKeychainImporting = CompanionManagedKeychainImporter(),
         managedKeychainDeleter: any ManagedKeychainDeleting = CompanionManagedKeychainDeleter(),
+        keychainMutator: any KeychainMutating = SystemKeychainMutator(),
         passwordAutoFillProvider: any PasswordAutoFillProviding = CompanionPasswordAutoFillProvider()
     ) {
         self.keychainClient = keychainClient
@@ -66,6 +68,7 @@ public struct MacopApp {
         self.biometricChecker = biometricChecker
         self.managedKeychainImporter = managedKeychainImporter
         self.managedKeychainDeleter = managedKeychainDeleter
+        self.keychainMutator = keychainMutator
         self.passwordAutoFillProvider = passwordAutoFillProvider
     }
 
@@ -225,6 +228,7 @@ public struct MacopApp {
                 client: self.keychainClient,
                 importer: self.managedKeychainImporter,
                 deleter: self.managedKeychainDeleter,
+                mutator: self.keychainMutator,
                 passwordAutoFillProvider: self.passwordAutoFillProvider
             )
         case .config:
@@ -262,13 +266,6 @@ public struct MacopApp {
                 context: DoctorContext(env: env, executor: self.commandExecutor)
             )
         }
-    }
-
-    private func renderedCommandName(_ parsed: ParsedCommand) -> String {
-        if parsed.command == .item, let sub = parsed.commandArgs.first {
-            return "item \(sub)"
-        }
-        return parsed.command.rawValue
     }
 
     private func renderCLIError(_ error: CLIError, argv: [String], env: [String: String]) -> CommandResult {
