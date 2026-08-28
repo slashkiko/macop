@@ -180,6 +180,17 @@ remove_signed_binary() {
 
 remove_signed_binary "$bin_dir/macop-agent" "macop-agent"
 remove_signed_binary "$bin_dir/macop" "macop"
+
+auth_app="$bin_dir/MacopAuth.app"
+if [[ -e "$auth_app" ]]; then
+  [[ ! -L "$auth_app" && -d "$auth_app" ]] \
+    || fail "refusing to remove a symlink or non-directory: $auth_app"
+  auth_identifier="$(codesign -d --verbose=4 "$auth_app" 2>&1 | sed -n 's/^Identifier=//p' | head -n 1)"
+  [[ "$auth_identifier" == "io.github.slashkiko.macop.auth" ]] \
+    || fail "refusing to remove $auth_app because its code-signing identifier is unexpected."
+  rm -rf "$auth_app"
+  printf 'Removed %s\n' "$auth_app"
+fi
 remove_managed_path
 
 printf '%s\n' 'Preserved macop configuration, Keychain items, CTK identities, and the install directory.'

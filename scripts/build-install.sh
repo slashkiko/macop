@@ -16,7 +16,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/build-install.sh [options]
 
-Build, sign, verify, and install macop and macop-agent.
+Build, sign, verify, and install macop, macop-agent, and MacopAuth.app.
 
 Options:
   --bin-dir <directory>       Install directory (default: ~/.local/bin)
@@ -29,7 +29,8 @@ Options:
   --signing-identity <name>  Use a stable codesigning identity instead of ad-hoc signing
   --help                     Show this help
 
-MACOP_BIN_DIR, MACOP_SHELL_PROFILE, and MACOP_SIGNING_IDENTITY may be used
+MACOP_BIN_DIR, MACOP_SHELL_PROFILE, MACOP_SIGNING_IDENTITY, and
+MACOP_PROVISIONING_PROFILE may be used
 instead of their options.
 EOF
 }
@@ -102,7 +103,7 @@ if [[ -n "$signing_identity" ]]; then
     || fail "--signing-identity requires a named or hash codesigning identity, not ad-hoc signing."
 fi
 
-for command in awk chmod codesign dirname grep id install make mktemp mv readlink rm stat; do
+for command in awk chmod codesign cp dirname grep head id install make mktemp mv readlink rm rmdir sed stat; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is unavailable: $command"
 done
 
@@ -193,10 +194,14 @@ if [[ "$skip_build" == false ]]; then
 fi
 
 build_dir="$repo_root/.build/$configuration"
+codesign_identity="${signing_identity:--}"
+MACOP_SIGNING_IDENTITY="$codesign_identity" bash "$repo_root/scripts/build-auth-app.sh" "$configuration"
 source_macop="$build_dir/macop"
 source_agent="$build_dir/macop-agent"
+source_auth_app="$build_dir/MacopAuth.app"
 [[ -x "$source_macop" ]] || fail "missing build artifact: $source_macop"
 [[ -x "$source_agent" ]] || fail "missing build artifact: $source_agent"
+[[ -d "$source_auth_app" ]] || fail "missing app bundle: $source_auth_app"
 
 if [[ ! -e "$bin_dir" ]]; then
   install -d -m 755 "$bin_dir"
@@ -207,6 +212,7 @@ fi
 
 destination_macop="$bin_dir/macop"
 destination_agent="$bin_dir/macop-agent"
+destination_auth_app="$bin_dir/MacopAuth.app"
 op_path="$bin_dir/op"
 
 for destination in "$destination_macop" "$destination_agent"; do
@@ -214,6 +220,13 @@ for destination in "$destination_macop" "$destination_agent"; do
   [[ ! -e "$destination" || -f "$destination" ]] \
     || fail "refusing to replace a non-file: $destination"
 done
+if [[ -e "$destination_auth_app" ]]; then
+  [[ ! -L "$destination_auth_app" && -d "$destination_auth_app" ]] \
+    || fail "refusing to replace a symlink or non-directory: $destination_auth_app"
+  installed_auth_identifier="$(codesign -d --verbose=4 "$destination_auth_app" 2>&1 | sed -n 's/^Identifier=//p' | head -n 1)"
+  [[ "$installed_auth_identifier" == "io.github.slashkiko.macop.auth" ]] \
+    || fail "refusing to replace an app with an unexpected code-signing identifier: $destination_auth_app"
+fi
 
 if [[ "$with_op_symlink" == true ]]; then
   if [[ -L "$op_path" ]]; then
@@ -227,24 +240,65 @@ fi
 
 staged_macop="$(mktemp "$bin_dir/.macop.install.XXXXXX")"
 staged_agent="$(mktemp "$bin_dir/.macop-agent.install.XXXXXX")"
+staged_auth_app="$(mktemp -d "$bin_dir/.MacopAuth.install.XXXXXX")"
+auth_backup=""
 cleanup() {
   [[ -z "$staged_macop" ]] || rm -f "$staged_macop"
   [[ -z "$staged_agent" ]] || rm -f "$staged_agent"
+  [[ -z "$staged_auth_app" || ! -e "$staged_auth_app" ]] || rm -rf "$staged_auth_app"
+  if [[ -n "$auth_backup" && -e "$auth_backup" && ! -e "$destination_auth_app" ]]; then
+    mv "$auth_backup" "$destination_auth_app"
+    auth_backup=""
+  fi
+  [[ -z "$auth_backup" || ! -e "$auth_backup" ]] || rm -rf "$auth_backup"
 }
 trap cleanup EXIT
 
 install -m 755 "$source_macop" "$staged_macop"
 install -m 755 "$source_agent" "$staged_agent"
-codesign_identity="${signing_identity:--}"
+cp -R "$source_auth_app/Contents" "$staged_auth_app/Contents"
 codesign --force --sign "$codesign_identity" --identifier macop "$staged_macop"
 codesign --force --sign "$codesign_identity" --identifier macop-agent "$staged_agent"
 codesign --verify --strict "$staged_macop"
 codesign --verify --strict "$staged_agent"
+codesign --verify --strict "$staged_auth_app"
+
+read_identifier() {
+  codesign -d --verbose=4 "$1" 2>&1 | sed -n 's/^Identifier=//p' | head -n 1
+}
+
+read_team_id() {
+  codesign -d --verbose=4 "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -n 1
+}
+
+[[ "$(read_identifier "$staged_macop")" == "macop" ]] || fail "macop identifier readback failed."
+[[ "$(read_identifier "$staged_agent")" == "macop-agent" ]] || fail "macop-agent identifier readback failed."
+[[ "$(read_identifier "$staged_auth_app")" == "io.github.slashkiko.macop.auth" ]] \
+  || fail "MacopAuth identifier readback failed."
+if [[ -n "$signing_identity" ]]; then
+  macop_team="$(read_team_id "$staged_macop")"
+  agent_team="$(read_team_id "$staged_agent")"
+  auth_team="$(read_team_id "$staged_auth_app")"
+  [[ -n "$macop_team" && "$macop_team" != "not set" && "$macop_team" == "$agent_team" \
+      && "$macop_team" == "$auth_team" ]] \
+    || fail "macop, macop-agent, and MacopAuth must have the same non-empty Team ID."
+fi
 
 mv -f "$staged_macop" "$destination_macop"
 staged_macop=""
 mv -f "$staged_agent" "$destination_agent"
 staged_agent=""
+if [[ -e "$destination_auth_app" ]]; then
+  auth_backup="$(mktemp -d "$bin_dir/.MacopAuth.backup.XXXXXX")"
+  rmdir "$auth_backup"
+  mv "$destination_auth_app" "$auth_backup"
+fi
+mv "$staged_auth_app" "$destination_auth_app"
+staged_auth_app=""
+if [[ -n "$auth_backup" ]]; then
+  rm -rf "$auth_backup"
+  auth_backup=""
+fi
 
 if [[ "$with_op_symlink" == true && ! -L "$op_path" ]]; then
   ln -s macop "$op_path"
@@ -254,17 +308,22 @@ if [[ "$configure_path" == true ]]; then
   configure_shell_path
 fi
 
-printf 'Installed macop and macop-agent in %s\n' "$bin_dir"
+printf 'Installed macop, macop-agent, and MacopAuth.app in %s\n' "$bin_dir"
 if [[ "$with_op_symlink" == true ]]; then
   printf 'Installed op symlink: %s -> macop\n' "$op_path"
 else
   printf 'The op symlink was not changed; use --with-op-symlink to create it safely.\n'
 fi
 if [[ -n "$signing_identity" ]]; then
-  printf 'Installed binaries were signed with %s. Reuse the same identity after updates to preserve their designated requirements.\n' \
+  printf 'Installed binaries and MacopAuth.app were signed with %s. Reuse the same identity after updates to preserve their designated requirements.\n' \
     "$signing_identity"
+  if [[ -n "${MACOP_PROVISIONING_PROFILE:-}" ]]; then
+    printf '%s\n' 'Managed Keychain capability is enabled by the embedded provisioning profile.'
+  else
+    printf '%s\n' 'Managed Keychain capability is disabled; set MACOP_PROVISIONING_PROFILE to a matching profile to enable it.'
+  fi
 else
-  printf '%s\n' 'Installed binaries are ad-hoc signed; Keychain ACL trust can change after every rebuild, and verified-session agent mode requires a production same-Team signed pair.'
+  printf '%s\n' 'Installed artifacts are ad-hoc signed; native approval capabilities require certificate-backed same-Team signatures.'
 fi
 if [[ "$configure_path" == true ]]; then
   printf 'Restart the shell or run: source %q\n' "$shell_profile"

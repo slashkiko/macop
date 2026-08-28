@@ -32,6 +32,7 @@ test "$foreign_op_status" -ne 0
 grep -F 'refusing to replace an op symlink that does not target macop' "$fixture_root/foreign-op.stderr"
 test ! -e "$bin_dir/macop"
 test ! -e "$bin_dir/macop-agent"
+test ! -e "$bin_dir/MacopAuth.app"
 test "$(readlink "$bin_dir/op")" = "/usr/bin/true"
 rm -f "$bin_dir/op"
 
@@ -56,6 +57,7 @@ test "$malformed_profile_status" -ne 0
 grep -F 'managed PATH markers are malformed' "$fixture_root/malformed-profile.stderr"
 test ! -e "$bin_dir/macop"
 test ! -e "$bin_dir/macop-agent"
+test ! -e "$bin_dir/MacopAuth.app"
 grep -Fqx 'export MUST_NOT_BE_REMOVED=yes' "$shell_profile"
 printf '%s\n' 'export EXISTING_SETTING=preserved' >"$shell_profile"
 
@@ -74,6 +76,7 @@ test "$invalid_signing_status" -ne 0
 grep -F 'requires a named or hash codesigning identity' "$fixture_root/invalid-signing.stderr"
 test ! -e "$bin_dir/macop"
 test ! -e "$bin_dir/macop-agent"
+test ! -e "$bin_dir/MacopAuth.app"
 
 bash scripts/build-install.sh \
   --configuration debug \
@@ -85,10 +88,13 @@ bash scripts/build-install.sh \
 
 test -x "$bin_dir/macop"
 test -x "$bin_dir/macop-agent"
+test -x "$bin_dir/MacopAuth.app/Contents/MacOS/MacopAuth"
 test -L "$bin_dir/op"
 test "$(readlink "$bin_dir/op")" = "macop"
 test "$(codesign -d --verbose=4 "$bin_dir/macop" 2>&1 | sed -n 's/^Identifier=//p')" = "macop"
 test "$(codesign -d --verbose=4 "$bin_dir/macop-agent" 2>&1 | sed -n 's/^Identifier=//p')" = "macop-agent"
+test "$(codesign -d --verbose=4 "$bin_dir/MacopAuth.app" 2>&1 | sed -n 's/^Identifier=//p')" = \
+  "io.github.slashkiko.macop.auth"
 grep -Fqx '# >>> macop PATH >>>' "$shell_profile"
 grep -Fqx "export PATH=$bin_dir:\"\$PATH\"" "$shell_profile"
 grep -Fqx 'export EXISTING_SETTING=preserved' "$shell_profile"
@@ -97,6 +103,7 @@ bash scripts/uninstall.sh --bin-dir "$bin_dir" --shell-profile "$shell_profile"
 
 test ! -e "$bin_dir/macop"
 test ! -e "$bin_dir/macop-agent"
+test ! -e "$bin_dir/MacopAuth.app"
 test ! -e "$bin_dir/op"
 test -d "$bin_dir"
 test -f "$config_marker"
