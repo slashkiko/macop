@@ -146,7 +146,7 @@ shell aliasは対話shellだけに適用され、通常のshell scriptでは展�
 - 意味が異なるcommandやflagを互換と見なさない。たとえば1Password accountを返す`whoami`はローカルmacOS user情報で代用しない。
 - 本物の`op`へ暗黙に処理を転送しない。
 
-`ssh`、`config`、`doctor`、`compatibility`と`item import`は`macop`固有のextensionであり、1Password CLI互換とは主張しない。alias経由で`op ssh`などと起動された場合も、`macop` extensionとして同じ動作をする。
+`ssh`、`config`、`doctor`、`compatibility`と`item import/acquire/create/edit/delete`は`macop`固有のextensionであり、1Password CLI互換とは主張しない。alias経由で`op ssh`などと起動された場合も、`macop` extensionとして同じ動作をする。
 
 ### 6.3 互換対象
 
@@ -161,10 +161,11 @@ shell aliasは対話shellだけに適用され、通常のshell scriptでは展�
 | `op completion` | `macop completion` | 対応: bash / zsh / fish。PowerShellはmacOS MVP外 |
 | `op whoami` | 同名 | 未対応。1Password accountという概念がないため |
 | `op signin`, `op signout`, `op update` | 同名 | 未対応。account backend・自動updateを持たないため |
-| `op item create/edit/delete/move/share/template` | 同名 | 未対応。Keychain item CRUDとshare/vault機能をMVP外とするため |
+| `op item create/edit/delete` | `macop item create/edit/delete` | macop extensionとして設定済みKeychain selectorに限定対応。1Password item schema互換ではない |
+| `op item move/share/template` | 同名 | 未対応。vault/share/templateのデータモデルを持たないため |
 | `op vault/account/user/group/service-account/connect/events-api/document/environment/plugin` | 同名 | 未対応。vault/cloud backendを持たないため |
 | `--account`, `--session`, `--cache`, `--iso-timestamps`、UTF-8以外の`--encoding` | 同名 | 未対応。無視やno-opにはしない |
-| — | `macop ssh`, `config`, `doctor`, `compatibility`, `item import` | macop extensionとして対応。1Password CLI互換の機能ではない |
+| — | `macop ssh`, `config`, `doctor`, `compatibility`, `item import/acquire/create/edit/delete` | macop extensionとして対応。1Password CLI互換の機能ではない |
 
 ### 6.4 互換性の境界
 
@@ -276,9 +277,14 @@ op item list --format=json
 op item get GitHub --format=json
 op item get GitHub --fields label=token
 printf %s "$SECRET_FROM_A_SAFE_SOURCE" | macop item import GitHub
+printf %s "$SECRET_FROM_A_SAFE_SOURCE" | macop item create LegacyGitHub
+printf %s "$REPLACEMENT_FROM_A_SAFE_SOURCE" | macop item edit LegacyGitHub
+macop item delete LegacyGitHub
 ```
 
-MVPでは設定済みのKeychain itemのみを対象にする。`item list`は`--long`と`--format=json`を受け付ける。`item get`はitem名、`--fields label=<field>`、`--reveal`、`--format=json`を受け付け、`--reveal`がないsecret fieldはマスクする。macop固有の`item import`は`keychain-managed` itemだけを対象に、UTF-8 secretのstdinをData Protection Keychainへ登録する。既存itemは上書きせず、Touch IDまたはMac認証と`userPresence` access controlを要求する。
+設定済みのKeychain itemのみを対象にする。`item list`は`--long`と`--format=json`を受け付ける。`item get`はitem名、`--fields label=<field>`、`--reveal`、`--format=json`を受け付け、`--reveal`がないsecret fieldはマスクする。macop固有の`item import`は`keychain-managed` itemだけを対象に、UTF-8 secretのstdinをData Protection Keychainへ登録する。既存itemは上書きせず、Touch IDまたはMac認証と`userPresence` access controlを要求する。`synchronization: "icloud"`を明示したmanaged itemは`kSecAttrSynchronizable=true`と`kSecAttrAccessibleWhenUnlocked`を使い、デフォルトのlocal itemは`ThisDeviceOnly`を維持する。
+
+`item create/edit`は設定済みのlegacy generic/internet passwordをstdinだけから作成・更新する。`edit/delete`はsecretを読む前にopaque persistent referenceを列挙してexact-oneを要求し、曖昧selectorで複数itemを変更しない。`item delete`はlegacy itemまたは1件のmanaged itemを削除し、`--all-managed`はmacop access group内のlocal/synchronizable generic passwordだけを対象にする。
 
 1Password固有のitem ID、stdin入力、`--vault`、`--categories`、`--tags`、`--favorite`、`--include-archive`、`--otp`、`--share-link`は、vault/category/archive/share/OTPという対応するデータモデルがないため未対応エラーにする。
 
@@ -331,7 +337,7 @@ macop ssh delete github
 
 `macop`が扱うのはidentity label、公開鍵、公開鍵ハッシュなどの非機密metadataだけであり、secret値やprivate keyは保存しない。`public-key`は選択hashをSecurity.frameworkで正確に1件へ解決する。`run`と`test`は選択identityだけを公開する短命agentの下でApple純正`ssh`を起動し、`-F /dev/null`、`PKCS11Provider=none`、`IdentitiesOnly=no`、`IdentityFile=none`、`IdentityAgent=SSH_AUTH_SOCK`、`PreferredAuthentications=publickey`、`ForwardAgent=no`を固定指定する。ユーザーSSH設定、既定identity file、別agent、非公開鍵認証へfallbackして成功する経路はfail closedで禁止する。`create`は`p-256-ne -t bio`を標準にし、作成後にSecurity.frameworkが選択hashから公開鍵を正確に1件解決できることまで検証する。
 
-verified-session agentは`macop ssh agent shell <identity-label> -- <program> [arguments...]`と`macop ssh agent application <identity-label> <application-path>`で起動する。`ssh test/run`も同じlauncherを内部利用する。いずれも新規に起動した協調rootだけを対象とし、既存application、外部relay、Sourcetree/Terminal固有のE2E互換性は保証しない。
+verified-session agentは`macop ssh agent shell <identity-label> -- <program> [arguments...]`と`macop ssh agent application <identity-label> <application-path>`で起動する。`ssh test/run`も同じlauncherを内部利用する。いずれも新規に起動した協調rootだけを対象とし、既存application、外部relay、Terminalタブ固有のE2E互換性は保証しない。
 
 ### 9.3 Phase 0で確定した限界
 
@@ -353,7 +359,7 @@ Phase 4は一つのverified-session基盤に、CLI用とapplication用の入口�
 
 verified modeでは、有効なOpenSSH session bindingが署名要求より前に届くことを必須にし、`forwarding=1`、bindingなし、外部relay、終了済みroot sessionをfail closedで拒否する。承認画面には起動前に選択したものと一致したcanonical executable path、署名authority/team、短縮cdhash、鍵名とfingerprint、対象session、期限を表示する。Apple anchorとTeam IDを確認できた場合だけ「trusted signature + exact image pinned」、ad-hoc/unanchoredなら「exact image pinned; publisher unverified」とする。同一live snapshotのidentifier+cdhash（trusted時はApple anchor+Team IDも含む）から最終requirementを構築してlive `SecCode`へstrict検証し、その同じrequirementをregistryへ保存する。生のcode requirementは表示しない。「macop-agent経由だけに適用され、OSのalternate direct CTK accessは制御しない」と明記する。host bindingで受け入れるhost keyは`ssh-ed25519`と`ecdsa-sha2-nistp256`だけとし、RSAとhost certificateは互換fallbackなしで拒否する。
 
-Phase 0bでは、最小`.app`を`NSWorkspace.OpenConfiguration`から起動して専用`SSH_AUTH_SOCK`とnonce環境変数を渡し、launcherの起動PIDとsocket peer PID、bundle ID、および協調probeが自己申告したnonceが一致することを確認した。このnonce一致はproduction rootをagent側から認証した証拠ではない。macOSでは同一UIDでも`KERN_PROCARGS2`による他process環境の取得が許可されないため、productionではnonceを子processへ渡さず、rootから再観測して照合する設計も採用しない。process ancestry試験では正規の子processを許可し、socket pathを知る外部processとroot終了後の孤児processを拒否した。Sourcetree固有の挙動、Terminalタブ単位integration、実CTK identityでのTouch ID / GitHub E2EはPhase 4の未完了項目とする。
+Phase 0bでは、最小`.app`を`NSWorkspace.OpenConfiguration`から起動して専用`SSH_AUTH_SOCK`とnonce環境変数を渡し、launcherの起動PIDとsocket peer PID、bundle ID、および協調probeが自己申告したnonceが一致することを確認した。このnonce一致はproduction rootをagent側から認証した証拠ではない。macOSでは同一UIDでも`KERN_PROCARGS2`による他process環境の取得が許可されないため、productionではnonceを子processへ渡さず、rootから再観測して照合する設計も採用しない。process ancestry試験では正規の子processを許可し、socket pathを知る外部processとroot終了後の孤児processを拒否した。実CTK identityでのTouch ID / GitHub E2Eは完了し、Terminalタブ単位integrationだけを後続とする。Sourcetree固有対応はサンプル案だったため対象外とする。
 
 この設計でも、登録application自体の侵害、process injection、登録process tree内の悪意あるrelayは防御境界外である。「macopだけが署名できる」「任意の既存applicationを事後に認証できる」とは主張しない。
 
@@ -526,7 +532,7 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - 共用socketではrelayより前の元clientを識別できないため、stable socket案は不採用とした
 - Phase 0 spikeのapplication別専用socketでは、起動PID・peer PID・bundle IDと協調probeが自己申告したnonceの一致、外部relayと終了済みsessionの拒否を確認した。nonce自己申告はproductionのroot認証証拠にせず、productionではlauncher/registry内部の予約相関に限定した
 - Apple OpenSSH 10.2のsession bindingでAgent Forwardingを`forwarding=1`として検出できた
-- verified-session agentを条件付きGoとした。当時はSourcetree、Terminalタブ、実CTK identity / Touch ID / GitHub E2Eが未検証だった
+- verified-session agentを条件付きGoとした。当時はTerminalタブ、実CTK identity / Touch ID / GitHub E2Eが未検証だった。Sourcetree固有対応は後に対象外とした
 - 詳細は[Phase 0 feasibility report](./macop-phase0-feasibility-2026-08-14.md)を参照する
 
 ### Phase 1: CLI・package基盤
@@ -558,6 +564,8 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - UTF-8/NUL validation、stdout/stderr redactor（chunk境界を含む）、対話時のPTY relay
 - shellなしの`posix_spawnp`実行
 - `--no-masking`の明示的解除
+- managed itemの項目単位iCloud同期、legacy generic/internet itemのstdin-only create/editとexact-one delete
+- user-initiated Passwords AutoFill fallback、明示refresh、managed Keychain save/update/delete
 
 ### Phase 4: Secure Enclave SSH
 
@@ -565,10 +573,12 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - 共用socketを持たないsession registry、application / shell session別proxy socket、process / code identity検証
 - OpenSSH session bindingを必須化し、`forwarding=1`と非協調clientをfail closedで拒否
 - application・検証状態・鍵・session・期限を表示するTouch ID承認UIとsession単位cache
-- Sourcetree / Terminalの製品別integration、実CTK identityでの署名・GitHub E2E
+- Terminalタブ単位integration、実CTK identityでの署名・GitHub E2E
 - 2026-08-28にcertificate-backed same-Team build、要求元icon付きTouch ID UI、自作agent経由の実CTK identity署名、GitHub SSHの`shell/test/run`をdogfood確認済み
 - `/usr/bin/git`はdeveloper-tool shimであるため、`ssh run`はlookup overrideを除去した`xcrun --no-cache --find git`で実体imageを解決する。Gitは`POSIX_SPAWN_START_SUSPENDED`で起動し、`anchor apple`・`com.apple.git`・library validationをlive processで検証してexact requirement/cdhashをregistryへ固定する。registry activation・承認・agent authorization後だけ`SIGCONT`し、拒否時は一度も再開せずkill/reapする
 - `ssh run`は`git`と`/usr/bin/git`だけを入口として受け入れ、同名の任意実行ファイルへverified-session socketを渡さない
+- `ssh shell-init zsh|bash|fish`はinteractive shellを1回だけverified rootへ置換し、tab/shell終了を既存registryの即時失効へ結び付ける
+- `ssh git-signing-config`とGitの`ssh-keygen -Y sign -n git`互換adapterは、設定公開鍵に一致するCTK identityだけでcanonical SSHSIG preimageを署名し、private keyやstable agent socketをexportしない
 
 ### Phase 5: 安全性と互換性
 
@@ -596,16 +606,16 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - `macop`独自ストレージにsecretが存在しない。
 - 未対応`op`コマンドが理由付きの終了コード`3`を返す。
 - text / JSON双方でエラー形式が安定している。
-- Apple Passwordsアクセスは未対応として明示される。
+- Apple Passwordsはuser-initiated AutoFill chooser経由で利用でき、直接列挙・silent queryは公開API不在として拒否される。
 - `macop compatibility --format=json`がsupport matrixをstableなmacop schemaで返す。
 
-## 16. 将来候補
+## 16. MVP後の実装状態
 
-- Keychain itemの作成、編集、削除
-- `kSecAttrSynchronizable`を使ったgeneric secret同期
-- shell plugin
-- Git SSH署名
-- Appleが公式APIを公開した場合のApple Passwords provider
+- Keychain itemの作成、編集、削除: legacy generic/internetとmanaged削除を実装済み
+- `kSecAttrSynchronizable`を使ったgeneric secret同期: managed itemの項目単位opt-inとして実装済み。2台目Macでの伝播acceptanceは未実施
+- shell plugin: zsh/bash/fish向け生成とtab root終了時のregistry失効を実装済み。実Terminal tab dogfoodは未実施
+- Git SSH署名: GitのSSH signing program互換adapterと設定生成を実装済み。OpenSSHによるSSHSIG検証済み、実CTK/Touch ID commit署名dogfoodは未実施
+- Apple Passwords provider: user-initiated AutoFill adapterは実装済み。公式direct providerは公開APIが提供された場合だけ差し替える
 
 ## 17. 参考資料
 

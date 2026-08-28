@@ -181,6 +181,16 @@ contains no secret value:
 }
 ```
 
+Set `"synchronization": "icloud"` on an individual `keychain-managed` item
+to store it as a synchronizable Data Protection Keychain item. The default
+(`null` or `"local"`) remains device-local. An iCloud item uses
+`kSecAttrAccessibleWhenUnlocked`, because `ThisDeviceOnly` accessibility cannot
+sync, while retaining `userPresence` authorization. The other Mac must have
+iCloud Keychain enabled and a macop build signed for the same Keychain access
+group. Updates and deletions affect the synchronized copies. Cross-Mac
+propagation still requires acceptance on a second Mac; local add/read/update/delete
+and the synchronizable query contract are covered by the implementation tests.
+
 For a Touch ID-protected managed item, use the same non-secret selector shape
 with `"provider": "keychain-managed"`, then pass the secret only over stdin:
 
@@ -210,6 +220,20 @@ matching provisioning profile via `MACOP_PROVISIONING_PROFILE`; builds without
 that profile do not advertise the managed Keychain capability. Ad-hoc builds
 deliberately fail closed.
 
+Configured legacy `keychain-generic` and `keychain-internet` items support
+stdin-only create and edit, plus exact-one deletion:
+
+```bash
+printf %s "$SECRET_FROM_A_SAFE_SOURCE" | macop item create GitHub
+printf %s "$REPLACEMENT_FROM_A_SAFE_SOURCE" | macop item edit GitHub
+macop item delete GitHub
+```
+
+`create` refuses an existing selector. `edit` and `delete` enumerate opaque
+persistent references first and refuse zero or multiple matches, so an
+ambiguous service/account or server/account selector never modifies several
+Keychain items.
+
 For an interactive credential, `read`, `run`, and `inject` first try the
 configured managed Keychain item. If it is missing, macOS opens its Passwords
 AutoFill chooser; after selection, macop shows the verified requesting app again
@@ -217,6 +241,9 @@ and requires Touch ID or the Mac login password before returning the credential
 to the requesting command. The approval window lets you save or update the
 selected password in the managed Keychain. Cancellation, authentication errors,
 and other Keychain failures never trigger the fallback.
+The system chooser is intentionally user-initiated: macop cannot enumerate or
+silently query the Passwords database through a public macOS API, and the
+current AutoFill workaround obtains the password field but not the username.
 
 `item acquire` performs the same lookup and writes the credential to stdout.
 Pass `--from-passwords` to bypass a known-bad cached item explicitly; macop does
@@ -230,10 +257,12 @@ macop item delete GitHub
 macop item delete --all-managed
 ```
 
-`item delete GitHub` uses the configured service/account selector.
+`item delete GitHub` uses the configured exact selector. Managed items require
+the native macop approval and macOS authentication; legacy items use their
+system Keychain access policy.
 `--all-managed` is intentionally limited to generic-password items in macop's
-private access group. Both forms require the native approval and macOS
-authentication; deleting an already-missing individual item reports not found.
+private access group and includes local and synchronizable copies. Deleting an
+already-missing individual item reports not found.
 
 The supported secret boundary is deliberately narrow:
 
@@ -244,8 +273,9 @@ The supported secret boundary is deliberately narrow:
   result only to stdout; persistent secret output files are rejected.
 - `item list` and `item get` return macop metadata. `item import` accepts exact
   UTF-8 secret bytes from stdin for a configured managed item; `item acquire`
-  returns a managed or interactively selected credential; `item delete` removes
-  only managed items. Metadata JSON is a macop schema
+  returns a managed or interactively selected credential; `item create/edit`
+  mutate configured legacy items from stdin, and `item delete` removes one
+  exactly selected Keychain item. Metadata JSON is a macop schema
   with `schema_version`, not a complete 1Password item schema; `--reveal` is an
   explicit request to expose an item field.
 - Resolved secrets exist in process memory while a command is prepared and
@@ -292,6 +322,26 @@ Git remains suspended through registry activation and approval, and receives
 without allowing its first instruction to run.
 It accepts only the `git` and `/usr/bin/git` entry points; renamed or alternate
 executables are rejected rather than receiving the verified-session socket.
+
+Generate repository-local Git commit/tag SSH-signing configuration for the same
+Secure Enclave identity:
+
+```bash
+macop ssh git-signing-config github
+# Review the three printed `git config --local` commands, then run them.
+git commit -S
+git tag -s v1.0.0
+```
+
+Git invokes the installed macop binary through its `ssh-keygen -Y sign`
+interface. macop accepts only Git's
+`-Y sign -n git -f <public-key> <message-file>` shape, requires the direct
+parent to be Apple's live Git image, accepts only owner-controlled regular
+input files and an owner-controlled signature directory, and refuses
+to overwrite an existing `.sig`, matches the configured public key to exactly
+one CTK identity, and signs the canonical `SSHSIG` preimage after native macop
+approval. The generated envelope is checked by the test suite with Apple
+OpenSSH. No private key or stable agent socket is exported.
 
 `macop doctor` enumerates each CTK identity by its public hash, resolves its
 public key through Security.framework, and checks the effective isolated SSH
@@ -375,6 +425,21 @@ start time, code requirement, and process ancestry before enabling signing.
 macop ssh agent shell github -- /usr/bin/ssh git@github.com
 macop ssh agent application github /Applications/Example.app
 ```
+
+For one verified session per interactive Terminal tab, add the generated shell
+plugin to the relevant startup file:
+
+```bash
+export MACOP_SSH_IDENTITY=github
+eval "$(macop ssh shell-init zsh)" # use bash or fish as appropriate
+```
+
+The plugin replaces the initial interactive shell with
+`macop ssh agent shell ... -- $SHELL -l` exactly once, guarded by
+`MACOP_SHELL_INTEGRATION_ACTIVE`. The child login shell inherits the private
+socket and normal terminal process group. Closing the tab or exiting that shell
+ends the registered root and revokes the session/socket; the fixed session
+deadline remains an independent upper bound.
 
 Only the socket is passed to the new process. A nonce stays as an opaque
 launcher-to-registry reservation capability; it is not read from, or used to

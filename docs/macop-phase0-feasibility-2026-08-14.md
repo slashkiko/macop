@@ -90,7 +90,7 @@ local SSH connection:     session-bind@openssh.com forwarding=0
 forwarded agent request:  session-bind@openssh.com forwarding=1
 ```
 
-verified modeでは、署名要求より前の有効なsession bindingを必須にし、`forwarding=1`を拒否する。`session-bind@openssh.com`を送らないclientや、独自forwarderは検証済みとして扱わずfail closedにする。この条件がSourcetreeなど対象clientと両立するかは製品別に確認が必要である。
+verified modeでは、署名要求より前の有効なsession bindingを必須にし、`forwarding=1`を拒否する。`session-bind@openssh.com`を送らないclientや、独自forwarderは検証済みとして扱わずfail closedにする。この条件が対象clientと両立するかは個別に確認が必要である。
 
 ## 採用する設計境界
 
@@ -115,13 +115,13 @@ verified modeでは、署名要求より前の有効なsession bindingを必須�
 
 ## 未検証事項とPhase 4開始条件
 
-- SourcetreeはこのMacに未インストールのため、macopからの新規起動、専用`SSH_AUTH_SOCK`利用、`session-bind@openssh.com`対応を未確認。
-- Terminalのタブ単位shell integrationと、タブ終了時のsession失効を未確認。
+- Sourcetreeはサンプル対象だったが、利用予定がないため2026-08-28に固有対応をスコープから除外した。
+- Terminalのタブ単位shell integrationは2026-08-29にzsh/bash/fish pluginとして実装した。tab shell root終了時のregistry失効は既存fixtureで検証済みだが、実Terminalでのjob-control dogfoodは未実施。
 - 実CTK identityを使ったTouch ID、署名、GitHub SSH E2Eを未実施。
 - 正式配布時のcode requirement、Developer ID signing、XPC boundaryを未確定。
 - PID再利用への対策は開始時刻との組み合わせを設計したが、長時間stress testは未実施。
 
-Phase 4では、まず最小agent protocol、session registry、Sourcetreeまたは対象GUI client、Terminal shell integrationを順に実装・検証する。対象clientがsession bindingに非対応なら、承認画面上で「検証済み」と表示せず、そのclientをverified modeの対象外にする。既存のApple純正`op`互換動作と公開CLI契約は変更しない。
+Phase 4では、まず最小agent protocol、session registry、対象GUI client、Terminal shell integrationを順に実装・検証する。対象clientがsession bindingに非対応なら、承認画面上で「検証済み」と表示せず、そのclientをverified modeの対象外にする。既存のApple純正`op`互換動作と公開CLI契約は変更しない。
 
 ## Phase gate
 
