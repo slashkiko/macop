@@ -1,3 +1,4 @@
+// swiftlint:disable file_length
 import Foundation
 
 public struct CompatibilityEntry: Codable, Sendable {
@@ -150,6 +151,12 @@ public enum CompatibilityCommand {
             .init(command: "item get --fields", kind: "flag", status: "supported"),
             .init(command: "item get --reveal", kind: "flag", status: "supported"),
             .init(command: "item get --format", kind: "flag", status: "supported"),
+            .init(
+                command: "item import",
+                kind: "extension",
+                status: "supported",
+                reason: "Create-only stdin import for configured keychain-managed items."
+            ),
             .init(
                 command: "item get --id",
                 kind: "flag",

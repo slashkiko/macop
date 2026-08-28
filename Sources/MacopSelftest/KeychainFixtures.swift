@@ -78,3 +78,11 @@ final class QuerySensitiveKeychainClient: KeychainClient, @unchecked Sendable {
         }
     }
 }
+
+final class RecordingManagedKeychainImporter: ManagedKeychainImporting, @unchecked Sendable {
+    private(set) var imports = [(secret: Data, service: String, account: String)]()
+
+    func importSecret(_ secret: Data, service: String, account: String) throws {
+        self.imports.append((secret, service, account))
+    }
+}

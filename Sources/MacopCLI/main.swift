@@ -20,6 +20,7 @@ let result = app.runInteractivelyIfNeeded(argv: CommandLine.arguments, env: envi
     }
     let readsStandardInput = parsed?.command == .inject
         && (try? InjectCommand.requiresStandardInput(args: parsed?.commandArgs ?? [])) == true
+        || parsed?.command == .item && parsed?.commandArgs.first == "import"
     let input = readsStandardInput ? FileHandle.standardInput.readDataToEndOfFile() : Data()
     return app.run(argv: CommandLine.arguments, env: environment, input: input)
 }()

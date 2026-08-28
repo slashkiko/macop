@@ -5,7 +5,7 @@ public enum ReadCommand {
         args: [String],
         options: GlobalOptions,
         env: [String: String],
-        client: any KeychainClient = SystemKeychainClient()
+        client: any KeychainClient = DefaultKeychainClient()
     ) throws -> CommandResult {
         let parsed = try parseArgs(args)
         let reference = try ReferenceResolver.parse(parsed.reference, env: env)
@@ -111,6 +111,9 @@ public enum ReadCommand {
         }
         if item.provider == "keychain-generic", let service = item.service, let account = item.account {
             return .generic(service: service, account: account)
+        }
+        if item.provider == "keychain-managed", let service = item.service, let account = item.account {
+            return .managed(service: service, account: account)
         }
         throw CLIError.unsupportedProvider(provider: item.provider, reason: "This provider cannot supply secret text.")
     }

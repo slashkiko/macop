@@ -1,18 +1,53 @@
 import Foundation
 
 public enum ItemCommand {
-    public static func run(args: [String], options: GlobalOptions, client: any KeychainClient) throws -> CommandResult {
+    public static func run(
+        args: [String],
+        options: GlobalOptions,
+        input: Data = Data(),
+        client: any KeychainClient,
+        importer: any ManagedKeychainImporting = CompanionManagedKeychainImporter()
+    ) throws -> CommandResult {
         guard let subcommand = args.first
-        else { throw CLIError.invalidArguments(message: "item requires list or get.") }
+        else { throw CLIError.invalidArguments(message: "item requires list, get, or import.") }
         switch subcommand {
         case "list": return try self.list(Array(args.dropFirst()), options: options)
         case "get": return try self.get(Array(args.dropFirst()), options: options, client: client)
+        case "import": return try self.importItem(
+                Array(args.dropFirst()), options: options, input: input, importer: importer
+            )
         default:
             if let reason = self.unsupportedSubcommandReason(subcommand) {
                 throw CLIError.unsupportedCommand(command: "item \(subcommand)", reason: reason)
             }
             throw CLIError.invalidArguments(message: "Unknown item subcommand: \(subcommand)")
         }
+    }
+
+    private static func importItem(
+        _ args: [String],
+        options: GlobalOptions,
+        input: Data,
+        importer: any ManagedKeychainImporting
+    ) throws -> CommandResult {
+        guard args.count == 1, let name = args.first, !name.hasPrefix("-") else {
+            throw CLIError.invalidArguments(message: "item import requires one configured item name and secret stdin.")
+        }
+        guard !input.isEmpty, input.count <= ManagedKeychainStore.maximumSecretLength,
+              let text = String(data: input, encoding: .utf8), !text.contains("\0")
+        else {
+            throw CLIError.invalidArguments(message: "item import requires 1 to 65536 bytes of UTF-8 secret stdin.")
+        }
+        let matches = try ConfigStore.items(configDirectory: options.configDirectory)
+            .filter { $0.value.provider == "keychain-managed" && $0.key.split(separator: "/").last == Substring(name) }
+        guard matches.count == 1, let item = matches.first,
+              let service = item.value.service, let account = item.value.account
+        else { throw CLIError.notFound(message: "Configured managed item \"\(name)\" was not found.") }
+        try importer.importSecret(input, service: service, account: account)
+        if options.format == .json {
+            return CommandResult(exitCode: 0, stdout: "{\"schema_version\":1,\"status\":\"imported\"}\n")
+        }
+        return CommandResult(exitCode: 0, stdout: "Imported \(item.key) into the managed Keychain.\n")
     }
 
     private static func list(_ args: [String], options: GlobalOptions) throws -> CommandResult {
@@ -102,8 +137,7 @@ public enum ItemCommand {
     }
 
     private static func supported(_ entry: (key: String, value: ConfigItem)) -> Bool {
-        entry.value
-            .provider == "keychain-generic" || entry.value.provider == "keychain-internet"
+        ["keychain-generic", "keychain-internet", "keychain-managed"].contains(entry.value.provider)
     }
 
     private static func query(for item: ConfigItem) throws -> KeychainQuery {
@@ -120,6 +154,9 @@ public enum ItemCommand {
                 server: server,
                 account: account
             )
+        }
+        if item.provider == "keychain-managed", let service = item.service, let account = item.account {
+            return .managed(service: service, account: account)
         }
         throw CLIError.unsupportedProvider(
             provider: item.provider,

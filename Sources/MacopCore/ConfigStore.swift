@@ -4,6 +4,7 @@ import Foundation
 public enum ConfigProviderKind: Sendable {
     case keychainGeneric
     case keychainInternet
+    case keychainManaged
     case secureEnclave
 }
 
@@ -201,6 +202,18 @@ public enum ConfigStore {
                     .invalidArguments(message: "keychain-internet does not allow service or label in config item.")
             }
             return .keychainInternet
+        case "keychain-managed":
+            guard self.hasValue(item.service), self.hasValue(item.account) else {
+                throw CLIError.invalidArguments(
+                    message: "keychain-managed requires service and account in config item."
+                )
+            }
+            guard item.server == nil, item.label == nil else {
+                throw CLIError.invalidArguments(
+                    message: "keychain-managed does not allow server or label in config item."
+                )
+            }
+            return .keychainManaged
         case "secure-enclave":
             guard self.hasValue(item.label) else {
                 throw CLIError.invalidArguments(message: "secure-enclave requires label in config item.")
@@ -287,7 +300,7 @@ public enum ConfigStore {
                 throw CLIError.invalidArguments(message: "Config item \"\(key)\" must be an object with a provider.")
             }
             let allowed: Set<String> = switch provider {
-            case "keychain-generic": ["provider", "service", "account", "fields"]
+            case "keychain-generic", "keychain-managed": ["provider", "service", "account", "fields"]
             case "keychain-internet": ["provider", "server", "account", "fields"]
             case "secure-enclave": ["provider", "label"]
             default: ["provider"]

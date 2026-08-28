@@ -49,15 +49,18 @@ public struct MacopApp {
     private let keychainClient: any KeychainClient
     private let commandExecutor: CommandExecutor
     private let biometricChecker: any BiometricAvailabilityChecking
+    private let managedKeychainImporter: any ManagedKeychainImporting
 
     public init(
-        keychainClient: any KeychainClient = SystemKeychainClient(),
+        keychainClient: any KeychainClient = DefaultKeychainClient(),
         commandExecutor: CommandExecutor = SystemCommandExecutor(),
-        biometricChecker: any BiometricAvailabilityChecking = SystemBiometricAvailabilityChecker()
+        biometricChecker: any BiometricAvailabilityChecking = SystemBiometricAvailabilityChecker(),
+        managedKeychainImporter: any ManagedKeychainImporting = CompanionManagedKeychainImporter()
     ) {
         self.keychainClient = keychainClient
         self.commandExecutor = commandExecutor
         self.biometricChecker = biometricChecker
+        self.managedKeychainImporter = managedKeychainImporter
     }
 
     public func run(argv: [String], env: [String: String], input: Data = Data()) -> CommandResult {
@@ -203,7 +206,13 @@ public struct MacopApp {
                 client: self.keychainClient
             )
         case .item:
-            return try ItemCommand.run(args: parsed.commandArgs, options: parsed.options, client: self.keychainClient)
+            return try ItemCommand.run(
+                args: parsed.commandArgs,
+                options: parsed.options,
+                input: input,
+                client: self.keychainClient,
+                importer: self.managedKeychainImporter
+            )
         case .config:
             return try ConfigCommand.run(args: parsed.commandArgs, options: parsed.options)
         case .run:

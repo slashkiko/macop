@@ -1659,7 +1659,7 @@ func run() throws {
         "inject --force", "item list", "item list --long", "item list --format", "item list --vault",
         "item list --categories", "item list --tags", "item list --favorite", "item list --include-archive",
         "item list --otp", "item list --share-link", "item get", "item get --fields",
-        "item get --reveal",
+        "item get --reveal", "item import",
         "item get --format", "item get --id", "item get --stdin", "item get --vault", "item get --categories",
         "item get --tags",
         "item get --favorite",
@@ -1698,7 +1698,7 @@ func run() throws {
     )
     try expect(
         compatibilityHuman.stdout
-            .contains("Macop extensions: compatibility, config init, config validate, doctor, ssh"),
+            .contains("Macop extensions: item import, compatibility, config init, config validate, doctor, ssh"),
         "human matrix should label extensions"
     )
     try expect(compatibilityHuman.stdout.contains("Flags:"), "human matrix should label flags separately")
@@ -2958,6 +2958,44 @@ func run() throws {
         validSectionFieldClient.queries.count == 1,
         "valid section/field selector must resolve its Keychain mapping"
     )
+
+    let managedConfig = """
+    { "version": 1, "items": {
+      "Local/Managed": {
+        "provider": "keychain-managed", "service": "github-token", "account": "me", "fields": ["token"]
+      }
+    } }
+    """
+    try managedConfig.data(using: .utf8)!.write(to: configPath, options: [.atomic])
+    let managedClient = RecordingKeychainClient(.success(Data("managed-secret".utf8)))
+    let managedImporter = RecordingManagedKeychainImporter()
+    let managedApp = MacopApp(keychainClient: managedClient, managedKeychainImporter: managedImporter)
+    let managedRead = managedApp.run(
+        argv: ["macop", "--config", configDirectory, "read", "op://Local/Managed/token"], env: [:]
+    )
+    try expect(managedRead.exitCode == 0, "managed Keychain config items must be readable")
+    try expect(
+        managedClient.queries == [.managed(service: "github-token", account: "me")],
+        "managed config items must route to the managed Keychain query"
+    )
+    let managedSecret = Data("new-managed-secret".utf8)
+    let managedImportResult = managedApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "import", "Managed"],
+        env: [:],
+        input: managedSecret
+    )
+    try expect(managedImportResult.exitCode == 0, "item import must accept configured managed items")
+    try expect(
+        managedImporter.imports.count == 1
+            && managedImporter.imports[0].secret == managedSecret
+            && managedImporter.imports[0].service == "github-token"
+            && managedImporter.imports[0].account == "me",
+        "item import must forward exact stdin and configured selectors"
+    )
+    let emptyManagedImport = managedApp.run(
+        argv: ["macop", "--config", configDirectory, "item", "import", "Managed"], env: [:]
+    )
+    try expect(emptyManagedImport.exitCode == 2, "item import must reject empty stdin before broker access")
 
     let literalSelectorConfig = """
     { "version": 1, "items": {

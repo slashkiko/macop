@@ -37,8 +37,9 @@ public enum CompletionText {
             _macop() {
               local -a commands
               commands=(read run inject item completion compatibility ssh config doctor)
-              _arguments '1:command:(${commands})' '*::argument:->args'
+            _arguments '1:command:(${commands})' '*::argument:->args'
               case $words[2] in
+                item) _values 'item command' list get import ;;
                 config) _values 'config command' init validate ;;
                 ssh) _values 'ssh command' create list public-key delete test run agent ;;
                 completion) _values 'shell' bash zsh fish ;;
@@ -53,6 +54,7 @@ public enum CompletionText {
               local commands="read run inject item completion compatibility ssh config doctor"
               local flags="--help --version --format --config --no-color --debug --encoding"
               case "${COMP_WORDS[1]}" in
+                item) COMPREPLY=( $(compgen -W "list get import ${flags}" -- "$cur") ) ;;
                 config) COMPREPLY=( $(compgen -W "init validate ${flags}" -- "$cur") ) ;;
                 ssh) COMPREPLY=( $(compgen -W "create list public-key delete test run agent ${flags}" -- "$cur") ) ;;
                 completion) COMPREPLY=( $(compgen -W "bash zsh fish ${flags}" -- "$cur") ) ;;
@@ -67,6 +69,8 @@ public enum CompletionText {
             complete -c op -f -a 'read run inject item completion compatibility ssh config doctor'
             complete -c macop -l format -a 'human-readable json'
             complete -c op -l format -a 'human-readable json'
+            complete -c macop -n '__fish_seen_subcommand_from item' -a 'list get import'
+            complete -c op -n '__fish_seen_subcommand_from item' -a 'list get import'
             complete -c macop -n '__fish_seen_subcommand_from config' -a 'init validate'
             complete -c op -n '__fish_seen_subcommand_from config' -a 'init validate'
             complete -c macop -n '__fish_seen_subcommand_from ssh' -a 'create list public-key delete test run agent'

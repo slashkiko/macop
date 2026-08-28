@@ -437,6 +437,12 @@ enum SecretMaterial {
                     client: client
                 )
             }
+            if item.provider == "keychain-managed", let service = item.service, let account = item.account {
+                return try KeychainProvider.readText(
+                    .managed(service: service, account: account),
+                    client: client
+                )
+            }
             if item.provider == "keychain-internet", let server = item.server, let account = item.account {
                 return try KeychainProvider.readText(
                     .internet(server: server, account: account),
