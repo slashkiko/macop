@@ -151,6 +151,9 @@ public enum SSHCommand {
         case "git-signing-config": return try self.gitSigningConfig(
                 Array(args.dropFirst()), options: options, context: context
             )
+        case "git-client": return try GitClientTrustCommand.run(
+                args: Array(args.dropFirst()), options: options
+            )
         case "connect": return try self.execute(
                 self.connectInvocation(Array(args.dropFirst()), options: options, context: context), context: context
             )

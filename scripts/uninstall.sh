@@ -5,6 +5,7 @@ bin_dir="${MACOP_BIN_DIR:-$HOME/.local/bin}"
 shell_profile="${MACOP_SHELL_PROFILE:-}"
 keep_path=false
 delete_managed_keychain=false
+remove_data=false
 
 usage() {
   cat <<'EOF'
@@ -18,11 +19,15 @@ Options:
   --keep-path            Preserve the managed PATH block
   --delete-managed-keychain
                          Delete all macop-managed Keychain items before uninstalling
+  --remove-data          Delete the machine-local trusted Git client registry
   --help                 Show this help
 
 The script preserves configuration, Keychain items, CTK identities, and the
-install directory by default. --delete-managed-keychain requires the installed,
-signed macop and MacopAuth.app and interactive macOS authentication. An op
+trusted Git client registry by default. --remove-data removes only
+~/Library/Application Support/macop/git-clients.json; it does not remove
+config.json, Keychain items, or CTK identities.
+--delete-managed-keychain requires the installed, signed macop and MacopAuth.app
+and interactive macOS authentication. An op
 symlink is removed only when it targets macop. The managed PATH block is removed
 unless --keep-path is passed.
 MACOP_BIN_DIR and MACOP_SHELL_PROFILE may be used instead of their options.
@@ -52,6 +57,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --delete-managed-keychain)
       delete_managed_keychain=true
+      shift
+      ;;
+    --remove-data)
+      remove_data=true
       shift
       ;;
     --help|-h)
@@ -149,10 +158,63 @@ validate_managed_path_removal() {
 
 validate_managed_path_removal
 
+remove_machine_local_data() {
+  if [[ "$remove_data" != true ]]; then
+    return
+  fi
+  local registry_directory="$HOME/Library/Application Support/macop"
+  local registry_path="$registry_directory/git-clients.json"
+  local registry_lock="$registry_directory/.git-clients.lock"
+  if [[ ! -e "$registry_path" && ! -L "$registry_path" \
+      && ! -e "$registry_lock" && ! -L "$registry_lock" ]]; then
+    return
+  fi
+  [[ ! -L "$registry_directory" && -d "$registry_directory" ]] \
+    || fail "refusing to remove data through an unsafe registry directory."
+  [[ "$(stat -f '%u' "$registry_directory")" == "$(id -u)" \
+      && "$(stat -f '%Lp' "$registry_directory")" == "700" ]] \
+    || fail "trusted Git registry directory must be current-user-owned with mode 0700."
+  local registry_was_present=false
+  if [[ -e "$registry_path" || -L "$registry_path" ]]; then
+    registry_was_present=true
+  fi
+  /usr/bin/perl -MFcntl=:DEFAULT,:flock -e '
+    use strict; use warnings;
+    my ($directory, $registry, $lock, $uid) = @ARGV;
+    my @directory_stat = lstat($directory);
+    die "unsafe registry directory\n" unless @directory_stat
+      && (($directory_stat[2] & 0170000) == 0040000)
+      && $directory_stat[4] == $uid && (($directory_stat[2] & 0777) == 0700);
+    sysopen(my $lock_handle, $lock, O_RDWR | O_CREAT | O_NOFOLLOW, 0600)
+      or die "unsafe registry lock\n";
+    my @lock_stat = stat($lock_handle);
+    die "unsafe registry lock metadata\n" unless @lock_stat
+      && (($lock_stat[2] & 0170000) == 0100000)
+      && $lock_stat[4] == $uid && (($lock_stat[2] & 0777) == 0600);
+    flock($lock_handle, LOCK_EX) or die "cannot lock registry\n";
+    exit 0 unless -e $registry || -l $registry;
+    my @before = lstat($registry);
+    die "unsafe registry file\n" unless @before
+      && (($before[2] & 0170000) == 0100000)
+      && $before[4] == $uid && (($before[2] & 0777) == 0600);
+    sysopen(my $registry_handle, $registry, O_RDONLY | O_NOFOLLOW)
+      or die "cannot open registry safely\n";
+    my @after = stat($registry_handle);
+    die "registry changed during removal\n" unless @after
+      && $before[0] == $after[0] && $before[1] == $after[1];
+    unlink($registry) or die "cannot remove registry\n";
+  ' "$registry_directory" "$registry_path" "$registry_lock" "$(id -u)" \
+    || fail "could not remove the trusted Git registry safely."
+  if [[ "$registry_was_present" == true ]]; then
+    printf 'Removed %s\n' "$registry_path"
+  fi
+}
+
 if [[ ! -e "$bin_dir" ]]; then
   if [[ "$delete_managed_keychain" == true ]]; then
     fail "cannot delete managed Keychain items because $bin_dir does not exist."
   fi
+  remove_machine_local_data
   remove_managed_path
   printf 'Nothing to uninstall: %s does not exist.\n' "$bin_dir"
   exit 0
@@ -160,6 +222,8 @@ fi
 [[ -d "$bin_dir" ]] || fail "install path is not a directory: $bin_dir"
 [[ "$(stat -f '%u' "$bin_dir")" == "$(id -u)" ]] \
   || fail "install directory must be owned by the current user."
+
+remove_machine_local_data
 
 delete_managed_keychain_items() {
   if [[ "$delete_managed_keychain" != true ]]; then

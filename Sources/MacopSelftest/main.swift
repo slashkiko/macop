@@ -180,6 +180,313 @@ final class RecordingSSHExecutor: SSHStreamingExecuting, @unchecked Sendable {
     }
 }
 
+private struct GitClientTrustFixtureInspector: GitClientTrustInspecting {
+    let identity: LiveCodeIdentity
+    func inspectSelector(_: String) throws -> LiveCodeIdentity {
+        self.identity
+    }
+}
+
+private struct GitClientVersionFixtureExecutor: GitClientVersionProbing {
+    func version(executablePath _: String) -> String {
+        "git version 2.50.1\n"
+    }
+}
+
+private final class GitClientErrorCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values = [String]()
+    func append(_ error: Error) {
+        self.lock.lock(); self.values.append(String(describing: error)); self.lock.unlock()
+    }
+
+    func read() -> [String] {
+        self.lock.lock(); defer { self.lock.unlock() }; return self.values
+    }
+}
+
+private func expectThrows(_ message: String, _ action: () throws -> Void) throws {
+    do {
+        try action()
+        throw SelftestFailure(message: message)
+    } catch is SelftestFailure {
+        throw SelftestFailure(message: message)
+    } catch {}
+}
+
+private func gitClientTrustRegistrySelftests() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent("macop-git-clients-\(UUID().uuidString)")
+    defer { try? fileManager.removeItem(at: root) }
+    let file = root.appendingPathComponent("git-clients.json")
+    let identity = LiveCodeIdentity(
+        canonicalPath: "/opt/homebrew/Cellar/git/2.50.1/bin/git",
+        identifier: "git-555549448a760ad1",
+        teamID: nil,
+        signingAuthority: nil,
+        cdHash: "5c44aabbccdd",
+        hasTrustedPublisher: false
+    )
+    let registry = GitClientTrustRegistry(
+        fileURL: file, inspector: GitClientTrustFixtureInspector(identity: identity)
+    )
+    let trusted = try registry.trust(selectorPath: "/opt/homebrew/bin/git", version: "git version 2.50.1\nignored")
+    try expect(
+        trusted.selectorPath == "/opt/homebrew/bin/git"
+            && trusted.resolvedPath == identity.canonicalPath
+            && trusted.cdHash == identity.cdHash
+            && trusted.version == "git version 2.50.1"
+            && trusted.codeRequirement.contains("cdhash H\"5c44aabbccdd\""),
+        "non-Apple Git trust must pin selector, canonical image, identifier, and cdhash"
+    )
+    let certificateIdentity = LiveCodeIdentity(
+        canonicalPath: "/Applications/ExampleGit.app/Contents/MacOS/git",
+        identifier: "com.example.git", teamID: "EXAMPLE1234", signingAuthority: "Apple Development",
+        cdHash: "aabbccdd", hasTrustedPublisher: true
+    )
+    let certificateRegistry = GitClientTrustRegistry(
+        fileURL: root.appendingPathComponent("certificate/git-clients.json"),
+        inspector: GitClientTrustFixtureInspector(identity: certificateIdentity)
+    )
+    let certificateEntry = try certificateRegistry.trust(
+        selectorPath: "/Applications/ExampleGit.app/Contents/MacOS/git", version: "git version certificate"
+    )
+    let certificateRequirement = certificateEntry.codeRequirement
+    let certificateSnapshot = ProcessSnapshot(pid: 43, parentPID: 1, startTime: 8)
+    try GitClientRequesterTrust.validatePinnedEntry(
+        certificateEntry,
+        current: certificateIdentity,
+        live: LiveCodeInspection(identity: certificateIdentity, codeRequirement: certificateRequirement),
+        before: certificateSnapshot,
+        after: certificateSnapshot
+    )
+    try expect(
+        certificateEntry.publisherVerified && certificateEntry.teamID == "EXAMPLE1234"
+            && certificateEntry.codeRequirement == certificateRequirement
+            && certificateRequirement.contains("anchor apple generic"),
+        "certificate-backed non-Apple Git must persist the same canonical publisher-bound requirement used live"
+    )
+    let initialList = try registry.list()
+    try expect(initialList == [trusted], "trusted Git registry must round-trip exactly")
+    let json = try GitClientTrustCommand.run(
+        args: ["list"], options: GlobalOptions(format: .json), versionProbe: GitClientVersionFixtureExecutor(),
+        registry: registry
+    )
+    let jsonObject = try JSONSerialization.jsonObject(with: Data(json.stdout.utf8)) as? [String: Any]
+    let jsonClients = jsonObject?["clients"] as? [[String: Any]]
+    try expect(
+        json.exitCode == 0 && jsonObject?["schema_version"] as? Int == 1
+            && jsonClients?.first?["selector_path"] as? String == "/opt/homebrew/bin/git",
+        "ssh git-client list JSON must expose only public pinned metadata"
+    )
+    _ = try GitClientTrustCommand.run(
+        args: ["trust", "/opt/homebrew/bin/git"], options: GlobalOptions(),
+        versionProbe: GitClientVersionFixtureExecutor(), registry: registry
+    )
+    let removed = try registry.remove(selectorPath: "/opt/homebrew/bin/git")
+    let emptyList = try registry.list()
+    try expect(removed == trusted && emptyList.isEmpty, "Git client removal must use exact selector")
+
+    _ = try registry.trust(selectorPath: "/opt/homebrew/bin/git", version: "git version 2.50.1")
+    let pinned = try registry.list()[0]
+    let live = LiveCodeInspection(identity: identity, codeRequirement: pinned.codeRequirement)
+    let snapshot = ProcessSnapshot(pid: 42, parentPID: 1, startTime: 7)
+    let unregistered = try GitClientRequesterTrust.registeredCandidate(
+        entries: [], livePath: identity.canonicalPath, resolve: { _ in identity }
+    )
+    try expect(unregistered == nil, "an unregistered non-Apple Git image must have no trusted candidate")
+    try GitClientRequesterTrust.validatePinnedEntry(
+        pinned, current: identity, live: live, before: snapshot, after: snapshot
+    )
+    let changedHash = LiveCodeIdentity(
+        canonicalPath: identity.canonicalPath, identifier: identity.identifier, teamID: nil,
+        signingAuthority: nil, cdHash: "00", hasTrustedPublisher: false
+    )
+    try expectThrows("Git cdhash update must fail closed") {
+        try GitClientRequesterTrust.validatePinnedEntry(
+            pinned, current: changedHash, live: live, before: snapshot, after: snapshot
+        )
+    }
+    let retargeted = LiveCodeIdentity(
+        canonicalPath: "/opt/homebrew/Cellar/git/2.51.0/bin/git", identifier: identity.identifier, teamID: nil,
+        signingAuthority: nil, cdHash: identity.cdHash, hasTrustedPublisher: false
+    )
+    try expectThrows("Git selector retarget must fail closed") {
+        try GitClientRequesterTrust.validatePinnedEntry(
+            pinned, current: retargeted, live: live, before: snapshot, after: snapshot
+        )
+    }
+    let updateCandidate = try GitClientRequesterTrust.registeredCandidate(
+        entries: [pinned], livePath: retargeted.canonicalPath,
+        resolve: { _ in retargeted }
+    )
+    try expect(
+        updateCandidate?.entry.selectorPath == pinned.selectorPath,
+        "a retargeted registered selector must produce selector-specific re-trust handling, not generic unregistered"
+    )
+    do {
+        _ = try GitClientRequesterTrust.validateRegisteredProcess(
+            entry: pinned, current: retargeted, before: snapshot, after: snapshot,
+            liveInspection: { live }
+        )
+        throw SelftestFailure(message: "retargeted Git must not validate")
+    } catch let CLIError.denied(message) {
+        try expect(
+            message.contains("macop ssh git-client trust /opt/homebrew/bin/git"),
+            "retargeted Git denial must name the exact selector-specific re-trust command"
+        )
+    }
+    let changedIdentifier = LiveCodeIdentity(
+        canonicalPath: identity.canonicalPath, identifier: "different-git", teamID: nil,
+        signingAuthority: nil, cdHash: identity.cdHash, hasTrustedPublisher: false
+    )
+    try expectThrows("Git identifier change must fail closed") {
+        try GitClientRequesterTrust.validatePinnedEntry(
+            pinned, current: changedIdentifier, live: live, before: snapshot, after: snapshot
+        )
+    }
+    try expectThrows("Git PID reuse/exec transition must fail closed") {
+        try GitClientRequesterTrust.validatePinnedEntry(
+            pinned, current: identity, live: live, before: snapshot,
+            after: ProcessSnapshot(pid: 42, parentPID: 1, startTime: 8)
+        )
+    }
+    try expectThrows("relative Git selectors must be rejected") {
+        _ = try registry.trust(selectorPath: "opt/homebrew/bin/git", version: "git")
+    }
+
+    let duplicate = Data("""
+    {"schema_version":1,"schema_version":1,"clients":[]}
+    """.utf8)
+    try duplicate.write(to: file); try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    try expectThrows("duplicate Git registry keys must be rejected") { _ = try registry.list() }
+    try Data("{\"schema_version\":2,\"clients\":[]}".utf8).write(to: file)
+    try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    try expectThrows("unknown Git registry schema must be rejected") { _ = try registry.list() }
+    try Data("{\"schema_version\":1,\"clients\":[]}".utf8).write(to: file)
+    try fileManager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
+    try expectThrows("non-owner-only Git registry mode must be rejected") { _ = try registry.list() }
+
+    let concurrentFile = root.appendingPathComponent("concurrent/git-clients.json")
+    let concurrentA = GitClientTrustRegistry(
+        fileURL: concurrentFile, inspector: GitClientTrustFixtureInspector(identity: identity)
+    )
+    let concurrentB = GitClientTrustRegistry(
+        fileURL: concurrentFile, inspector: GitClientTrustFixtureInspector(identity: identity)
+    )
+    let concurrentFailures = LockedCounter()
+    let concurrentErrors = GitClientErrorCollector()
+    let concurrentGroup = DispatchGroup()
+    for (registry, selector) in [
+        (concurrentA, "/opt/homebrew/bin/git-a"),
+        (concurrentB, "/opt/homebrew/bin/git-b")
+    ] {
+        concurrentGroup.enter()
+        DispatchQueue.global().async {
+            defer { concurrentGroup.leave() }
+            do { _ = try registry.trust(selectorPath: selector, version: "git version test") } catch {
+                concurrentFailures.increment(); concurrentErrors.append(error)
+            }
+        }
+    }
+    concurrentGroup.wait()
+    let concurrentEntries = try concurrentA.list()
+    guard concurrentFailures.read() == 0, concurrentEntries.count == 2 else {
+        throw SelftestFailure(
+            message: "concurrent Git trust mutations must serialize without losing either entry "
+                + "(failures=\(concurrentFailures.read()), entries=\(concurrentEntries.count))"
+                + " errors=\(concurrentErrors.read())"
+        )
+    }
+
+    let singleCommitFile = root.appendingPathComponent("single-commit/git-clients.json")
+    let singleCommitRegistry = GitClientTrustRegistry(
+        fileURL: singleCommitFile, inspector: GitClientTrustFixtureInspector(identity: identity)
+    )
+    var registryExistedDuringProbe = false
+    _ = try singleCommitRegistry.trust(selectorPath: "/opt/homebrew/bin/git") { _ in
+        registryExistedDuringProbe = fileManager.fileExists(atPath: singleCommitFile.path)
+        return "git version test"
+    }
+    try expect(
+        !registryExistedDuringProbe && fileManager.fileExists(atPath: singleCommitFile.path),
+        "Git trust must inspect and probe version before its single atomic registry commit"
+    )
+
+    let symlinkRoot = root.appendingPathComponent("symlink-root")
+    let symlinkTarget = root.appendingPathComponent("symlink-target")
+    try fileManager.createDirectory(at: symlinkTarget, withIntermediateDirectories: false)
+    try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: symlinkTarget.path)
+    try Data("{\"schema_version\":1,\"clients\":[]}".utf8)
+        .write(to: symlinkTarget.appendingPathComponent("git-clients.json"))
+    try fileManager.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: symlinkTarget.appendingPathComponent("git-clients.json").path
+    )
+    try fileManager.createSymbolicLink(at: symlinkRoot, withDestinationURL: symlinkTarget)
+    let symlinkRegistry = GitClientTrustRegistry(
+        fileURL: symlinkRoot.appendingPathComponent("git-clients.json"),
+        inspector: GitClientTrustFixtureInspector(identity: identity)
+    )
+    try expectThrows("symlink Git registry directory must be rejected") { _ = try symlinkRegistry.list() }
+
+    let unsafeComponent = root.appendingPathComponent("unsafe-component")
+    try fileManager.createDirectory(at: unsafeComponent, withIntermediateDirectories: false)
+    try fileManager.setAttributes([.posixPermissions: 0o777], ofItemAtPath: unsafeComponent.path)
+    let unsafeExecutable = unsafeComponent.appendingPathComponent("git")
+    try Data("#!/bin/sh\nexit 0\n".utf8).write(to: unsafeExecutable)
+    try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: unsafeExecutable.path)
+    try expectThrows("group/world-writable Git path component must be rejected") {
+        _ = try SystemGitClientTrustInspector().inspectSelector(unsafeExecutable.path)
+    }
+    let slowVersion = root.appendingPathComponent("slow-version")
+    try Data("#!/bin/sh\nexec /bin/sleep 10\n".utf8).write(to: slowVersion)
+    try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: slowVersion.path)
+    let probeStart = Date()
+    let timedVersion = SystemGitClientVersionProbe().version(executablePath: slowVersion.path)
+    try expect(
+        timedVersion == "unknown" && Date().timeIntervalSince(probeStart) < 4,
+        "Git version display probe must time out without delaying or partially committing trust"
+    )
+    let inheritedVersionPipe = root.appendingPathComponent("inherited-version-pipe")
+    let inheritedChildPID = root.appendingPathComponent("inherited-version-child.pid")
+    try Data(
+        "#!/bin/sh\n/bin/sleep 10 &\nprintf '%s\\n' $! > '\(inheritedChildPID.path)'\n"
+            .appending("printf 'git version inherited-pipe\\n'\n").utf8
+    )
+    .write(to: inheritedVersionPipe)
+    try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: inheritedVersionPipe.path)
+    let inheritedProbeStart = Date()
+    let inheritedVersion = SystemGitClientVersionProbe().version(executablePath: inheritedVersionPipe.path)
+    let childPIDText = try String(contentsOf: inheritedChildPID, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let childPID = Int32(childPIDText) else {
+        throw SelftestFailure(message: "version probe descendant fixture did not report its PID")
+    }
+    let childExitDeadline = Date().addingTimeInterval(1)
+    var childExited = false
+    repeat {
+        errno = 0
+        if kill(childPID, 0) == -1, errno == ESRCH {
+            childExited = true; break
+        }
+        usleep(20000)
+    } while Date() < childExitDeadline
+    try expect(
+        Date().timeIntervalSince(inheritedProbeStart) < 2
+            && (inheritedVersion == "git version inherited-pipe\n" || inheritedVersion == "unknown"),
+        "Git version probe must not wait for EOF held by a descendant process"
+    )
+    try expect(childExited, "Git version probe must kill and fully reap its descendant process group")
+    if fileManager.isExecutableFile(atPath: "/opt/homebrew/bin/git") {
+        let actual = try SystemGitClientTrustInspector().inspectSelector("/opt/homebrew/bin/git")
+        try expect(
+            actual.canonicalPath.hasPrefix("/") && !actual.identifier.isEmpty && actual.cdHash?.isEmpty == false,
+            "installed Homebrew Git must expose a statically validated exact image identity"
+        )
+    }
+}
+
 extension RecordingSSHExecutor: CTKPublicKeyResolving, AppleGitTrustValidating {}
 
 private final class GitSigningExecutor: CommandExecuting, CTKPublicKeyResolving, @unchecked Sendable {
@@ -2732,6 +3039,9 @@ func run() throws {
     do { try agentSelftests() } catch { throw SelftestFailure(message: "agent selftests: \(error)") }
     do { try runtimeSelftests() } catch { throw SelftestFailure(message: "runtime selftests: \(error)") }
     do { try authBrokerSelftests() } catch { throw SelftestFailure(message: "auth broker selftests: \(error)") }
+    do { try gitClientTrustRegistrySelftests() } catch {
+        throw SelftestFailure(message: "git client trust registry selftests: \(error)")
+    }
     try runKeychainIntegrationIfRequested()
     let app = MacopApp(keychainClient: FakeKeychainClient(response: .success(Data("test-secret".utf8))))
     let fileManager = FileManager.default
@@ -3213,7 +3523,8 @@ func run() throws {
         "plugin", "compatibility", "config init", "config validate", "doctor", "ssh", "ssh create",
         "ssh create --touch-id",
         "ssh list", "ssh public-key", "ssh test", "ssh run", "ssh delete", "ssh agent", "ssh agent shell",
-        "ssh agent application", "ssh shell-init", "ssh git-signing-config", "ssh connect", "ssh host-config",
+        "ssh agent application", "ssh shell-init", "ssh git-signing-config", "ssh git-client",
+        "ssh git-client trust", "ssh git-client list", "ssh git-client remove", "ssh connect", "ssh host-config",
         "reference ?attribute=otp", "reference ?ssh-format=openssh", "--help", "--version",
         "--format",
         "--config", "--no-color", "--debug", "--encoding=utf-8", "--account", "--session", "--cache",
@@ -5480,6 +5791,97 @@ func run() throws {
             && bashCompletion.stdout.contains("--config|--format|--encoding")
             && bashCompletion.stdout.contains("--config=*|--format=*|--encoding=*"),
         "bash completion must parse valued global options before positional commands"
+    )
+    let gitFishCompletion = app.run(argv: ["macop", "completion", "fish"], env: [:])
+    try expect(
+        zshCompletion.stdout.contains("'git client command' trust list remove")
+            && bashCompletion.stdout.contains("trust list remove")
+            && gitFishCompletion.stdout.contains("__macop_git_client_position")
+            && gitFishCompletion.stdout.contains("'trust list remove'"),
+        "all completions must expose the explicit Git client trust lifecycle"
+    )
+    if let fishExecutable = safeExecutableOnPATH(
+        named: "fish", environment: ProcessInfo.processInfo.environment
+    ) {
+        let fishCandidates = try runProcess(
+            executable: fishExecutable,
+            arguments: ["-c", gitFishCompletion.stdout + "\ncomplete -C 'macop ssh git-client '"]
+        )
+        let candidateNames = Set(fishCandidates.stdout.split(whereSeparator: \ .isWhitespace).map(String.init))
+        try expect(
+            fishCandidates.status == 0 && candidateNames == ["trust", "list", "remove"]
+                && fishCandidates.stderr.isEmpty,
+            "fish must offer only git-client lifecycle actions after the nested subcommand"
+        )
+    }
+    for (shell, executable, completion, setup) in [
+        (
+            "zsh", "/bin/zsh", zshCompletion.stdout,
+            "compdef() { :; }; _arguments() { :; }; _values() { printf '<%s>\\n' \"$@\"; }; "
+                + "words=(macop ssh --format json git-client ''); CURRENT=6; _macop"
+        ),
+        (
+            "bash", "/bin/bash", bashCompletion.stdout,
+            "COMP_WORDS=(macop ssh --format json git-client ''); COMP_CWORD=5; _macop_complete; "
+                + "printf '<%s>\\n' \"${COMPREPLY[@]}\""
+        )
+    ] {
+        let completed = try runProcess(
+            executable: executable,
+            arguments: ["-c", (shell == "zsh" ? "compdef() { :; }\n" : "") + completion + "\n" + setup]
+        )
+        try expect(
+            completed.status == 0 && completed.stdout.contains("<trust>")
+                && completed.stdout.contains("<list>") && completed.stdout.contains("<remove>")
+                && completed.stderr.isEmpty,
+            "\(shell) completion must parse global options before ssh git-client"
+        )
+    }
+
+    let uninstallRoot = fileManager.temporaryDirectory
+        .appendingPathComponent("macop-uninstall-\(UUID().uuidString)")
+    defer { try? fileManager.removeItem(at: uninstallRoot) }
+    let registryDirectory = uninstallRoot.appendingPathComponent("Library/Application Support/macop")
+    try fileManager.createDirectory(at: registryDirectory, withIntermediateDirectories: true)
+    try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: registryDirectory.path)
+    let uninstallRegistry = registryDirectory.appendingPathComponent("git-clients.json")
+    let uninstallRegistryLock = registryDirectory.appendingPathComponent(".git-clients.lock")
+    try Data("{\"schema_version\":1,\"clients\":[]}".utf8).write(to: uninstallRegistry)
+    try Data().write(to: uninstallRegistryLock)
+    try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: uninstallRegistry.path)
+    try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: uninstallRegistryLock.path)
+    let lockHolder = Process()
+    let lockHolderOutput = Pipe()
+    lockHolder.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+    lockHolder.arguments = [
+        "-MFcntl=:DEFAULT,:flock", "-e",
+        "$|=1; sysopen(my $f, $ARGV[0], O_RDWR|O_NOFOLLOW) or die; "
+            + "flock($f, LOCK_EX) or die; print qq(locked\\n); sleep 1;",
+        uninstallRegistryLock.path
+    ]
+    lockHolder.standardOutput = lockHolderOutput
+    lockHolder.standardError = FileHandle.nullDevice
+    try lockHolder.run()
+    let lockReady = lockHolderOutput.fileHandleForReading.availableData
+    try expect(String(data: lockReady, encoding: .utf8) == "locked\n", "uninstall lock fixture must start")
+    let repositoryRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let uninstallStart = Date()
+    let uninstall = try runProcess(
+        executable: "/bin/bash",
+        arguments: [repositoryRoot.appendingPathComponent("scripts/uninstall.sh").path, "--remove-data"],
+        environment: [
+            "HOME": uninstallRoot.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "SHELL": "/bin/zsh",
+            "MACOP_BIN_DIR": uninstallRoot.appendingPathComponent("missing-bin").path
+        ]
+    )
+    lockHolder.waitUntilExit()
+    try expect(
+        uninstall.status == 0 && !fileManager.fileExists(atPath: uninstallRegistry.path)
+            && fileManager.fileExists(atPath: uninstallRegistryLock.path)
+            && uninstall.stdout.contains("git-clients.json")
+            && Date().timeIntervalSince(uninstallStart) >= 0.7,
+        "uninstall --remove-data must share the mutation lock, remove registry data, and preserve the lock inode"
     )
     for (shell, executable, completion, setup) in [
         (

@@ -588,10 +588,11 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - Terminalタブ単位integration、実CTK identityでの署名・GitHub E2E
 - 2026-08-28にcertificate-backed same-Team build、要求元icon付きTouch ID UI、自作agent経由の実CTK identity署名、GitHub SSHの`shell/test/run`をdogfood確認済み
 - `/usr/bin/git`はdeveloper-tool shimであるため、`ssh run`はlookup overrideを除去した`xcrun --no-cache --find git`で実体imageを解決する。Gitは`POSIX_SPAWN_START_SUSPENDED`で起動し、`anchor apple`・`com.apple.git`・library validationをlive processで検証してexact requirement/cdhashをregistryへ固定する。registry activation・承認・agent authorization後だけ`SIGCONT`し、拒否時は一度も再開せずkill/reapする
-- `ssh run`は`git`と`/usr/bin/git`だけを入口として受け入れ、同名の任意実行ファイルへverified-session socketを渡さない
+- `ssh run`は`git`と`/usr/bin/git`だけを入口として受け入れ、同名の任意実行ファイルへverified-session socketを渡さない。非Apple Gitの端末ローカルtrust registryは署名・検証adapter専用であり、agent socketの権限には流用しない
 - `ssh shell-init zsh|bash|fish`はinteractive shellを1回だけverified rootへ置換し、tab/shell終了を既存registryの即時失効へ結び付ける
 - `ssh git-signing-config`とGitの`ssh-keygen -Y sign -n git`互換adapterは、legacy形式とApple Gitがagent内の鍵を示すために公開鍵の直後へ`-U`を置く形式だけを受理し、設定公開鍵に一致するCTK identityだけでcanonical SSHSIG preimageを署名する。private keyやstable agent socketはexportしない
 - 同じGit adapterの検証経路は、直接のlive Apple Git親を再検証し、Gitが使うexact-orderの`find-principals`、`verify -n git`、`check-novalidate -n git`と厳密なverify-timeだけを受理してから`/usr/bin/ssh-keygen`へ`execv`する。stdioとexit statusを維持し、その他の`-Y`操作・追加flag・順序変更はgeneral proxyにせずfail closedで拒否する
+- Apple Gitは登録不要。非Apple Gitは`ssh git-client trust/list/remove`でselector pathと登録時canonical実体・identifier・cdhash requirementをowner-onlyな`~/Library/Application Support/macop/git-clients.json`へ明示固定する。署名・検証時はselector再解決、live parent path、PID/start snapshot、identifier、cdhashを共通validatorで再検証し、更新・retarget後はtrust再実行までfail closedとする。version表示は補助情報でtrust根拠ではない
 
 ### Phase 5: 安全性と互換性
 

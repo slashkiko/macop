@@ -17,11 +17,7 @@ public enum AuthBrokerRequester {
         guard let before = requesterInspector.snapshot(of: rootPID) else {
             throw AgentProtocolError.denied
         }
-        let expectedPath = try self.executablePath(pid: rootPID)
-        let inspection = try LiveCodeIdentityInspector.inspectExpectedAppleGit(
-            pid: rootPID,
-            expectedPath: expectedPath
-        )
+        let inspection = try GitClientRequesterTrust.validate(pid: rootPID)
         guard requesterInspector.snapshot(of: rootPID) == before else {
             throw AgentProtocolError.denied
         }

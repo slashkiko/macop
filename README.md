@@ -126,6 +126,13 @@ scripts/uninstall.sh
 The uninstaller verifies the code-signing identifiers before removing the two
 executables. It deliberately preserves the install directory, macop
 configuration, Keychain items, CTK identities, and unrelated `op` commands.
+It also preserves the machine-local trusted Git client registry. Remove only
+that registry (not config.json, Keychain items, or CTK identities) with:
+
+```bash
+scripts/uninstall.sh --remove-data
+```
+
 It removes only its marked PATH block by default; pass `--keep-path` to retain
 that block. Use the same `--bin-dir`, `MACOP_BIN_DIR`, `--shell-profile`, or
 `MACOP_SHELL_PROFILE` value that was used to install.
@@ -449,8 +456,10 @@ and library-validation flag, then pins the exact image as the verified root.
 Git remains suspended through registry activation and approval, and receives
 `SIGCONT` only after the session is authorized; rejection kills and reaps it
 without allowing its first instruction to run.
-It accepts only the `git` and `/usr/bin/git` entry points; renamed or alternate
-executables are rejected rather than receiving the verified-session socket.
+It accepts only the `git` and `/usr/bin/git` entry points. The non-Apple Git
+registry described below is intentionally not used by `ssh run`; registered
+paths authorize only Git's direct signing/verification adapter and never grant
+a verified-session agent socket.
 
 The optional top-level `ssh_hosts` object maps a safe alias to public connection
 metadata and one Secure Enclave identity label:
@@ -482,7 +491,8 @@ Git invokes the installed macop binary through its `ssh-keygen -Y sign`
 interface. macop accepts only Git's legacy
 `-Y sign -n git -f <public-key> <message-file>` shape or Apple Git's exact
 `-Y sign -n git -f <public-key> -U <message-file>` agent-key shape, requires the direct
-parent to be Apple's live Git image, accepts only owner-controlled regular
+parent to be Apple's live Git image or an explicitly pinned non-Apple Git image,
+accepts only owner-controlled regular
 input files and an owner-controlled signature directory, and refuses
 to overwrite an existing `.sig`, matches the configured public key to exactly
 one CTK identity, and signs the canonical `SSHSIG` preimage after native macop
@@ -495,6 +505,22 @@ only Git's exact `find-principals`, `verify -n git`, and `check-novalidate -n gi
 forms with bounded arguments and an exact verify-time, then replaces itself
 with `/usr/bin/ssh-keygen` so stdin, stdout, stderr, and the exit status remain
 native. Other `-Y` operations, reordered flags, and extra options fail closed.
+
+Apple Git needs no registration. To use Homebrew or another non-Apple Git,
+review and explicitly pin its selector path to the exact canonical image,
+identifier, and cdhash on this Mac:
+
+```bash
+macop ssh git-client trust /opt/homebrew/bin/git
+macop ssh git-client list
+macop ssh git-client remove /opt/homebrew/bin/git
+```
+
+The owner-only registry is stored at
+`~/Library/Application Support/macop/git-clients.json`. A package upgrade,
+selector retarget, identifier change, or cdhash change fails closed; inspect the
+new binary and run `trust` again. The displayed `git --version` is informational
+and is not part of the trust decision.
 
 `macop doctor` enumerates each CTK identity by its public hash, resolves its
 public key through Security.framework, and checks the effective isolated SSH

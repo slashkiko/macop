@@ -34,6 +34,9 @@ public enum HelpText {
       completion
       compatibility
       ssh
+      ssh git-client trust <absolute-selector-path>
+      ssh git-client list
+      ssh git-client remove <absolute-selector-path>
       config
       doctor
 
@@ -80,7 +83,13 @@ public enum CompletionText {
                 generate) _values 'generate command' password ;;
                 profile) _values 'profile command' run shell-init ;;
                 config) _values 'config command' init validate ;;
-                ssh) _values 'ssh command' create list public-key delete test run agent shell-init git-signing-config connect host-config ;;
+                ssh)
+                  subcommand_index=$(__macop_zsh_next_positional_index $(( command_index + 1 )))
+                  if [[ ${words[$subcommand_index]} == git-client ]]; then
+                    _values 'git client command' trust list remove
+                  else
+                    _values 'ssh command' create list public-key delete test run agent shell-init git-signing-config git-client connect host-config
+                  fi ;;
                 completion) _values 'shell' bash zsh fish ;;
               esac
             }
@@ -105,7 +114,7 @@ public enum CompletionText {
               local cur="${COMP_WORDS[COMP_CWORD]}"
               local commands="read run inject generate item profile completion compatibility ssh config doctor"
               local flags="--help --version --format --config --no-color --debug --encoding"
-              local ssh_commands="create list public-key delete test run agent shell-init git-signing-config connect host-config"
+              local ssh_commands="create list public-key delete test run agent shell-init git-signing-config git-client connect host-config"
               local command_index subcommand_index command
               command_index="$(__macop_bash_next_positional_index 1)"
               command="${COMP_WORDS[command_index]}"
@@ -120,7 +129,13 @@ public enum CompletionText {
                 generate) COMPREPLY=( $(compgen -W "password ${flags}" -- "$cur") ) ;;
                 profile) COMPREPLY=( $(compgen -W "run shell-init ${flags}" -- "$cur") ) ;;
                 config) COMPREPLY=( $(compgen -W "init validate ${flags}" -- "$cur") ) ;;
-                ssh) COMPREPLY=( $(compgen -W "${ssh_commands} ${flags}" -- "$cur") ) ;;
+                ssh)
+                  subcommand_index="$(__macop_bash_next_positional_index "$(( command_index + 1 ))")"
+                  if [[ "${COMP_WORDS[subcommand_index]}" == "git-client" ]]; then
+                    COMPREPLY=( $(compgen -W "trust list remove ${flags}" -- "$cur") )
+                  else
+                    COMPREPLY=( $(compgen -W "${ssh_commands} ${flags}" -- "$cur") )
+                  fi ;;
                 completion) COMPREPLY=( $(compgen -W "bash zsh fish ${flags}" -- "$cur") ) ;;
                 *) COMPREPLY=( $(compgen -W "${commands} ${flags}" -- "$cur") ) ;;
               esac
@@ -173,6 +188,13 @@ public enum CompletionText {
               set -l otp_index (__macop_next_positional_index (math $command_index + 1))
               test -n "$otp_index"; and string match -q -- otp $words[$otp_index]
             end
+            function __macop_git_client_position
+              set -l words (commandline -opc)
+              set -l command_index (__macop_command_index)
+              test -n "$command_index"; or return 1
+              set -l ssh_index (__macop_next_positional_index (math $command_index + 1))
+              test -n "$ssh_index"; and string match -q -- git-client $words[$ssh_index]
+            end
             complete -c macop -n '__macop_item_position; and not __macop_otp_position' \\
               -a 'list get create edit import acquire generate otp delete'
             complete -c op -n '__macop_item_position; and not __macop_otp_position' \\
@@ -185,9 +207,15 @@ public enum CompletionText {
             complete -c op -n '__macop_command_position profile' -a 'run shell-init'
             complete -c macop -n '__macop_command_position config' -a 'init validate'
             complete -c op -n '__macop_command_position config' -a 'init validate'
-            set -l macop_ssh_commands 'create list public-key delete test run agent shell-init git-signing-config connect host-config'
-            complete -c macop -n '__macop_command_position ssh' -a "$macop_ssh_commands"
-            complete -c op -n '__macop_command_position ssh' -a "$macop_ssh_commands"
+            set -l macop_ssh_commands 'create list public-key delete test run agent shell-init git-signing-config git-client connect host-config'
+            complete -c macop -n '__macop_command_position ssh; and not __macop_git_client_position' \
+              -a "$macop_ssh_commands"
+            complete -c op -n '__macop_command_position ssh; and not __macop_git_client_position' \
+              -a "$macop_ssh_commands"
+            complete -c macop -n '__macop_command_position ssh; and __macop_git_client_position' \
+              -a 'trust list remove'
+            complete -c op -n '__macop_command_position ssh; and __macop_git_client_position' \
+              -a 'trust list remove'
             """
         default:
             "macop: unsupported shell for completion: \(shell)\n"

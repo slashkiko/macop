@@ -29,20 +29,7 @@ public struct SystemGitSSHSigningRequesterValidator: GitSSHSigningRequesterValid
 
     public func validateRequester() throws -> Int32 {
         let parent = getppid()
-        guard parent > 1 else { throw CLIError.denied(message: "The Git SSH adapter requires an Apple Git parent.") }
-        var buffer = [CChar](repeating: 0, count: 4 * 1024)
-        let count = proc_pidpath(parent, &buffer, UInt32(buffer.count))
-        guard count > 0 else { throw CLIError.denied(message: "The Git SSH adapter parent could not be inspected.") }
-        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
-        guard let pathString = String(bytes: bytes, encoding: .utf8) else {
-            throw CLIError.denied(message: "The Git SSH adapter parent path is invalid.")
-        }
-        let path = LiveCodeIdentityInspector.canonicalPath(pathString)
-        do {
-            _ = try LiveCodeIdentityInspector.inspectExpectedAppleGit(pid: parent, expectedPath: path)
-        } catch {
-            throw CLIError.denied(message: "The Git SSH adapter accepts only the active Apple Git process.")
-        }
+        _ = try GitClientRequesterTrust.validate(pid: parent)
         return parent
     }
 }

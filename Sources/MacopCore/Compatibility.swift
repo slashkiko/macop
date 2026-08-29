@@ -95,6 +95,15 @@ private let compatibilitySSHEntries: [CompatibilityEntry] = [
         reason: "Generate repository-local Git SSH signing configuration for a CTK identity."
     ),
     .init(
+        command: "ssh git-client",
+        kind: "extension",
+        status: "supported",
+        reason: "Explicitly pins non-Apple Git selector paths to an exact machine-local identifier and cdhash."
+    ),
+    .init(command: "ssh git-client trust", kind: "subcommand", status: "supported"),
+    .init(command: "ssh git-client list", kind: "subcommand", status: "supported"),
+    .init(command: "ssh git-client remove", kind: "subcommand", status: "supported"),
+    .init(
         command: "ssh connect",
         kind: "extension",
         status: "supported",

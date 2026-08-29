@@ -243,7 +243,7 @@ public enum LiveCodeIdentityInspector {
         return LiveCodeInspection(identity: candidate, codeRequirement: text)
     }
 
-    private static func finalRequirementText(for candidate: LiveCodeIdentity) throws -> String {
+    static func finalRequirementText(for candidate: LiveCodeIdentity) throws -> String {
         guard self.safeIdentifier(candidate.identifier), let cdHash = candidate.cdHash,
               self.safeCDHash(cdHash)
         else { throw AgentProtocolError.denied }
