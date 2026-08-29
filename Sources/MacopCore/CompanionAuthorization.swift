@@ -89,6 +89,7 @@ public final class CompanionAgentSigner: AgentKeySigning, @unchecked Sendable {
         )
         guard case let .sshSignResponse(response) = try self.connection.send(.sshSignRequest(request), timeout: 30),
               response.authorizationID == self.authorizationID,
+              response.outcome == .signed,
               !response.signature.isEmpty
         else { throw AgentProtocolError.denied }
         return response.signature

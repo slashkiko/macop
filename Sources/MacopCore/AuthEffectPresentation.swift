@@ -47,9 +47,18 @@ public struct ManagedKeychainEffectPresentation: Sendable, Equatable {
 
 public enum SSHSigningEffectOutcome: Sendable, Equatable {
     case noSignatureRequested
-    case preparationFailed
+    case requesterInvalid
+    case signerUnavailable
+    case identityMismatch
     case signatureFailed
     case signed
+}
+
+public enum SSHSigningEffectFailure: Sendable, Equatable {
+    case requesterInvalid
+    case signerUnavailable
+    case identityMismatch
+    case signatureFailed
 }
 
 public struct SSHSigningEffectPresentation: Sendable, Equatable {
@@ -66,10 +75,30 @@ public struct SSHSigningEffectPresentation: Sendable, Equatable {
         self.message = switch (outcome, delivery) {
         case (.noSignatureRequested, _):
             "SSH鍵の使用を許可しましたが、署名要求は受信しませんでした"
-        case (.preparationFailed, _):
-            "\(subject)の要求元または署名鍵を検証できませんでした。署名は実行していません"
-        case (.signatureFailed, _):
-            "\(subject)に失敗しました。署名結果は返していません"
+        case (.requesterInvalid, .delivered):
+            "\(subject)の要求元を再検証できませんでした。署名は実行していません"
+        case (.requesterInvalid, .unknown):
+            "\(subject)の要求元を再検証できませんでした。署名は実行していません。要求元への結果通知は確認できません"
+        case (.requesterInvalid, .notAttempted):
+            "\(subject)の要求元を再検証できませんでした。署名は実行していません。結果は返していません"
+        case (.signerUnavailable, .delivered):
+            "\(subject)のSecure Enclave署名鍵を準備できませんでした。署名は実行していません"
+        case (.signerUnavailable, .unknown):
+            "\(subject)のSecure Enclave署名鍵を準備できませんでした。署名は実行していません。要求元への結果通知は確認できません"
+        case (.signerUnavailable, .notAttempted):
+            "\(subject)のSecure Enclave署名鍵を準備できませんでした。署名は実行していません。結果は返していません"
+        case (.identityMismatch, .delivered):
+            "\(subject)の承認済み署名鍵が一致しませんでした。署名は実行していません"
+        case (.identityMismatch, .unknown):
+            "\(subject)の承認済み署名鍵が一致しませんでした。署名は実行していません。要求元への結果通知は確認できません"
+        case (.identityMismatch, .notAttempted):
+            "\(subject)の承認済み署名鍵が一致しませんでした。署名は実行していません。結果は返していません"
+        case (.signatureFailed, .delivered):
+            "\(subject)のSecure Enclave署名処理に失敗しました。署名結果は返していません"
+        case (.signatureFailed, .unknown):
+            "\(subject)のSecure Enclave署名処理に失敗しました。署名結果は返していません。要求元への結果通知は確認できません"
+        case (.signatureFailed, .notAttempted):
+            "\(subject)のSecure Enclave署名処理に失敗しました。署名結果は返していません"
         case (.signed, .delivered):
             "\(subject)を完了しました"
         case (.signed, .unknown):
@@ -104,29 +133,29 @@ public enum AuthEffectPipeline {
         operation: AuthBrokerOperation,
         prepare: () throws -> Void = {},
         sign: () throws -> Data,
-        deliver: (Data) throws -> Void
+        deliver: (AuthBrokerSSHSignOutcome, Data) throws -> Void
     ) -> SSHSigningEffectPresentation {
         do {
             try prepare()
         } catch {
-            return SSHSigningEffectPresentation(
+            return self.signingFailure(
                 operation: operation,
-                outcome: .preparationFailed,
-                delivery: .notAttempted
+                failure: .requesterInvalid,
+                deliver: deliver
             )
         }
         let signature: Data
         do {
             signature = try sign()
         } catch {
-            return SSHSigningEffectPresentation(
+            return self.signingFailure(
                 operation: operation,
-                outcome: .signatureFailed,
-                delivery: .notAttempted
+                failure: .signatureFailed,
+                deliver: deliver
             )
         }
         do {
-            try deliver(signature)
+            try deliver(.signed, signature)
             return SSHSigningEffectPresentation(
                 operation: operation,
                 outcome: .signed,
@@ -139,6 +168,35 @@ public enum AuthEffectPipeline {
                 delivery: .unknown
             )
         }
+    }
+
+    public static func signingFailure(
+        operation: AuthBrokerOperation,
+        failure: SSHSigningEffectFailure,
+        deliver: (AuthBrokerSSHSignOutcome, Data) throws -> Void
+    ) -> SSHSigningEffectPresentation {
+        let (brokerOutcome, outcome): (AuthBrokerSSHSignOutcome, SSHSigningEffectOutcome) = switch failure {
+        case .requesterInvalid:
+            (.requesterInvalid, .requesterInvalid)
+        case .signerUnavailable:
+            (.signerUnavailable, .signerUnavailable)
+        case .identityMismatch:
+            (.identityMismatch, .identityMismatch)
+        case .signatureFailed:
+            (.signatureFailed, .signatureFailed)
+        }
+        let delivery: AuthEffectResponseDelivery
+        do {
+            try deliver(brokerOutcome, Data())
+            delivery = .delivered
+        } catch {
+            delivery = .unknown
+        }
+        return SSHSigningEffectPresentation(
+            operation: operation,
+            outcome: outcome,
+            delivery: delivery
+        )
     }
 }
 

@@ -29,19 +29,19 @@ public struct SystemGitSSHSigningRequesterValidator: GitSSHSigningRequesterValid
 
     public func validateRequester() throws -> Int32 {
         let parent = getppid()
-        guard parent > 1 else { throw CLIError.denied(message: "Git SSH signing requires an Apple Git parent.") }
+        guard parent > 1 else { throw CLIError.denied(message: "The Git SSH adapter requires an Apple Git parent.") }
         var buffer = [CChar](repeating: 0, count: 4 * 1024)
         let count = proc_pidpath(parent, &buffer, UInt32(buffer.count))
-        guard count > 0 else { throw CLIError.denied(message: "Git SSH signing parent could not be inspected.") }
+        guard count > 0 else { throw CLIError.denied(message: "The Git SSH adapter parent could not be inspected.") }
         let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
         guard let pathString = String(bytes: bytes, encoding: .utf8) else {
-            throw CLIError.denied(message: "Git SSH signing parent path is invalid.")
+            throw CLIError.denied(message: "The Git SSH adapter parent path is invalid.")
         }
         let path = LiveCodeIdentityInspector.canonicalPath(pathString)
         do {
             _ = try LiveCodeIdentityInspector.inspectExpectedAppleGit(pid: parent, expectedPath: path)
         } catch {
-            throw CLIError.denied(message: "Git SSH signing accepts only the active Apple Git process.")
+            throw CLIError.denied(message: "The Git SSH adapter accepts only the active Apple Git process.")
         }
         return parent
     }
@@ -55,34 +55,46 @@ public struct CompanionGitSSHSigningProvider: GitSSHSigningProviding {
         data: Data,
         requesterPID: Int32
     ) throws -> GitSSHSignature {
-        let connection = try AuthBrokerClientConnection.launchAndConnect(
-            requiredCapabilities: AuthBrokerCapability.sshSigning.rawValue
+        let connection = try GitSSHSigningAuthorizationBoundary.connect {
+            try AuthBrokerClientConnection.launchAndConnect(
+                requiredCapabilities: AuthBrokerCapability.sshSigning.rawValue
+            )
+        }
+        let request = try GitSSHSigningAuthorizationBoundary.prepare {
+            let value = try AuthBrokerRequester.gitSSHSigningApprovalRequest(
+                credentialLabel: identity.label,
+                credentialFingerprint: identity.fingerprint,
+                rootPID: requesterPID
+            )
+            _ = try AuthBrokerWire.frame(.approvalRequest(value))
+            return value
+        }
+        let approvalMessage = try GitSSHSigningAuthorizationBoundary.receive {
+            try connection.send(.approvalRequest(request))
+        }
+        let approvedPublicKey = try GitSSHSigningAuthorizationClassifier.approvedPublicKey(
+            from: approvalMessage,
+            requestID: request.requestID,
+            expectedPublicKey: identity.publicKeyBlob
         )
-        let request = try AuthBrokerRequester.approvalRequest(
-            operation: .gitSSHSign,
-            purpose: .gitSSHSign,
-            credentialLabel: identity.label,
-            service: "",
-            account: "",
-            credentialFingerprint: identity.fingerprint,
-            rootPID: requesterPID
-        )
-        guard case let .approvalResponse(approval) = try connection.send(.approvalRequest(request)),
-              approval.requestID == request.requestID,
-              approval.status == .approved,
-              approval.resultStatus == errSecSuccess,
-              constantTimeEqual(approval.resultData, identity.publicKeyBlob)
-        else { throw CLIError.denied(message: "Git SSH signing was denied or cancelled.") }
         let signRequest = AuthBrokerSSHSignRequest(
             authorizationID: request.requestID,
             data: data,
             flags: 0
         )
-        guard case let .sshSignResponse(response) = try connection.send(.sshSignRequest(signRequest)),
-              response.authorizationID == request.requestID,
-              !response.signature.isEmpty
-        else { throw CLIError.runtimeError(message: "Git SSH signing returned an invalid response.") }
-        return GitSSHSignature(publicKeyBlob: approval.resultData, signatureBlob: response.signature)
+        _ = try AuthBrokerWire.frame(.sshSignRequest(signRequest))
+        let signMessage: AuthBrokerMessage
+        do {
+            signMessage = try connection.send(.sshSignRequest(signRequest))
+        } catch {
+            throw GitSSHSigningFailure.deliveryIndeterminate
+        }
+        let signature = try GitSSHSigningResponseClassifier.signature(
+            from: signMessage,
+            authorizationID: request.requestID,
+            stage: .signature
+        )
+        return GitSSHSignature(publicKeyBlob: approvedPublicKey, signatureBlob: signature)
     }
 }
 
@@ -123,6 +135,8 @@ public enum GitSSHSigningCommand {
             return CommandResult(exitCode: 0)
         } catch let error as CLIError {
             return ErrorRenderer.render(error: error, format: .humanReadable)
+        } catch let failure as GitSSHSigningFailure {
+            return ErrorRenderer.render(error: failure.cliError, format: .humanReadable)
         } catch {
             return ErrorRenderer.render(
                 error: .runtimeError(message: "Git SSH signing failed."),
@@ -131,8 +145,12 @@ public enum GitSSHSigningCommand {
         }
     }
 
-    public static func isSigningInvocation(_ argv: [String]) -> Bool {
+    public static func isAdapterInvocation(_ argv: [String]) -> Bool {
         argv.dropFirst().first == "-Y"
+    }
+
+    public static func isSigningInvocation(_ argv: [String]) -> Bool {
+        Array(argv.dropFirst()).prefix(2) == ["-Y", "sign"]
     }
 
     private struct Invocation {
@@ -143,17 +161,26 @@ public enum GitSSHSigningCommand {
 
     private static func parse(argv: [String]) throws -> Invocation {
         let args = Array(argv.dropFirst())
-        guard args.count == 7, args[0] == "-Y", args[1] == "sign", args[2] == "-n",
-              args[4] == "-f", !args[3].isEmpty, args[3] == "git",
-              !args[5].isEmpty, !args[6].isEmpty,
-              !args[5].hasPrefix("-"), !args[6].hasPrefix("-"),
-              args[5].hasPrefix("/"), args[6].hasPrefix("/")
+        let hasAgentKeyFlag = args.count == 8 && args[6] == "-U"
+        guard args.count == 7 || hasAgentKeyFlag,
+              args[0] == "-Y", args[1] == "sign", args[2] == "-n",
+              args[3] == "git", args[4] == "-f"
         else {
             throw CLIError.invalidArguments(
-                message: "The Git SSH adapter accepts only: -Y sign -n git -f <public-key> <message-file>."
+                message: "The Git SSH adapter accepts only: -Y sign -n git -f <public-key> [-U] <message-file>."
             )
         }
-        return Invocation(namespace: args[3], keyPath: args[5], messagePath: args[6])
+        let keyPath = args[5]
+        let messagePath = args[hasAgentKeyFlag ? 7 : 6]
+        guard !keyPath.isEmpty, !messagePath.isEmpty,
+              !keyPath.hasPrefix("-"), !messagePath.hasPrefix("-"),
+              keyPath.hasPrefix("/"), messagePath.hasPrefix("/")
+        else {
+            throw CLIError.invalidArguments(
+                message: "The Git SSH adapter accepts only: -Y sign -n git -f <public-key> [-U] <message-file>."
+            )
+        }
+        return Invocation(namespace: args[3], keyPath: keyPath, messagePath: messagePath)
     }
 
     private static func readPublicKey(path: String) throws -> Data {

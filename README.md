@@ -479,14 +479,22 @@ git tag -s v1.0.0
 ```
 
 Git invokes the installed macop binary through its `ssh-keygen -Y sign`
-interface. macop accepts only Git's
-`-Y sign -n git -f <public-key> <message-file>` shape, requires the direct
+interface. macop accepts only Git's legacy
+`-Y sign -n git -f <public-key> <message-file>` shape or Apple Git's exact
+`-Y sign -n git -f <public-key> -U <message-file>` agent-key shape, requires the direct
 parent to be Apple's live Git image, accepts only owner-controlled regular
 input files and an owner-controlled signature directory, and refuses
 to overwrite an existing `.sig`, matches the configured public key to exactly
 one CTK identity, and signs the canonical `SSHSIG` preimage after native macop
 approval. The generated envelope is checked by the test suite with Apple
 OpenSSH. No private key or stable agent socket is exported.
+
+The same adapter supports Git verification without becoming a general
+`ssh-keygen` proxy. After revalidating the direct Apple Git parent, macop accepts
+only Git's exact `find-principals`, `verify -n git`, and `check-novalidate -n git`
+forms with bounded arguments and an exact verify-time, then replaces itself
+with `/usr/bin/ssh-keygen` so stdin, stdout, stderr, and the exit status remain
+native. Other `-Y` operations, reordered flags, and extra options fail closed.
 
 `macop doctor` enumerates each CTK identity by its public hash, resolves its
 public key through Security.framework, and checks the effective isolated SSH

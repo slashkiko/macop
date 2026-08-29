@@ -245,6 +245,32 @@ private final class RecordingGitSigningProvider: GitSSHSigningProviding, @unchec
     }
 }
 
+private struct FailingGitSigningProvider: GitSSHSigningProviding {
+    let failure: GitSSHSigningFailure
+
+    func sign(
+        identity _: SSHCommand.VerifiedSessionIdentity,
+        data _: Data,
+        requesterPID _: Int32
+    ) throws -> GitSSHSignature {
+        throw self.failure
+    }
+}
+
+private final class RecordingGitVerificationExecutor: GitSSHVerificationExecuting, @unchecked Sendable {
+    private(set) var invocations = [[String]]()
+    let exitCode: Int32
+
+    init(exitCode: Int32 = 0) {
+        self.exitCode = exitCode
+    }
+
+    func execute(arguments: [String]) throws -> Int32 {
+        self.invocations.append(arguments)
+        return self.exitCode
+    }
+}
+
 private struct AllowingGitSigningRequesterValidator: GitSSHSigningRequesterValidating {
     func validateRequester() throws -> Int32 {
         42
@@ -604,6 +630,309 @@ private func authBrokerSelftests() throws {
         decodedRequest == .approvalRequest(request),
         "auth broker request must round-trip exactly"
     )
+    let wireFixtureSignature = Data("typed-signature".utf8)
+    let signedResponse = AuthBrokerSSHSignResponse(
+        authorizationID: request.requestID,
+        outcome: .signed,
+        signature: wireFixtureSignature
+    )
+    var signedResponseFrame = try AuthBrokerWire.frame(.sshSignResponse(signedResponse))
+    let decodedSignedResponse = try AuthBrokerWire.takeFrame(from: &signedResponseFrame)
+    try expect(
+        decodedSignedResponse == .sshSignResponse(signedResponse),
+        "broker v5 must round-trip a typed successful SSH signing response"
+    )
+    for outcome in [
+        AuthBrokerSSHSignOutcome.requesterInvalid,
+        .signerUnavailable,
+        .identityMismatch,
+        .signatureFailed
+    ] {
+        let response = AuthBrokerSSHSignResponse(
+            authorizationID: request.requestID,
+            outcome: outcome
+        )
+        var frame = try AuthBrokerWire.frame(.sshSignResponse(response))
+        let decodedFailureResponse = try AuthBrokerWire.takeFrame(from: &frame)
+        try expect(
+            decodedFailureResponse == .sshSignResponse(response),
+            "broker v5 must round-trip every closed, secret-free SSH signing failure"
+        )
+    }
+    for contradictory in [
+        AuthBrokerSSHSignResponse(
+            authorizationID: request.requestID,
+            outcome: .signed
+        ),
+        AuthBrokerSSHSignResponse(
+            authorizationID: request.requestID,
+            outcome: .signatureFailed,
+            signature: wireFixtureSignature
+        )
+    ] {
+        do {
+            _ = try AuthBrokerWire.frame(.sshSignResponse(contradictory))
+            throw SelftestFailure(message: "contradictory SSH signing responses must fail closed")
+        } catch AuthBrokerProtocolError.malformed {}
+    }
+    var unknownSigningOutcome = try AuthBrokerWire.frame(.sshSignResponse(AuthBrokerSSHSignResponse(
+        authorizationID: request.requestID,
+        outcome: .signatureFailed
+    )))
+    unknownSigningOutcome[51] = 0xFF
+    do {
+        _ = try AuthBrokerWire.takeFrame(from: &unknownSigningOutcome)
+        throw SelftestFailure(message: "unknown SSH signing outcomes must fail closed")
+    } catch AuthBrokerProtocolError.malformed {}
+
+    let classifiedSignature = try GitSSHSigningResponseClassifier.signature(
+        from: .sshSignResponse(signedResponse),
+        authorizationID: request.requestID,
+        stage: .signature
+    )
+    try expect(
+        classifiedSignature == wireFixtureSignature,
+        "Git signing client must accept only a typed signed response at the signature stage"
+    )
+    let approvedAuthorization = AuthBrokerApprovalResponse(
+        requestID: request.requestID,
+        status: .approved,
+        resultStatus: errSecSuccess,
+        resultData: wireFixtureSignature
+    )
+    let classifiedAuthorizationKey = try GitSSHSigningAuthorizationClassifier.approvedPublicKey(
+        from: .approvalResponse(approvedAuthorization),
+        requestID: request.requestID,
+        expectedPublicKey: wireFixtureSignature
+    )
+    try expect(
+        classifiedAuthorizationKey == wireFixtureSignature,
+        "Git signing authorization must accept one structurally consistent matching approval"
+    )
+    do {
+        let _: Int = try GitSSHSigningAuthorizationBoundary.connect {
+            throw SelftestFailure(message: "fixture companion resolution, launch, or v5 handshake failure")
+        }
+        throw SelftestFailure(message: "Git signing broker boundary failure must not return")
+    } catch let failure as GitSSHSigningFailure {
+        try expect(
+            failure == .brokerUnavailable,
+            "companion resolution, launch, and v5 handshake failures must become a closed broker failure"
+        )
+    }
+    do {
+        let _: Int = try GitSSHSigningAuthorizationBoundary.prepare {
+            throw SelftestFailure(message: "fixture approval request construction failure")
+        }
+        throw SelftestFailure(message: "Git signing authorization preparation failure must not return")
+    } catch let failure as GitSSHSigningFailure {
+        try expect(
+            failure == .authorizationRequestInvalid,
+            "approval request construction and framing failures must remain before signature submission"
+        )
+    }
+    do {
+        let _: Int = try GitSSHSigningAuthorizationBoundary.receive {
+            throw SelftestFailure(message: "fixture authorization response loss")
+        }
+        throw SelftestFailure(message: "Git signing authorization response loss must not return")
+    } catch let failure as GitSSHSigningFailure {
+        try expect(
+            failure == .authorizationResponseUnavailable,
+            "authorization response loss must remain distinct from signature-result uncertainty"
+        )
+    }
+    for (status, expectedFailure) in [
+        (AuthBrokerApprovalStatus.cancelled, GitSSHSigningFailure.authorizationCancelled),
+        (.denied, .authorizationDenied)
+    ] {
+        do {
+            _ = try GitSSHSigningAuthorizationClassifier.approvedPublicKey(
+                from: .approvalResponse(AuthBrokerApprovalResponse(
+                    requestID: request.requestID,
+                    status: status,
+                    resultStatus: errSecAuthFailed
+                )),
+                requestID: request.requestID,
+                expectedPublicKey: wireFixtureSignature
+            )
+            throw SelftestFailure(message: "Git signing cancellation and denial must not approve")
+        } catch let failure as GitSSHSigningFailure {
+            try expect(
+                failure == expectedFailure,
+                "genuine Git signing cancellation and denial must retain their closed status"
+            )
+        }
+    }
+    for (outcome, expectedFailure) in [
+        (AuthBrokerSSHSignOutcome.requesterInvalid, GitSSHSigningFailure.requesterInvalid),
+        (.signerUnavailable, .signerUnavailable),
+        (.identityMismatch, .identityMismatch)
+    ] {
+        do {
+            _ = try GitSSHSigningAuthorizationClassifier.approvedPublicKey(
+                from: .sshSignResponse(AuthBrokerSSHSignResponse(
+                    authorizationID: request.requestID,
+                    outcome: outcome
+                )),
+                requestID: request.requestID,
+                expectedPublicKey: wireFixtureSignature
+            )
+            throw SelftestFailure(message: "pre-approval preparation failure must not approve")
+        } catch let failure as GitSSHSigningFailure {
+            try expect(
+                failure == expectedFailure,
+                "Git authorization must preserve each permitted typed preparation failure"
+            )
+        }
+    }
+    let invalidAuthorizationResponses: [AuthBrokerMessage] = [
+        .approvalResponse(AuthBrokerApprovalResponse(
+            requestID: UUID(),
+            status: .approved,
+            resultStatus: errSecSuccess,
+            resultData: wireFixtureSignature
+        )),
+        .approvalResponse(AuthBrokerApprovalResponse(
+            requestID: request.requestID,
+            status: .approved,
+            resultStatus: errSecAuthFailed,
+            resultData: wireFixtureSignature
+        )),
+        .approvalResponse(AuthBrokerApprovalResponse(
+            requestID: request.requestID,
+            status: .approved,
+            resultStatus: errSecSuccess
+        )),
+        .approvalResponse(AuthBrokerApprovalResponse(
+            requestID: request.requestID,
+            status: .approved,
+            resultStatus: errSecSuccess,
+            resultData: Data("wrong-public-key".utf8)
+        )),
+        .approvalResponse(AuthBrokerApprovalResponse(
+            requestID: request.requestID,
+            status: .approved,
+            message: "untrusted server text",
+            resultStatus: errSecSuccess,
+            resultData: wireFixtureSignature
+        )),
+        .approvalResponse(AuthBrokerApprovalResponse(
+            requestID: request.requestID,
+            status: .approved,
+            resultStatus: errSecSuccess,
+            resultData: wireFixtureSignature,
+            verifiedUsername: "unexpected"
+        )),
+        .approvalResponse(AuthBrokerApprovalResponse(
+            requestID: request.requestID,
+            status: .cancelled,
+            resultStatus: errSecSuccess
+        )),
+        .approvalResponse(AuthBrokerApprovalResponse(
+            requestID: request.requestID,
+            status: .denied,
+            resultStatus: errSecAuthFailed,
+            resultData: wireFixtureSignature
+        )),
+        .sshSignResponse(signedResponse),
+        .sshSignResponse(AuthBrokerSSHSignResponse(
+            authorizationID: request.requestID,
+            outcome: .signatureFailed
+        )),
+        .sshSignResponse(AuthBrokerSSHSignResponse(
+            authorizationID: UUID(),
+            outcome: .requesterInvalid
+        )),
+        .hello(AuthBrokerHello(
+            minimumVersion: AuthBrokerWire.currentVersion,
+            maximumVersion: AuthBrokerWire.currentVersion,
+            capabilities: 0,
+            nonce: nonce
+        ))
+    ]
+    for message in invalidAuthorizationResponses {
+        do {
+            _ = try GitSSHSigningAuthorizationClassifier.approvedPublicKey(
+                from: message,
+                requestID: request.requestID,
+                expectedPublicKey: wireFixtureSignature
+            )
+            throw SelftestFailure(message: "invalid Git signing authorization response must not approve")
+        } catch let failure as GitSSHSigningFailure {
+            try expect(
+                failure == .invalidAuthorizationResponse,
+                "invalid authorization responses must remain pre-signature and fail closed"
+            )
+        }
+    }
+    let typedGitFailures: [(AuthBrokerSSHSignOutcome, GitSSHSigningFailure)] = [
+        (.requesterInvalid, .requesterInvalid),
+        (.signerUnavailable, .signerUnavailable),
+        (.identityMismatch, .identityMismatch),
+        (.signatureFailed, .signatureFailed)
+    ]
+    for (outcome, expectedFailure) in typedGitFailures {
+        do {
+            _ = try GitSSHSigningResponseClassifier.signature(
+                from: .sshSignResponse(AuthBrokerSSHSignResponse(
+                    authorizationID: request.requestID,
+                    outcome: outcome
+                )),
+                authorizationID: request.requestID,
+                stage: outcome == .signatureFailed ? .signature : .authorization
+            )
+            throw SelftestFailure(message: "typed Git signing failures must not return signature bytes")
+        } catch let failure as GitSSHSigningFailure {
+            try expect(failure == expectedFailure, "Git signing client must preserve each typed failure reason")
+        }
+    }
+    let invalidGitSigningResponses: [(AuthBrokerMessage, GitSSHSigningResponseStage)] = [
+        (.sshSignResponse(signedResponse), .authorization),
+        (
+            .sshSignResponse(AuthBrokerSSHSignResponse(
+                authorizationID: request.requestID,
+                outcome: .signatureFailed
+            )),
+            .authorization
+        ),
+        (
+            .sshSignResponse(AuthBrokerSSHSignResponse(
+                authorizationID: request.requestID,
+                outcome: .signerUnavailable
+            )),
+            .signature
+        ),
+        (
+            .sshSignResponse(AuthBrokerSSHSignResponse(
+                authorizationID: UUID(),
+                outcome: .signed,
+                signature: wireFixtureSignature
+            )),
+            .signature
+        ),
+        (.hello(AuthBrokerHello(
+            minimumVersion: AuthBrokerWire.currentVersion,
+            maximumVersion: AuthBrokerWire.currentVersion,
+            capabilities: 0,
+            nonce: nonce
+        )), .signature)
+    ]
+    for (message, stage) in invalidGitSigningResponses {
+        do {
+            _ = try GitSSHSigningResponseClassifier.signature(
+                from: message,
+                authorizationID: request.requestID,
+                stage: stage
+            )
+            throw SelftestFailure(message: "skewed Git signing responses must fail closed")
+        } catch let failure as GitSSHSigningFailure {
+            try expect(
+                failure == .invalidResponse,
+                "skewed Git signing responses must preserve an indeterminate typed client failure"
+            )
+        }
+    }
     var unknownPurposeFrame = try AuthBrokerWire.frame(.approvalRequest(request))
     unknownPurposeFrame[68] = 0xFF
     do {
@@ -697,7 +1026,7 @@ private func authBrokerSelftests() throws {
     let decodedIndeterminateImport = try AuthBrokerWire.takeFrame(from: &indeterminateImportFrame)
     try expect(
         decodedIndeterminateImport == .managedKeychainImportResponse(indeterminateImport),
-        "broker v4 must preserve server-side post-mutation uncertainty"
+        "broker v5 must preserve server-side post-mutation uncertainty"
     )
     let passwordAutoFillRequest = AuthBrokerApprovalRequest(
         requestID: UUID(),
@@ -746,7 +1075,7 @@ private func authBrokerSelftests() throws {
     let decodedPasswordAutoFillResponse = try AuthBrokerWire.takeFrame(from: &passwordAutoFillResponseFrame)
     try expect(
         decodedPasswordAutoFillResponse == .approvalResponse(passwordAutoFillResponse),
-        "Password AutoFill username attestation must round-trip in broker v4"
+        "Password AutoFill username attestation must round-trip in broker v5"
     )
     let validAutoFillOutcomes: [(String, OSStatus, PasswordAutoFillSaveStatus)] = [
         ("saved", errSecSuccess, .saved),
@@ -1009,10 +1338,20 @@ private func authBrokerSelftests() throws {
             outcome: .signatureFailed,
             delivery: .notAttempted
         )
-        let preparationFailed = SSHSigningEffectPresentation(
+        let requesterInvalid = SSHSigningEffectPresentation(
             operation: operation,
-            outcome: .preparationFailed,
-            delivery: .notAttempted
+            outcome: .requesterInvalid,
+            delivery: .delivered
+        )
+        let signerUnavailable = SSHSigningEffectPresentation(
+            operation: operation,
+            outcome: .signerUnavailable,
+            delivery: .delivered
+        )
+        let identityMismatch = SSHSigningEffectPresentation(
+            operation: operation,
+            outcome: .identityMismatch,
+            delivery: .unknown
         )
         let delivered = SSHSigningEffectPresentation(
             operation: operation,
@@ -1027,8 +1366,13 @@ private func authBrokerSelftests() throws {
         try expect(
             !noRequest.isSuccess
                 && noRequest.message.contains("署名要求は受信しませんでした")
-                && !preparationFailed.isSuccess
-                && preparationFailed.message.contains("署名は実行していません")
+                && !requesterInvalid.isSuccess
+                && requesterInvalid.message.contains("要求元を再検証できませんでした")
+                && !signerUnavailable.isSuccess
+                && signerUnavailable.message.contains("署名鍵を準備できませんでした")
+                && !identityMismatch.isSuccess
+                && identityMismatch.message.contains("承認済み署名鍵が一致しませんでした")
+                && identityMismatch.message.contains("結果通知は確認できません")
                 && !signFailed.isSuccess
                 && signFailed.message.contains("署名結果は返していません")
                 && delivered.isSuccess
@@ -1058,6 +1402,7 @@ private func authBrokerSelftests() throws {
     )
     var signingDeliveryAttempted = false
     var signingAttempted = false
+    var signingFailureOutcome: AuthBrokerSSHSignOutcome?
     let signingPreparationFailed = AuthEffectPipeline.signing(
         operation: .sshSession,
         prepare: { throw SelftestFailure(message: "fixture requester revalidation failure") },
@@ -1065,41 +1410,56 @@ private func authBrokerSelftests() throws {
             signingAttempted = true
             return Data("must-not-be-signed".utf8)
         },
-        deliver: { _ in signingDeliveryAttempted = true }
+        deliver: { outcome, signature in
+            signingDeliveryAttempted = true
+            signingFailureOutcome = outcome
+            try expect(signature.isEmpty, "preparation failure response must not contain a signature")
+        }
     )
     try expect(
         !signingPreparationFailed.isSuccess
-            && signingPreparationFailed.message.contains("署名は実行していません")
+            && signingPreparationFailed.message.contains("要求元を再検証できませんでした")
             && !signingAttempted
-            && !signingDeliveryAttempted,
-        "requester revalidation or signer preparation failure must remain distinct from an attempted signature"
+            && signingDeliveryAttempted
+            && signingFailureOutcome == .requesterInvalid,
+        "requester revalidation failure must return a typed response without attempting a signature"
     )
+    signingDeliveryAttempted = false
+    signingFailureOutcome = nil
     let signingFailed = AuthEffectPipeline.signing(
         operation: .gitSSHSign,
         sign: {
             signingAttempted = true
             throw SelftestFailure(message: "fixture signer failure")
         },
-        deliver: { _ in signingDeliveryAttempted = true }
+        deliver: { outcome, signature in
+            signingDeliveryAttempted = true
+            signingFailureOutcome = outcome
+            try expect(signature.isEmpty, "signature failure response must not contain signature bytes")
+        }
     )
     try expect(
         !signingFailed.isSuccess
             && signingFailed.message.contains("署名結果は返していません")
             && signingAttempted
-            && !signingDeliveryAttempted,
-        "a signature failure must not attempt a response or claim a completed signature"
+            && signingDeliveryAttempted
+            && signingFailureOutcome == .signatureFailed,
+        "a signature failure must return a typed failure response without claiming a completed signature"
     )
     let fixtureSignature = Data("fixture-signature".utf8)
     var deliveredSignature = Data()
     let signingDelivered = AuthEffectPipeline.signing(
         operation: .sshSession,
         sign: { fixtureSignature },
-        deliver: { deliveredSignature = $0 }
+        deliver: { outcome, signature in
+            try expect(outcome == .signed, "a successful signature response must use the signed outcome")
+            deliveredSignature = signature
+        }
     )
     let signingResponseLost = AuthEffectPipeline.signing(
         operation: .sshSession,
         sign: { fixtureSignature },
-        deliver: { _ in throw SelftestFailure(message: "fixture signature response loss") }
+        deliver: { _, _ in throw SelftestFailure(message: "fixture signature response loss") }
     )
     try expect(
         signingDelivered.isSuccess
@@ -1315,7 +1675,30 @@ private func agentSelftests() throws {
     let liveGit = try RunCommand.captureSuspendedFixture(
         argv: [activeGitPath, "--version"], environment: ProcessInfo.processInfo.environment, limit: 4096,
         validate: { pid in
-            _ = try LiveCodeIdentityInspector.inspectExpectedAppleGit(pid: pid, expectedPath: activeGitPath)
+            let inspection = try LiveCodeIdentityInspector.inspectExpectedAppleGit(
+                pid: pid,
+                expectedPath: activeGitPath
+            )
+            let request = try AuthBrokerRequester.gitSSHSigningApprovalRequest(
+                credentialLabel: "fixture-git-signing",
+                credentialFingerprint: "SHA256:fixture",
+                rootPID: pid
+            )
+            var frame = try AuthBrokerWire.frame(.approvalRequest(request))
+            let decoded = try AuthBrokerWire.takeFrame(from: &frame)
+            try expect(
+                request.operation == .gitSSHSign
+                    && request.purpose == .gitSSHSign
+                    && request.rootPID == pid
+                    && request.rootIdentifier == "com.apple.git"
+                    && request.rootIdentifier == inspection.identity.identifier
+                    && request.rootExecutablePath == inspection.identity.canonicalPath
+                    && request.rootCodeRequirement == inspection.codeRequirement
+                    && request.rootCodeRequirement.contains("cdhash H\"")
+                    && request.issuedAtMilliseconds < request.expiresAtMilliseconds
+                    && decoded == .approvalRequest(request),
+                "specialized Git approval requests must pin the exact live Apple Git inspection"
+            )
         }
     )
     try expect(liveGit.exitCode == 0, "suspended active Git must satisfy the live Apple requirement")
@@ -2330,6 +2713,16 @@ private func runHarnessIfRequested() -> Never? {
         write(result.stdout, to: .standardOutput)
         write(result.stderr, to: .standardError)
         exit(result.exitCode)
+    case "--git-verification-adapter":
+        // Process-level execv fixture. Production uses the live Apple Git
+        // validator; this harness isolates stdio and exit-status preservation.
+        let result = GitSSHVerificationCommand.run(
+            argv: ["macop"] + Array(arguments.dropFirst()),
+            requesterValidator: AllowingGitSigningRequesterValidator()
+        )
+        write(result.stdout, to: .standardOutput)
+        write(result.stderr, to: .standardError)
+        exit(result.exitCode)
     default:
         return nil
     }
@@ -2408,6 +2801,277 @@ func run() throws {
         signatureValidation.exitCode == 0,
         "OpenSSH must validate the generated SSHSIG envelope and signature"
     )
+
+    let allowedSigners = gitSigningDirectory.appendingPathComponent("allowed_signers")
+    try Data("git@example.test \(publicKeyText)".utf8).write(to: allowedSigners)
+    let verifyTime = "-Overify-time=20260829123456"
+    let verificationInvocations = [
+        [
+            "-Y", "find-principals", "-f", allowedSigners.path, "-s", signaturePath.path, verifyTime
+        ],
+        [
+            "-Y", "verify", "-n", "git", "-f", allowedSigners.path, "-I", "git@example.test",
+            "-s", signaturePath.path, verifyTime
+        ],
+        [
+            "-Y", "check-novalidate", "-n", "git", "-s", signaturePath.path, verifyTime
+        ]
+    ]
+    let verificationExecutor = RecordingGitVerificationExecutor(exitCode: 19)
+    for invocation in verificationInvocations {
+        let argv = ["macop"] + invocation
+        let result = GitSSHVerificationCommand.run(
+            argv: argv,
+            executor: verificationExecutor,
+            requesterValidator: AllowingGitSigningRequesterValidator()
+        )
+        try expect(
+            GitSSHSigningCommand.isAdapterInvocation(argv)
+                && GitSSHVerificationCommand.isVerificationInvocation(argv)
+                && !GitSSHSigningCommand.isSigningInvocation(argv)
+                && result.exitCode == 19
+                && verificationExecutor.invocations.last == invocation,
+            "Git SSH verification must delegate only an exact allowlisted Apple Git invocation"
+        )
+    }
+    let selftestExecutable = try RunningExecutable.path()
+    let verificationExecFixture = try RunCommand.capture(
+        argv: [
+            "/bin/sh", "-c",
+            "exec \"$1\" --git-verification-adapter -Y check-novalidate -n git -s \"$3\" \"$4\" < \"$2\"",
+            "macop-selftest", selftestExecutable, gitSigningMessage.path, signaturePath.path, verifyTime
+        ],
+        environment: ProcessInfo.processInfo.environment,
+        limit: 4096
+    )
+    try expect(
+        verificationExecFixture.exitCode == 0,
+        "Git verification adapter must exec Apple ssh-keygen with inherited stdin/stdout/stderr and exit status"
+    )
+    let rejectedVerificationInvocations: [(String, [String])] = [
+        (
+            "missing verify-time",
+            ["-Y", "find-principals", "-f", allowedSigners.path, "-s", signaturePath.path]
+        ),
+        (
+            "misordered find-principals paths",
+            ["-Y", "find-principals", "-s", signaturePath.path, "-f", allowedSigners.path, verifyTime]
+        ),
+        (
+            "extra find-principals option",
+            [
+                "-Y", "find-principals", "-f", allowedSigners.path, "-s", signaturePath.path,
+                "-Oprint-pubkey", verifyTime
+            ]
+        ),
+        (
+            "relative allowed signers",
+            ["-Y", "find-principals", "-f", "allowed_signers", "-s", signaturePath.path, verifyTime]
+        ),
+        (
+            "option-like signature path",
+            ["-Y", "find-principals", "-f", allowedSigners.path, "-s", "-signature", verifyTime]
+        ),
+        (
+            "wrong verify namespace",
+            [
+                "-Y", "verify", "-n", "file", "-f", allowedSigners.path, "-I", "git@example.test",
+                "-s", signaturePath.path, verifyTime
+            ]
+        ),
+        (
+            "empty principal",
+            [
+                "-Y", "verify", "-n", "git", "-f", allowedSigners.path, "-I", "",
+                "-s", signaturePath.path, verifyTime
+            ]
+        ),
+        (
+            "option-like principal",
+            [
+                "-Y", "verify", "-n", "git", "-f", allowedSigners.path, "-I", "-principal",
+                "-s", signaturePath.path, verifyTime
+            ]
+        ),
+        (
+            "non-ASCII principal",
+            [
+                "-Y", "verify", "-n", "git", "-f", allowedSigners.path, "-I", "利用者",
+                "-s", signaturePath.path, verifyTime
+            ]
+        ),
+        (
+            "oversized principal",
+            [
+                "-Y", "verify", "-n", "git", "-f", allowedSigners.path, "-I",
+                String(repeating: "a", count: 257), "-s", signaturePath.path, verifyTime
+            ]
+        ),
+        (
+            "separated verify-time option",
+            [
+                "-Y", "verify", "-n", "git", "-f", allowedSigners.path, "-I", "git@example.test",
+                "-s", signaturePath.path, "-O", "verify-time=20260829123456"
+            ]
+        ),
+        (
+            "invalid verify-time suffix",
+            [
+                "-Y", "check-novalidate", "-n", "git", "-s", signaturePath.path,
+                "-Overify-time=20260829123456Z"
+            ]
+        ),
+        (
+            "invalid calendar time",
+            [
+                "-Y", "check-novalidate", "-n", "git", "-s", signaturePath.path,
+                "-Overify-time=20260230123456"
+            ]
+        ),
+        (
+            "extra check-novalidate option",
+            [
+                "-Y", "check-novalidate", "-n", "git", "-f", allowedSigners.path,
+                "-s", signaturePath.path, verifyTime
+            ]
+        )
+    ]
+    let delegatedBeforeRejections = verificationExecutor.invocations.count
+    for rejected in rejectedVerificationInvocations {
+        let result = GitSSHVerificationCommand.run(
+            argv: ["macop"] + rejected.1,
+            executor: verificationExecutor,
+            requesterValidator: AllowingGitSigningRequesterValidator()
+        )
+        try expect(
+            result.exitCode == 2
+                && result.stderr.contains("exact Git verification invocations")
+                && verificationExecutor.invocations.count == delegatedBeforeRejections,
+            "Git SSH verification must reject \(rejected.0) before delegation"
+        )
+    }
+    let arbitraryAdapterInvocation = ["macop", "-Y", "match-principals", "anything"]
+    let arbitraryAdapterResult = GitSSHSigningCommand.run(
+        argv: arbitraryAdapterInvocation,
+        env: [:],
+        requesterValidator: AllowingGitSigningRequesterValidator()
+    )
+    try expect(
+        GitSSHSigningCommand.isAdapterInvocation(arbitraryAdapterInvocation)
+            && !GitSSHVerificationCommand.isVerificationInvocation(arbitraryAdapterInvocation)
+            && arbitraryAdapterResult.exitCode == 2,
+        "arbitrary -Y invocations must never turn macop into a general ssh-keygen proxy"
+    )
+
+    let appleGitSigningMessage = gitSigningDirectory.appendingPathComponent("apple-git-message")
+    let appleGitMessage = Data("object 0000000000000000000000000000000000000000\n".utf8)
+    try appleGitMessage.write(to: appleGitSigningMessage)
+    let appleGitSigningResult = GitSSHSigningCommand.run(
+        argv: [
+            "macop", "-Y", "sign", "-n", "git", "-f", gitSigningKey.path, "-U",
+            appleGitSigningMessage.path
+        ],
+        env: [:],
+        executor: GitSigningExecutor(publicKey: publicKeyBlob),
+        provider: gitSigningProvider,
+        requesterValidator: AllowingGitSigningRequesterValidator()
+    )
+    try expect(
+        appleGitSigningResult.exitCode == 0
+            && fileManager.fileExists(atPath: appleGitSigningMessage.path + ".sig"),
+        "Git SSH adapter must accept Apple Git's exact agent-key -U invocation"
+    )
+
+    let typedGitSigningFailures: [(GitSSHSigningFailure, String)] = [
+        (.brokerUnavailable, "No signature request was sent"),
+        (.authorizationRequestInvalid, "No signature request was sent"),
+        (.authorizationCancelled, "was cancelled"),
+        (.authorizationDenied, "was not authorized"),
+        (.requesterInvalid, "requester could not be revalidated"),
+        (.signerUnavailable, "Secure Enclave signing key could not be prepared"),
+        (.identityMismatch, "signing identity no longer matches"),
+        (.signatureFailed, "Secure Enclave signature operation failed"),
+        (.authorizationResponseUnavailable, "No signature request was sent"),
+        (.invalidAuthorizationResponse, "No signature request was sent"),
+        (.deliveryIndeterminate, "Do not retry automatically"),
+        (.invalidResponse, "do not retry automatically")
+    ]
+    for (index, fixture) in typedGitSigningFailures.enumerated() {
+        let message = gitSigningDirectory.appendingPathComponent("typed-failure-\(index)")
+        try gitMessage.write(to: message)
+        let result = GitSSHSigningCommand.run(
+            argv: [
+                "macop", "-Y", "sign", "-n", "git", "-f", gitSigningKey.path, "-U", message.path
+            ],
+            env: [:],
+            executor: GitSigningExecutor(publicKey: publicKeyBlob),
+            provider: FailingGitSigningProvider(failure: fixture.0),
+            requesterValidator: AllowingGitSigningRequesterValidator()
+        )
+        try expect(
+            result.exitCode != 0
+                && result.stderr.contains(fixture.1)
+                && !result.stderr.contains(gitMessage.base64EncodedString()),
+            "Git SSH adapter must render a secret-free typed diagnostic for \(fixture.0)"
+        )
+    }
+
+    let rejectedGitSigningInvocations: [(name: String, arguments: [String])] = [
+        (
+            "misordered -U",
+            ["-Y", "sign", "-n", "git", "-U", gitSigningMessage.path, "-f", gitSigningKey.path]
+        ),
+        (
+            "trailing -U",
+            ["-Y", "sign", "-n", "git", "-f", gitSigningKey.path, gitSigningMessage.path, "-U"]
+        ),
+        (
+            "duplicate -U",
+            ["-Y", "sign", "-n", "git", "-f", gitSigningKey.path, "-U", "-U", gitSigningMessage.path]
+        ),
+        (
+            "additional option",
+            [
+                "-Y", "sign", "-n", "git", "-f", gitSigningKey.path, "-O", "hashalg=sha512",
+                gitSigningMessage.path
+            ]
+        ),
+        (
+            "wrong namespace",
+            ["-Y", "sign", "-n", "file", "-f", gitSigningKey.path, gitSigningMessage.path]
+        ),
+        (
+            "relative public key",
+            ["-Y", "sign", "-n", "git", "-f", "key.pub", gitSigningMessage.path]
+        ),
+        (
+            "relative message",
+            ["-Y", "sign", "-n", "git", "-f", gitSigningKey.path, "message"]
+        ),
+        (
+            "option-like public key",
+            ["-Y", "sign", "-n", "git", "-f", "-key.pub", gitSigningMessage.path]
+        ),
+        (
+            "option-like message",
+            ["-Y", "sign", "-n", "git", "-f", gitSigningKey.path, "-message"]
+        )
+    ]
+    for rejected in rejectedGitSigningInvocations {
+        let result = GitSSHSigningCommand.run(
+            argv: ["macop"] + rejected.arguments,
+            env: [:],
+            executor: GitSigningExecutor(publicKey: publicKeyBlob),
+            provider: gitSigningProvider,
+            requesterValidator: AllowingGitSigningRequesterValidator()
+        )
+        try expect(
+            result.exitCode == 2
+                && result.stderr.contains("accepts only: -Y sign -n git -f <public-key> [-U] <message-file>"),
+            "Git SSH adapter must reject \(rejected.name)"
+        )
+    }
+
     let repeatedGitSigning = GitSSHSigningCommand.run(
         argv: [
             "macop", "-Y", "sign", "-n", "git", "-f", gitSigningKey.path, gitSigningMessage.path

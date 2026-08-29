@@ -293,12 +293,30 @@ public struct AuthBrokerSSHSignRequest: Sendable, Equatable {
 
 public struct AuthBrokerSSHSignResponse: Sendable, Equatable {
     public let authorizationID: UUID
+    public let outcome: AuthBrokerSSHSignOutcome
     public let signature: Data
 
-    public init(authorizationID: UUID, signature: Data) {
+    public init(
+        authorizationID: UUID,
+        outcome: AuthBrokerSSHSignOutcome,
+        signature: Data = Data()
+    ) {
         self.authorizationID = authorizationID
+        self.outcome = outcome
         self.signature = signature
     }
+}
+
+/// Closed, secret-free result of an approved signing flow. Preparation
+/// failures are intentionally split so the client can explain which
+/// fail-closed boundary stopped the operation without receiving arbitrary
+/// server text.
+public enum AuthBrokerSSHSignOutcome: UInt8, Sendable, Equatable {
+    case signed = 1
+    case requesterInvalid = 2
+    case signerUnavailable = 3
+    case identityMismatch = 4
+    case signatureFailed = 5
 }
 
 public enum AuthBrokerMessage: Sendable, Equatable {
@@ -314,7 +332,7 @@ public enum AuthBrokerMessage: Sendable, Equatable {
 
 // swiftlint:disable:next type_body_length
 public enum AuthBrokerWire {
-    public static let currentVersion: UInt16 = 4
+    public static let currentVersion: UInt16 = 5
     public static let maximumFrameLength = 256 * 1024
     public static let maximumCommandLength = 4 * 1024
     public static let maximumMetadataLength = 512
@@ -401,8 +419,12 @@ public enum AuthBrokerWire {
             value += try self.text(request.authorizationID.uuidString, maximum: 36)
             value += self.u32(request.flags) + self.bytes(request.data)
         case let .sshSignResponse(response):
+            guard self.validSSHSignResponse(response) else {
+                throw AuthBrokerProtocolError.malformed
+            }
             value.append(6)
             value += try self.text(response.authorizationID.uuidString, maximum: 36)
+            value.append(response.outcome.rawValue)
             value += self.bytes(response.signature)
         case let .managedKeychainImportRequest(request):
             guard !request.secret.isEmpty else { throw AuthBrokerProtocolError.malformed }
@@ -536,12 +558,19 @@ public enum AuthBrokerWire {
             guard let authorizationID = try UUID(uuidString: cursor.text(maximum: 36)) else {
                 throw AuthBrokerProtocolError.malformed
             }
+            guard let outcome = try AuthBrokerSSHSignOutcome(rawValue: cursor.byte()) else {
+                throw AuthBrokerProtocolError.malformed
+            }
             let signature = try cursor.bytes()
-            guard cursor.isAtEnd, !signature.isEmpty else { throw AuthBrokerProtocolError.malformed }
-            return .sshSignResponse(AuthBrokerSSHSignResponse(
+            let response = AuthBrokerSSHSignResponse(
                 authorizationID: authorizationID,
+                outcome: outcome,
                 signature: signature
-            ))
+            )
+            guard cursor.isAtEnd, self.validSSHSignResponse(response) else {
+                throw AuthBrokerProtocolError.malformed
+            }
+            return .sshSignResponse(response)
         case 7:
             guard let authorizationID = try UUID(uuidString: cursor.text(maximum: 36)) else {
                 throw AuthBrokerProtocolError.malformed
@@ -587,6 +616,15 @@ public enum AuthBrokerWire {
         case .committed: status == errSecSuccess
         case .failed: status != errSecSuccess
         case .indeterminate: true
+        }
+    }
+
+    private static func validSSHSignResponse(_ response: AuthBrokerSSHSignResponse) -> Bool {
+        switch response.outcome {
+        case .signed:
+            !response.signature.isEmpty
+        case .requesterInvalid, .signerUnavailable, .identityMismatch, .signatureFailed:
+            response.signature.isEmpty
         }
     }
 

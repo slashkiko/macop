@@ -590,7 +590,8 @@ Keychain access promptがbinary更新後にどう振る舞うかはOS/Keychain�
 - `/usr/bin/git`はdeveloper-tool shimであるため、`ssh run`はlookup overrideを除去した`xcrun --no-cache --find git`で実体imageを解決する。Gitは`POSIX_SPAWN_START_SUSPENDED`で起動し、`anchor apple`・`com.apple.git`・library validationをlive processで検証してexact requirement/cdhashをregistryへ固定する。registry activation・承認・agent authorization後だけ`SIGCONT`し、拒否時は一度も再開せずkill/reapする
 - `ssh run`は`git`と`/usr/bin/git`だけを入口として受け入れ、同名の任意実行ファイルへverified-session socketを渡さない
 - `ssh shell-init zsh|bash|fish`はinteractive shellを1回だけverified rootへ置換し、tab/shell終了を既存registryの即時失効へ結び付ける
-- `ssh git-signing-config`とGitの`ssh-keygen -Y sign -n git`互換adapterは、設定公開鍵に一致するCTK identityだけでcanonical SSHSIG preimageを署名し、private keyやstable agent socketをexportしない
+- `ssh git-signing-config`とGitの`ssh-keygen -Y sign -n git`互換adapterは、legacy形式とApple Gitがagent内の鍵を示すために公開鍵の直後へ`-U`を置く形式だけを受理し、設定公開鍵に一致するCTK identityだけでcanonical SSHSIG preimageを署名する。private keyやstable agent socketはexportしない
+- 同じGit adapterの検証経路は、直接のlive Apple Git親を再検証し、Gitが使うexact-orderの`find-principals`、`verify -n git`、`check-novalidate -n git`と厳密なverify-timeだけを受理してから`/usr/bin/ssh-keygen`へ`execv`する。stdioとexit statusを維持し、その他の`-Y`操作・追加flag・順序変更はgeneral proxyにせずfail closedで拒否する
 
 ### Phase 5: 安全性と互換性
 

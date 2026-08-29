@@ -8,8 +8,12 @@ private func write(_ text: String, to handle: FileHandle) {
 
 let app = MacopApp()
 let environment = ProcessInfo.processInfo.environment
-if GitSSHSigningCommand.isSigningInvocation(CommandLine.arguments) {
-    let result = GitSSHSigningCommand.run(argv: CommandLine.arguments, env: environment)
+if GitSSHSigningCommand.isAdapterInvocation(CommandLine.arguments) {
+    let result = if GitSSHVerificationCommand.isVerificationInvocation(CommandLine.arguments) {
+        GitSSHVerificationCommand.run(argv: CommandLine.arguments)
+    } else {
+        GitSSHSigningCommand.run(argv: CommandLine.arguments, env: environment)
+    }
     if !result.stdout.isEmpty {
         write(result.stdout, to: .standardOutput)
     }

@@ -2,6 +2,47 @@ import Darwin
 import Foundation
 
 public enum AuthBrokerRequester {
+    /// Builds the Git signing request from Apple's platform-Git requirement,
+    /// not the generic certificate-backed publisher policy. Platform Git may
+    /// legitimately have no Team ID; `inspectExpectedAppleGit` instead pins
+    /// the live Apple requirement, library validation, identifier, path, and
+    /// cdhash into the returned code requirement.
+    public static func gitSSHSigningApprovalRequest(
+        credentialLabel: String,
+        credentialFingerprint: String,
+        rootPID: Int32
+    ) throws -> AuthBrokerApprovalRequest {
+        guard rootPID > 1 else { throw AgentProtocolError.denied }
+        let requesterInspector = SystemRequesterInspector()
+        guard let before = requesterInspector.snapshot(of: rootPID) else {
+            throw AgentProtocolError.denied
+        }
+        let expectedPath = try self.executablePath(pid: rootPID)
+        let inspection = try LiveCodeIdentityInspector.inspectExpectedAppleGit(
+            pid: rootPID,
+            expectedPath: expectedPath
+        )
+        guard requesterInspector.snapshot(of: rootPID) == before else {
+            throw AgentProtocolError.denied
+        }
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+        return AuthBrokerApprovalRequest(
+            requestID: UUID(),
+            issuedAtMilliseconds: now,
+            expiresAtMilliseconds: now + 120_000,
+            operation: .gitSSHSign,
+            rootPID: rootPID,
+            rootStartTime: before.startTime,
+            rootIdentifier: inspection.identity.identifier,
+            rootCodeRequirement: inspection.codeRequirement,
+            rootExecutablePath: inspection.identity.canonicalPath,
+            purpose: .gitSSHSign,
+            credentialLabel: credentialLabel,
+            credentialFingerprint: credentialFingerprint,
+            host: ""
+        )
+    }
+
     public static func approvalRequest(
         operation: AuthBrokerOperation,
         purpose: AuthBrokerPurpose,

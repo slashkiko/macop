@@ -424,26 +424,47 @@ private enum AuthBrokerAppServer {
         if outcome.status == .approved, let context = outcome.context, isSigningRequest {
             do {
                 try self.validateRoot(request)
-                let candidate = try SSHCommand.makeVerifiedSessionSigner(
-                    label: request.credentialLabel,
-                    authenticationContext: context
-                )
-                guard constantTimeEqual(
-                    Data(candidate.fingerprint.utf8),
-                    Data(request.credentialFingerprint.utf8)
-                ) else { throw AgentProtocolError.denied }
-                signer = candidate
-                resultData = candidate.publicKeyBlob
             } catch {
-                let presentation = SSHSigningEffectPresentation(
-                    operation: request.operation,
-                    outcome: .preparationFailed,
-                    delivery: .notAttempted
+                await self.completeSigningFailure(
+                    client: client,
+                    request: request,
+                    failure: .requesterInvalid,
+                    coordinator: coordinator
                 )
-                await coordinator.complete(presentation.message, isSuccess: false)
                 await coordinator.terminateSoon(after: .seconds(2))
                 return
             }
+            let candidate: CTKIdentitySigner
+            do {
+                candidate = try SSHCommand.makeVerifiedSessionSigner(
+                    label: request.credentialLabel,
+                    authenticationContext: context
+                )
+            } catch {
+                await self.completeSigningFailure(
+                    client: client,
+                    request: request,
+                    failure: .signerUnavailable,
+                    coordinator: coordinator
+                )
+                await coordinator.terminateSoon(after: .seconds(2))
+                return
+            }
+            guard constantTimeEqual(
+                Data(candidate.fingerprint.utf8),
+                Data(request.credentialFingerprint.utf8)
+            ) else {
+                await self.completeSigningFailure(
+                    client: client,
+                    request: request,
+                    failure: .identityMismatch,
+                    coordinator: coordinator
+                )
+                await coordinator.terminateSoon(after: .seconds(2))
+                return
+            }
+            signer = candidate
+            resultData = candidate.publicKeyBlob
         } else if outcome.status == .approved,
                   let context = outcome.context,
                   request.operation == .managedKeychainRead
@@ -794,9 +815,10 @@ private enum AuthBrokerAppServer {
                 sign: {
                     try signer.sign(data: signRequest.data, flags: signRequest.flags)
                 },
-                deliver: { signature in
+                deliver: { outcome, signature in
                     try AuthBrokerSocketIO.writeMessage(.sshSignResponse(AuthBrokerSSHSignResponse(
                         authorizationID: request.requestID,
+                        outcome: outcome,
                         signature: signature
                     )), to: client, timeout: 30)
                 }
@@ -805,6 +827,25 @@ private enum AuthBrokerAppServer {
             guard presentation.isSuccess else { return }
             completedSignature = true
         }
+    }
+
+    private static func completeSigningFailure(
+        client: Int32,
+        request: AuthBrokerApprovalRequest,
+        failure: SSHSigningEffectFailure,
+        coordinator: AuthApprovalCoordinator
+    ) async {
+        let presentation = AuthEffectPipeline.signingFailure(
+            operation: request.operation,
+            failure: failure
+        ) { responseOutcome, signature in
+            try AuthBrokerSocketIO.writeMessage(.sshSignResponse(AuthBrokerSSHSignResponse(
+                authorizationID: request.requestID,
+                outcome: responseOutcome,
+                signature: signature
+            )), to: client, timeout: 5)
+        }
+        await coordinator.complete(presentation.message, isSuccess: presentation.isSuccess)
     }
 
     private static func validateRoot(_ request: AuthBrokerApprovalRequest) throws {
