@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 .PHONY: help setup bootstrap hooks-install
-.PHONY: format format-check lint test test-config-durability test-agent-helper test-invocation test-installation test-install-transaction test-profile-helper test-profile-bootstrap test-no-persistence test-keychain-integration test-keychain-auth-ui test-pty test-ssh-manual build release-build build-install-products release-build-install-products install uninstall
+.PHONY: format format-check lint test test-config-durability test-agent-helper test-invocation test-build-install-products test-installation test-install-transaction test-profile-helper test-profile-bootstrap test-no-persistence test-keychain-integration test-keychain-auth-ui test-pty test-ssh-manual build release-build build-install-products release-build-install-products install uninstall
 .PHONY: ci ci-swift ci-workflows ci-secrets
 .PHONY: pin-actions pin-actions-check
 .PHONY: workflow-lint workflow-security
@@ -49,6 +49,9 @@ test-agent-helper: build
 
 test-invocation: build
 	@bash scripts/test-invocation.sh
+
+test-build-install-products:
+	@bash scripts/test-build-install-products.sh
 
 test-installation: build
 	@bash scripts/test-installation.sh
@@ -128,7 +131,7 @@ workflow-security:
 secret-scan:
 	mise exec -- betterleaks dir .
 
-ci-swift: format-check lint build test test-agent-helper test-invocation test-installation test-install-transaction test-profile-helper test-no-persistence
+ci-swift: format-check lint build test test-agent-helper test-invocation test-build-install-products test-installation test-install-transaction test-profile-helper test-no-persistence
 
 ci-workflows: pin-actions-check workflow-lint workflow-security
 
