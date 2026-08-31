@@ -1,0 +1,195 @@
+/* Common */
+"common.cancel" = "Cancel";
+"common.cancelled" = "Cancelled";
+"common.not_allowed" = "Not allowed";
+"common.processing" = "Processing…";
+"common.verified" = "Verified";
+"common.close" = "Close";
+"common.copy_message" = "Copy Message";
+
+/* Approval request */
+"auth.launch.from_macop" = "Open MacopAuth from macop.";
+"auth.request.verification_failed" = "The approval request could not be verified securely.";
+"auth.request.verifying" = "Verifying the approval request…";
+"auth.header.credentials" = "%@ is requesting credentials";
+"auth.header.keychain" = "%@ is requesting to %@ a Keychain item";
+"auth.header.operation" = "%@ is requesting %@";
+"auth.header.git_ssh_signing" = "%@ is requesting a Git SSH signature";
+"auth.header.ssh_key" = "%@ is requesting an SSH key";
+"auth.current_request_only" = "Valid only for the current process and request";
+"auth.protection.device_owner" = "Touch ID, Apple Watch, or Mac login password";
+"auth.action.use_password" = "Use Password";
+"auth.action.mac_password" = "Mac Login Password";
+"auth.action.use_mac_password" = "Use Mac Login Password";
+"auth.action.touch_or_watch" = "Touch ID or Apple Watch";
+"auth.action.approve_touch_or_watch" = "Approve with Touch ID or Apple Watch";
+"auth.action.continue_ctk" = "Continue to Touch ID or Mac Login Password";
+"auth.ctk.next_prompt" = "macOS will request key authentication once";
+"auth.ctk.description" = "CTKCardToken will use Touch ID or your Mac login password. ";
+"auth.ctk.watch_unavailable" = "This Secure Enclave key cannot be unlocked with Apple Watch.";
+"auth.reason.ssh_session" = "Use the Secure Enclave SSH key.";
+"auth.reason.keychain_read" = "Read a macop-managed Keychain item.";
+"auth.reason.ssh_sign" = "Sign with the Secure Enclave SSH key.";
+"auth.reason.otp_import" = "Store the OTP seed protected by Touch ID, Apple Watch, or your Mac login password.";
+"auth.reason.keychain_import" = "Store a Keychain item protected by Touch ID, Apple Watch, or your Mac login password.";
+"auth.reason.otp_update" = "Update the OTP seed protected by Touch ID, Apple Watch, or your Mac login password.";
+"auth.reason.keychain_update" = "Update a macop-managed Keychain item.";
+"auth.reason.password_autofill" = "Use credentials selected from Passwords with macop.";
+"auth.reason.keychain_delete" = "Delete a macop-managed Keychain item.";
+"auth.reason.git_ssh_sign" = "Sign a Git commit or tag with the Secure Enclave SSH key.";
+"auth.reason.ssh_key_create" = "Create a Secure Enclave SSH key protected by Touch ID, Apple Watch, or your Mac login password.";
+"auth.reason.ssh_key_delete" = "Delete the Secure Enclave SSH key.";
+"auth.reason.ssh_migration" = "Change the Secure Enclave SSH key migration state.";
+
+/* Detail rows */
+"details.content" = "Action";
+"details.target" = "Target";
+"details.service" = "Service";
+"details.account" = "Account";
+"details.save_destination" = "Save to";
+"details.command" = "Command";
+"details.key" = "Key";
+"details.key_to_use" = "Key to use";
+"details.fingerprint" = "Fingerprint";
+"details.protection" = "Protection";
+"details.executable" = "Executable";
+"details.destination" = "Destination";
+"details.operation" = "Operation";
+"details.technical" = "Technical Details";
+"details.signature" = "Signature";
+"details.code_hash" = "Code Hash";
+"details.verification" = "Verification";
+
+/* Purpose and action names */
+"purpose.ssh_session" = "SSH session";
+"purpose.git_ssh_signing" = "Git SSH signing";
+"purpose.ssh_signing" = "SSH signing";
+"managed.action.read" = "read";
+"managed.action.update" = "update";
+"managed.action.add" = "add";
+"managed.action.delete" = "delete";
+"managed.action.otp_update" = "update OTP seed";
+"managed.action.otp_add" = "add OTP seed";
+"managed.target.all_items" = "All macop-managed Keychain items";
+"ssh.action.create" = "Create an SSH key";
+"ssh.action.delete" = "Delete an SSH key";
+"ssh.action.operation" = "SSH key operation";
+
+/* Password AutoFill */
+"autofill.title" = "Choose from Passwords";
+"autofill.instruction" = "Click the password field and choose the login you want from the system AutoFill suggestions.";
+"autofill.username" = "Username";
+"autofill.password" = "Password";
+"autofill.username_mismatch" = "The selected username does not match the configured account.";
+"autofill.username_missing" = "If Passwords did not fill the username, enter the configured account to confirm it.";
+"autofill.save_to_keychain" = "Also save or update it in the macop-managed Keychain";
+"autofill.request_only" = "Credentials are not shown again and are returned only to the current request";
+
+/* Destructive confirmation */
+"destructive.title.delete_all" = "Delete all managed items?";
+"destructive.title.delete_item" = "Delete this item?";
+"destructive.message.delete_all" = "All macop-managed Keychain items will be deleted. This action cannot be undone.";
+"destructive.message.delete_prepared_ssh_key" = "The prepared SSH key that has not been registered externally will be deleted. This action cannot be undone.";
+"destructive.message.delete_ssh_key" = "The displayed Secure Enclave SSH key will be deleted. This action cannot be undone.";
+"destructive.message.delete_keychain_item" = "The displayed Keychain item will be deleted. This action cannot be undone.";
+"destructive.action.delete_all" = "Delete All Managed Items";
+"destructive.action.delete_ssh_key" = "Delete SSH Key";
+"destructive.action.delete_keychain_item" = "Delete Keychain Item";
+
+/* Git client trust */
+"trust.enroll.title" = "Update Git Client Trust";
+"trust.enroll.description" = "Add or update a trusted Git client.";
+"trust.enroll.action" = "Update";
+"trust.remove.title" = "Change Git Client Trust";
+"trust.remove.description" = "Remove the selected Git client from the trusted set.";
+"trust.remove.action" = "Remove";
+"trust.migrate.title" = "Migrate Git Client Trust";
+"trust.migrate.description" = "Migrate the existing trust information to a format that detects tampering and rollback.";
+"trust.migrate.action" = "Migrate";
+"trust.reset.title" = "Reset Git Client Trust";
+"trust.reset.description" = "Remove all current Git client trust settings.";
+"trust.reset.action" = "Remove All";
+"trust.result.count" = "Trusted Git clients after this change: %d";
+"trust.result.none" = "No Git clients will be trusted after this change.";
+"trust.result.only_count" = "Only the following %d Git clients will be trusted.";
+"trust.authentication_reason" = "Save the displayed Git client trust settings in macop.";
+"trust.requester" = "Requester: %@\n%@\n\n";
+"trust.entry.selected_path" = "%d. Selected path: %@\n";
+"trust.entry.resolved_git" = "   Resolved Git: %@\n";
+"trust.entry.version" = "   Version: %@\n";
+"trust.entry.signature" = "   Signature: %@\n";
+"trust.entry.identifier" = "   Identifier: %@\n";
+"trust.entry.code_hash" = "   Code hash: %@";
+
+/* Immediate results */
+"result.credentials.approval_and_delivery_indeterminate" = "Neither the credential approval result nor its delivery to the requester could be confirmed";
+"result.credentials.approval_indeterminate" = "The credential approval result could not be confirmed";
+"result.delivery_unconfirmed_suffix" = ". Delivery to the requester could not be confirmed";
+"result.ssh_migration.request_invalid" = "The SSH key migration request could not be verified";
+"result.ssh_migration.updated" = "Updated the SSH key migration state";
+"result.ssh_migration.update_failed" = "Could not update the SSH key migration state";
+"result.ssh_migration.delivery_failed" = "Could not send the migration result to the requester";
+"result.ssh_migration.change_allowed" = "Allowed the Secure Enclave SSH key migration state change";
+"result.ssh_key.request_invalid" = "The SSH key operation request could not be verified";
+"result.ssh_key.created" = "Created the Secure Enclave SSH key";
+"result.ssh_key.deleted" = "Deleted the Secure Enclave SSH key";
+"result.ssh_key.indeterminate" = "The SSH key operation result is indeterminate. Check the key list before trying again.";
+"result.ssh_key.operation_failed" = "Could not perform the Secure Enclave SSH key operation";
+"result.ssh_key.operation_delivery_indeterminate" = "The SSH key operation may have completed, but delivery to the requester could not be confirmed";
+"result.ssh_key.operation_failed_after_approval" = "The Secure Enclave SSH key operation failed";
+"result.ssh_key.use_allowed" = "Allowed use of the SSH key";
+"result.ssh_key.create_allowed" = "Allowed creation of the Secure Enclave SSH key";
+"result.ssh_key.delete_allowed" = "Allowed deletion of the Secure Enclave SSH key";
+"result.trust.already_updated" = "Git client trust settings are already up to date";
+"result.trust.concurrent_change" = "The trust settings were updated by another change. Review them and try again.";
+"result.trust.cancelled" = "Cancelled the Git client trust change";
+"result.trust.changed_during_authentication" = "The trust settings changed during authentication. Review them and try again.";
+"result.trust.updated" = "Updated Git client trust settings";
+"result.keychain.read_failed" = "Could not read the Keychain item";
+"result.keychain.delete_failed" = "Failed to delete the Keychain item";
+"result.keychain.read" = "Read the Keychain item";
+"result.keychain.add_allowed" = "Allowed adding the Keychain item";
+"result.keychain.update_allowed" = "Allowed updating the Keychain item";
+"result.keychain.deleted" = "Deleted the item from the Keychain";
+"result.git_ssh_signing.allowed" = "Allowed Git SSH signing";
+"result.credentials.use_allowed" = "Allowed use of the credentials";
+"result.post_approval_failed" = "Post-approval processing failed";
+
+/* Managed mutation results */
+"result.keychain.mutation_not_received" = "The Keychain item %@ request was not received. The Keychain was not changed.";
+"result.keychain.mutation_completed" = "Completed the Keychain item operation: %@";
+"result.keychain.mutation_completed_delivery_indeterminate" = "Completed the Keychain item operation (%@), but delivery to the requester could not be confirmed";
+"result.keychain.mutation_failed" = "Failed to perform the Keychain item operation: %@";
+"result.keychain.mutation_failed_delivery_indeterminate" = "The Keychain item operation failed (%@), and delivery to the requester could not be confirmed";
+"result.keychain.mutation_indeterminate" = "The result of the Keychain item operation is indeterminate: %@";
+"result.keychain.mutation_and_delivery_indeterminate" = "Neither the Keychain item operation result (%@) nor its delivery to the requester could be confirmed";
+"result.keychain.mutation_delivery_failed" = "Could not send the Keychain item operation result to the requester: %@";
+
+/* Signing results */
+"result.signing.no_request_received" = "Use of the SSH key was allowed, but no signing request was received";
+"result.signing.requester_invalid" = "The requester for %@ could not be reverified. No signature was created.";
+"result.signing.requester_invalid_delivery_indeterminate" = "The requester for %@ could not be reverified. No signature was created, and delivery could not be confirmed.";
+"result.signing.requester_invalid_not_returned" = "The requester for %@ could not be reverified. No signature was created or returned.";
+"result.signing.key_unavailable" = "The Secure Enclave signing key for %@ could not be prepared. No signature was created.";
+"result.signing.key_unavailable_delivery_indeterminate" = "The Secure Enclave signing key for %@ could not be prepared. No signature was created, and delivery could not be confirmed.";
+"result.signing.key_unavailable_not_returned" = "The Secure Enclave signing key for %@ could not be prepared. No signature was created or returned.";
+"result.signing.identity_mismatch" = "The approved signing key for %@ did not match. No signature was created.";
+"result.signing.identity_mismatch_delivery_indeterminate" = "The approved signing key for %@ did not match. No signature was created, and delivery could not be confirmed.";
+"result.signing.identity_mismatch_not_returned" = "The approved signing key for %@ did not match. No signature was created or returned.";
+"result.signing.failed" = "Secure Enclave signing for %@ failed. No signature result was returned.";
+"result.signing.failed_delivery_indeterminate" = "Secure Enclave signing for %@ failed. No signature result was returned, and delivery could not be confirmed.";
+"result.signing.completed" = "%@ completed";
+"result.signing.completed_delivery_indeterminate" = "%@ completed, but delivery of the signature result could not be confirmed";
+"result.signing.completed_not_returned" = "%@ completed, but no signature result was returned";
+
+/* Password AutoFill results */
+"result.autofill.saved_and_delivered" = "Saved the credentials to the Keychain and returned them to the requester";
+"result.autofill.delivered_without_save" = "Returned the credentials to the requester without saving them to the Keychain";
+"result.autofill.save_failed_not_delivered" = "Saving to the Keychain failed. The requester will not use the credentials.";
+"result.autofill.save_indeterminate_not_delivered" = "The Keychain save result is indeterminate. The requester will not use the credentials.";
+"result.autofill.saved_delivery_indeterminate" = "Saved the credentials to the Keychain, but delivery to the requester could not be confirmed";
+"result.autofill.not_saved_delivery_indeterminate" = "The credentials were not saved to the Keychain, and delivery to the requester could not be confirmed";
+"result.autofill.save_failed_delivery_indeterminate" = "Saving to the Keychain failed, and delivery to the requester could not be confirmed";
+"result.autofill.save_and_delivery_indeterminate" = "Neither the Keychain save result nor delivery to the requester could be confirmed";
+"result.not_approved" = "Not approved";
+"result.approval_indeterminate" = "The approval result could not be confirmed";

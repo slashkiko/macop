@@ -6,6 +6,11 @@
     <string>ja</string>
     <key>CFBundleExecutable</key>
     <string>MacopAuth</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>ja</string>
+        <string>en</string>
+    </array>
     <key>CFBundleIdentifier</key>
     <string>io.github.slashkiko.macop.auth</string>
     <key>CFBundleInfoDictionaryVersion</key>

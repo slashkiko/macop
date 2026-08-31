@@ -1,0 +1,2 @@
+/* Japanese source strings are supplied as the fallback at each call site. */
+"auth.action.approve_touch_or_watch" = "Touch IDまたはApple Watchで承認";

@@ -110,6 +110,13 @@ MACOP_INSTALL_TEST_MODE=1 bash scripts/build-install.sh \
 test -x "$bin_dir/macop"
 test -x "$bin_dir/macop-agent"
 test -x "$bin_dir/MacopAuth.app/Contents/MacOS/MacopAuth"
+for language in ja en; do
+  strings_file="$bin_dir/MacopAuth.app/Contents/Resources/$language.lproj/Localizable.strings"
+  test -f "$strings_file"
+  plutil -lint "$strings_file" >/dev/null
+done
+test "$(plutil -extract 'CFBundleLocalizations.0' raw "$bin_dir/MacopAuth.app/Contents/Info.plist")" = "ja"
+test "$(plutil -extract 'CFBundleLocalizations.1' raw "$bin_dir/MacopAuth.app/Contents/Info.plist")" = "en"
 test -f "$bin_dir/macop-install-manifest.json"
 grep -Fqx '  "broker_protocol_version": 9,' "$bin_dir/macop-install-manifest.json"
 test -L "$bin_dir/op"

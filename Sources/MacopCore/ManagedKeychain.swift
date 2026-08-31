@@ -540,21 +540,45 @@ public struct PasswordAutoFillCompletionPresentation: Sendable, Equatable {
             && (saveStatus == .saved || saveStatus == .notRequested)
         self.message = switch (saveStatus, delivery) {
         case (.saved, .delivered):
-            "Keychainに保存し、要求元へ資格情報を渡しました"
+            PresentationLocalization.text(
+                "result.autofill.saved_and_delivered",
+                fallback: "Keychainに保存し、要求元へ資格情報を渡しました"
+            )
         case (.notRequested, .delivered):
-            "Keychainには保存せず、要求元へ資格情報を渡しました"
+            PresentationLocalization.text(
+                "result.autofill.delivered_without_save",
+                fallback: "Keychainには保存せず、要求元へ資格情報を渡しました"
+            )
         case (.failed, .delivered):
-            "Keychainへの保存に失敗しました。要求元は資格情報を使用しません"
+            PresentationLocalization.text(
+                "result.autofill.save_failed_not_delivered",
+                fallback: "Keychainへの保存に失敗しました。要求元は資格情報を使用しません"
+            )
         case (.indeterminate, .delivered):
-            "Keychainへの保存結果を確認できません。要求元は資格情報を使用しません"
+            PresentationLocalization.text(
+                "result.autofill.save_indeterminate_not_delivered",
+                fallback: "Keychainへの保存結果を確認できません。要求元は資格情報を使用しません"
+            )
         case (.saved, .unknown):
-            "Keychainに保存しました。要求元への資格情報の受け渡しは確認できません"
+            PresentationLocalization.text(
+                "result.autofill.saved_delivery_indeterminate",
+                fallback: "Keychainに保存しました。要求元への資格情報の受け渡しは確認できません"
+            )
         case (.notRequested, .unknown):
-            "Keychainには保存していません。要求元への資格情報の受け渡しは確認できません"
+            PresentationLocalization.text(
+                "result.autofill.not_saved_delivery_indeterminate",
+                fallback: "Keychainには保存していません。要求元への資格情報の受け渡しは確認できません"
+            )
         case (.failed, .unknown):
-            "Keychainへの保存に失敗しました。要求元への結果通知は確認できません"
+            PresentationLocalization.text(
+                "result.autofill.save_failed_delivery_indeterminate",
+                fallback: "Keychainへの保存に失敗しました。要求元への結果通知は確認できません"
+            )
         case (.indeterminate, .unknown):
-            "Keychainへの保存結果と、要求元への結果通知を確認できません"
+            PresentationLocalization.text(
+                "result.autofill.save_and_delivery_indeterminate",
+                fallback: "Keychainへの保存結果と、要求元への結果通知を確認できません"
+            )
         }
     }
 }
@@ -565,13 +589,16 @@ public struct PasswordAutoFillRejectionPresentation: Sendable, Equatable {
 
     public init(status: AuthBrokerApprovalStatus, delivery: PasswordAutoFillResponseDelivery) {
         let decision = switch status {
-        case .cancelled: "キャンセルしました"
-        case .denied: "承認しませんでした"
-        case .approved: "承認結果を確認できません"
+        case .cancelled: PresentationLocalization.text("common.cancelled", fallback: "キャンセルしました")
+        case .denied: PresentationLocalization.text("result.not_approved", fallback: "承認しませんでした")
+        case .approved: PresentationLocalization.text("result.approval_indeterminate", fallback: "承認結果を確認できません")
         }
         self.message = delivery == .delivered
             ? decision
-            : decision + "。要求元への結果通知は確認できません"
+            : decision + PresentationLocalization.text(
+                "result.delivery_unconfirmed_suffix",
+                fallback: "。要求元への結果通知は確認できません"
+            )
     }
 }
 

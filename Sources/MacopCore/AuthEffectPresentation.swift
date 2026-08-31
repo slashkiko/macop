@@ -22,25 +22,59 @@ public struct ManagedKeychainEffectPresentation: Sendable, Equatable {
         outcome: ManagedKeychainEffectOutcome,
         delivery: AuthEffectResponseDelivery
     ) {
-        let action = updating ? "更新" : "登録"
+        let action = updating
+            ? PresentationLocalization.text("managed.action.update", fallback: "更新")
+            : PresentationLocalization.text("managed.action.add", fallback: "登録")
         self.isSuccess = outcome == .committed && delivery == .delivered
         self.message = switch (outcome, delivery) {
         case (.notStarted, _):
-            "Keychain項目の\(action)要求を受信できませんでした。Keychainは変更していません"
+            PresentationLocalization.format(
+                "result.keychain.mutation_not_received",
+                fallback: "Keychain項目の%@要求を受信できませんでした。Keychainは変更していません",
+                action
+            )
         case (.committed, .delivered):
-            "Keychain項目を\(action)しました"
+            PresentationLocalization.format(
+                "result.keychain.mutation_completed",
+                fallback: "Keychain項目を%@しました",
+                action
+            )
         case (.committed, .unknown):
-            "Keychain項目を\(action)しました。要求元への結果通知は確認できません"
+            PresentationLocalization.format(
+                "result.keychain.mutation_completed_delivery_indeterminate",
+                fallback: "Keychain項目を%@しました。要求元への結果通知は確認できません",
+                action
+            )
         case (.failed, .delivered):
-            "Keychain項目の\(action)に失敗しました"
+            PresentationLocalization.format(
+                "result.keychain.mutation_failed",
+                fallback: "Keychain項目の%@に失敗しました",
+                action
+            )
         case (.failed, .unknown):
-            "Keychain項目の\(action)に失敗しました。要求元への結果通知は確認できません"
+            PresentationLocalization.format(
+                "result.keychain.mutation_failed_delivery_indeterminate",
+                fallback: "Keychain項目の%@に失敗しました。要求元への結果通知は確認できません",
+                action
+            )
         case (.indeterminate, .delivered):
-            "Keychain項目の\(action)結果を確認できません"
+            PresentationLocalization.format(
+                "result.keychain.mutation_indeterminate",
+                fallback: "Keychain項目の%@結果を確認できません",
+                action
+            )
         case (.indeterminate, .unknown):
-            "Keychain項目の\(action)結果と、要求元への結果通知を確認できません"
+            PresentationLocalization.format(
+                "result.keychain.mutation_and_delivery_indeterminate",
+                fallback: "Keychain項目の%@結果と、要求元への結果通知を確認できません",
+                action
+            )
         case (_, .notAttempted):
-            "Keychain項目の\(action)結果を要求元へ通知できませんでした"
+            PresentationLocalization.format(
+                "result.keychain.mutation_delivery_failed",
+                fallback: "Keychain項目の%@結果を要求元へ通知できませんでした",
+                action
+            )
         }
     }
 }
@@ -70,41 +104,102 @@ public struct SSHSigningEffectPresentation: Sendable, Equatable {
         outcome: SSHSigningEffectOutcome,
         delivery: AuthEffectResponseDelivery
     ) {
-        let subject = operation == .gitSSHSign ? "Git SSH署名" : "SSH署名"
+        let subject = operation == .gitSSHSign
+            ? PresentationLocalization.text("purpose.git_ssh_signing", fallback: "Git SSH署名")
+            : PresentationLocalization.text("purpose.ssh_signing", fallback: "SSH署名")
         self.isSuccess = outcome == .signed && delivery == .delivered
         self.message = switch (outcome, delivery) {
         case (.noSignatureRequested, _):
-            "SSH鍵の使用を許可しましたが、署名要求は受信しませんでした"
+            PresentationLocalization.text(
+                "result.signing.no_request_received",
+                fallback: "SSH鍵の使用を許可しましたが、署名要求は受信しませんでした"
+            )
         case (.requesterInvalid, .delivered):
-            "\(subject)の要求元を再検証できませんでした。署名は実行していません"
+            PresentationLocalization.format(
+                "result.signing.requester_invalid",
+                fallback: "%@の要求元を再検証できませんでした。署名は実行していません",
+                subject
+            )
         case (.requesterInvalid, .unknown):
-            "\(subject)の要求元を再検証できませんでした。署名は実行していません。要求元への結果通知は確認できません"
+            PresentationLocalization.format(
+                "result.signing.requester_invalid_delivery_indeterminate",
+                fallback: "%@の要求元を再検証できませんでした。署名は実行していません。要求元への結果通知は確認できません",
+                subject
+            )
         case (.requesterInvalid, .notAttempted):
-            "\(subject)の要求元を再検証できませんでした。署名は実行していません。結果は返していません"
+            PresentationLocalization.format(
+                "result.signing.requester_invalid_not_returned",
+                fallback: "%@の要求元を再検証できませんでした。署名は実行していません。結果は返していません",
+                subject
+            )
         case (.signerUnavailable, .delivered):
-            "\(subject)のSecure Enclave署名鍵を準備できませんでした。署名は実行していません"
+            PresentationLocalization.format(
+                "result.signing.key_unavailable",
+                fallback: "%@のSecure Enclave署名鍵を準備できませんでした。署名は実行していません",
+                subject
+            )
         case (.signerUnavailable, .unknown):
-            "\(subject)のSecure Enclave署名鍵を準備できませんでした。署名は実行していません。要求元への結果通知は確認できません"
+            PresentationLocalization.format(
+                "result.signing.key_unavailable_delivery_indeterminate",
+                fallback: "%@のSecure Enclave署名鍵を準備できませんでした。署名は実行していません。要求元への結果通知は確認できません",
+                subject
+            )
         case (.signerUnavailable, .notAttempted):
-            "\(subject)のSecure Enclave署名鍵を準備できませんでした。署名は実行していません。結果は返していません"
+            PresentationLocalization.format(
+                "result.signing.key_unavailable_not_returned",
+                fallback: "%@のSecure Enclave署名鍵を準備できませんでした。署名は実行していません。結果は返していません",
+                subject
+            )
         case (.identityMismatch, .delivered):
-            "\(subject)の承認済み署名鍵が一致しませんでした。署名は実行していません"
+            PresentationLocalization.format(
+                "result.signing.identity_mismatch",
+                fallback: "%@の承認済み署名鍵が一致しませんでした。署名は実行していません",
+                subject
+            )
         case (.identityMismatch, .unknown):
-            "\(subject)の承認済み署名鍵が一致しませんでした。署名は実行していません。要求元への結果通知は確認できません"
+            PresentationLocalization.format(
+                "result.signing.identity_mismatch_delivery_indeterminate",
+                fallback: "%@の承認済み署名鍵が一致しませんでした。署名は実行していません。要求元への結果通知は確認できません",
+                subject
+            )
         case (.identityMismatch, .notAttempted):
-            "\(subject)の承認済み署名鍵が一致しませんでした。署名は実行していません。結果は返していません"
+            PresentationLocalization.format(
+                "result.signing.identity_mismatch_not_returned",
+                fallback: "%@の承認済み署名鍵が一致しませんでした。署名は実行していません。結果は返していません",
+                subject
+            )
         case (.signatureFailed, .delivered):
-            "\(subject)のSecure Enclave署名処理に失敗しました。署名結果は返していません"
+            PresentationLocalization.format(
+                "result.signing.failed",
+                fallback: "%@のSecure Enclave署名処理に失敗しました。署名結果は返していません",
+                subject
+            )
         case (.signatureFailed, .unknown):
-            "\(subject)のSecure Enclave署名処理に失敗しました。署名結果は返していません。要求元への結果通知は確認できません"
+            PresentationLocalization.format(
+                "result.signing.failed_delivery_indeterminate",
+                fallback: "%@のSecure Enclave署名処理に失敗しました。署名結果は返していません。要求元への結果通知は確認できません",
+                subject
+            )
         case (.signatureFailed, .notAttempted):
-            "\(subject)のSecure Enclave署名処理に失敗しました。署名結果は返していません"
+            PresentationLocalization.format(
+                "result.signing.failed",
+                fallback: "%@のSecure Enclave署名処理に失敗しました。署名結果は返していません",
+                subject
+            )
         case (.signed, .delivered):
-            "\(subject)を完了しました"
+            PresentationLocalization.format("result.signing.completed", fallback: "%@を完了しました", subject)
         case (.signed, .unknown):
-            "\(subject)は完了しましたが、要求元への署名結果の受け渡しは確認できません"
+            PresentationLocalization.format(
+                "result.signing.completed_delivery_indeterminate",
+                fallback: "%@は完了しましたが、要求元への署名結果の受け渡しは確認できません",
+                subject
+            )
         case (.signed, .notAttempted):
-            "\(subject)は完了しましたが、署名結果は返していません"
+            PresentationLocalization.format(
+                "result.signing.completed_not_returned",
+                fallback: "%@は完了しましたが、署名結果は返していません",
+                subject
+            )
         }
     }
 }

@@ -6,6 +6,27 @@ import MacopCore
 import Security
 import SwiftUI
 
+private enum MacopAuthL10n {
+    static func text(_ key: String, fallback: String) -> String {
+        Bundle.main.localizedString(forKey: key, value: fallback, table: nil)
+    }
+
+    static func format(_ key: String, fallback: String, _ arguments: CVarArg...) -> String {
+        String(format: self.text(key, fallback: fallback), locale: Locale.current, arguments: arguments)
+    }
+
+    static func purpose(_ purpose: AuthBrokerPurpose) -> String {
+        switch purpose {
+        case .sshSession:
+            self.text("purpose.ssh_session", fallback: purpose.displayName)
+        case .gitSSHSign:
+            self.text("purpose.git_ssh_signing", fallback: purpose.displayName)
+        default:
+            purpose.displayName
+        }
+    }
+}
+
 @main
 struct MacopAuthApplication: App {
     @StateObject private var coordinator: AuthApprovalCoordinator
@@ -102,7 +123,10 @@ private final class AuthApprovalCoordinator: NSObject, ObservableObject {
         self.started = true
         self.resizeWindow(for: self.state)
         guard let socketPath = self.socketPath else {
-            self.state = .failed("MacopAuthはmacopから起動してください。")
+            self.state = .failed(MacopAuthL10n.text(
+                "auth.launch.from_macop",
+                fallback: "MacopAuthはmacopから起動してください。"
+            ))
             return
         }
         Task.detached { [weak self] in
@@ -110,7 +134,10 @@ private final class AuthApprovalCoordinator: NSObject, ObservableObject {
             do {
                 try await AuthBrokerAppServer.run(socketPath: socketPath, coordinator: self, probe: self.probe)
             } catch {
-                await self.fail("承認要求を安全に検証できませんでした。")
+                await self.fail(MacopAuthL10n.text(
+                    "auth.request.verification_failed",
+                    fallback: "承認要求を安全に検証できませんでした。"
+                ))
                 await self.terminateSoon()
             }
         }
@@ -122,8 +149,11 @@ private final class AuthApprovalCoordinator: NSObject, ObservableObject {
     ) async -> ApprovalOutcome {
         await withCheckedContinuation { continuation in
             let context = LAContext()
-            context.localizedCancelTitle = "キャンセル"
-            context.localizedFallbackTitle = "パスワードを使用"
+            context.localizedCancelTitle = MacopAuthL10n.text("common.cancel", fallback: "キャンセル")
+            context.localizedFallbackTitle = MacopAuthL10n.text(
+                "auth.action.use_password",
+                fallback: "パスワードを使用"
+            )
             let attemptID = UUID()
             self.continuation = continuation
             self.state = .pending(PendingApproval(
@@ -217,12 +247,17 @@ private final class AuthApprovalCoordinator: NSObject, ObservableObject {
         peer: AuthBrokerVerifiedPeer
     ) async -> Bool {
         let entries = document.clients.enumerated().map { index, entry in
-            "\(index + 1). 選択したパス: \(entry.selectorPath)\n"
-                + "   実際の Git: \(entry.resolvedPath)\n"
-                + "   バージョン: \(entry.version)\n"
-                + "   署名: \(entry.signatureKind)\n"
-                + "   識別子: \(entry.identifier)\n"
-                + "   コードハッシュ: \(entry.cdHash)"
+            MacopAuthL10n.format(
+                "trust.entry.selected_path",
+                fallback: "%d. 選択したパス: %@\n",
+                index + 1,
+                entry.selectorPath
+            )
+                + MacopAuthL10n.format("trust.entry.resolved_git", fallback: "   実際の Git: %@\n", entry.resolvedPath)
+                + MacopAuthL10n.format("trust.entry.version", fallback: "   バージョン: %@\n", entry.version)
+                + MacopAuthL10n.format("trust.entry.signature", fallback: "   署名: %@\n", entry.signatureKind)
+                + MacopAuthL10n.format("trust.entry.identifier", fallback: "   識別子: %@\n", entry.identifier)
+                + MacopAuthL10n.format("trust.entry.code_hash", fallback: "   コードハッシュ: %@", entry.cdHash)
         }.joined(separator: "\n\n")
         let presentation = GitClientTrustMutationPresentation(
             operation: operation,
@@ -231,7 +266,12 @@ private final class AuthApprovalCoordinator: NSObject, ObservableObject {
         let alert = NSAlert()
         alert.messageText = presentation.title
         let requester = peer.requestingApplication ?? peer.peerIdentity
-        alert.informativeText = "要求元: \(requester.identifier)\n\(requester.canonicalPath)\n\n"
+        alert.informativeText = MacopAuthL10n.format(
+            "trust.requester",
+            fallback: "要求元: %@\n%@\n\n",
+            requester.identifier,
+            requester.canonicalPath
+        )
             + "\(presentation.changeDescription)\n"
             + "\(presentation.resultDescription)\n"
             + "\(presentation.listIntroduction)"
@@ -239,7 +279,7 @@ private final class AuthApprovalCoordinator: NSObject, ObservableObject {
         alert.icon = NSImage(systemSymbolName: "lock.shield", accessibilityDescription: "Macop")
         alert.accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 1))
         alert.addButton(withTitle: presentation.confirmationTitle)
-        alert.addButton(withTitle: "キャンセル")
+        alert.addButton(withTitle: MacopAuthL10n.text("common.cancel", fallback: "キャンセル"))
         guard alert.runModal() == .alertFirstButtonReturn else { return false }
         let context = LAContext()
         do {
@@ -277,7 +317,7 @@ private final class AuthApprovalCoordinator: NSObject, ObservableObject {
         guard case let .pending(current) = self.state,
               current.attemptID == pending.attemptID else { return }
         let context = LAContext()
-        context.localizedCancelTitle = "キャンセル"
+        context.localizedCancelTitle = MacopAuthL10n.text("common.cancel", fallback: "キャンセル")
         let replacement = PendingApproval(
             request: pending.request,
             peer: pending.peer,
@@ -426,8 +466,8 @@ private final class AuthApprovalCoordinator: NSObject, ObservableObject {
         self.continuation = nil
         self.state = switch status {
         case .approved: .processing
-        case .cancelled: .cancelled("キャンセルしました")
-        case .denied: .denied("許可されませんでした")
+        case .cancelled: .cancelled(MacopAuthL10n.text("common.cancelled", fallback: "キャンセルしました"))
+        case .denied: .denied(MacopAuthL10n.text("common.not_allowed", fallback: "許可されませんでした"))
         }
         continuation.resume(returning: ApprovalOutcome(
             status: status,
@@ -441,31 +481,56 @@ private final class AuthApprovalCoordinator: NSObject, ObservableObject {
     private func localizedReason(for request: AuthBrokerApprovalRequest) -> String {
         switch request.operation {
         case .sshSession:
-            "Secure EnclaveのSSH鍵を使用します。"
+            MacopAuthL10n.text("auth.reason.ssh_session", fallback: "Secure EnclaveのSSH鍵を使用します。")
         case .managedKeychainRead:
-            "macop管理のKeychain項目を読み取ります。"
+            MacopAuthL10n.text("auth.reason.keychain_read", fallback: "macop管理のKeychain項目を読み取ります。")
         case .sshSign:
-            "Secure EnclaveのSSH鍵で署名します。"
+            MacopAuthL10n.text("auth.reason.ssh_sign", fallback: "Secure EnclaveのSSH鍵で署名します。")
         case .managedKeychainImport:
-            request.purpose.concernsOTP
-                ? "OTP seedをTouch ID、Apple Watch、またはMacのログインパスワードで保護して登録します。"
-                : "Touch ID、Apple Watch、またはMacのログインパスワードで保護するKeychain項目を登録します。"
+            if request.purpose.concernsOTP {
+                MacopAuthL10n.text(
+                    "auth.reason.otp_import",
+                    fallback: "OTP seedをTouch ID、Apple Watch、またはMacのログインパスワードで保護して登録します。"
+                )
+            } else {
+                MacopAuthL10n.text(
+                    "auth.reason.keychain_import",
+                    fallback: "Touch ID、Apple Watch、またはMacのログインパスワードで保護するKeychain項目を登録します。"
+                )
+            }
         case .managedKeychainUpdate:
-            request.purpose.concernsOTP
-                ? "OTP seedをTouch ID、Apple Watch、またはMacのログインパスワードで更新します。"
-                : "macop管理のKeychain項目を更新します。"
+            if request.purpose.concernsOTP {
+                MacopAuthL10n.text(
+                    "auth.reason.otp_update",
+                    fallback: "OTP seedをTouch ID、Apple Watch、またはMacのログインパスワードで更新します。"
+                )
+            } else {
+                MacopAuthL10n.text("auth.reason.keychain_update", fallback: "macop管理のKeychain項目を更新します。")
+            }
         case .passwordAutoFill:
-            "Passwordsから選んだ資格情報をmacopで使用します。"
+            MacopAuthL10n.text(
+                "auth.reason.password_autofill",
+                fallback: "Passwordsから選んだ資格情報をmacopで使用します。"
+            )
         case .managedKeychainDelete:
-            "macop管理のKeychain項目を削除します。"
+            MacopAuthL10n.text("auth.reason.keychain_delete", fallback: "macop管理のKeychain項目を削除します。")
         case .gitSSHSign:
-            "Secure EnclaveのSSH鍵でGit commitまたはtagへ署名します。"
+            MacopAuthL10n.text(
+                "auth.reason.git_ssh_sign",
+                fallback: "Secure EnclaveのSSH鍵でGit commitまたはtagへ署名します。"
+            )
         case .directSSHKeyCreate:
-            "Touch ID、Apple Watch、またはMacのログインパスワードで保護するSecure Enclave SSH鍵を作成します。"
+            MacopAuthL10n.text(
+                "auth.reason.ssh_key_create",
+                fallback: "Touch ID、Apple Watch、またはMacのログインパスワードで保護するSecure Enclave SSH鍵を作成します。"
+            )
         case .directSSHKeyDelete:
-            "Secure Enclave SSH鍵を削除します。"
+            MacopAuthL10n.text("auth.reason.ssh_key_delete", fallback: "Secure Enclave SSH鍵を削除します。")
         case .sshMigrationTransition:
-            "Secure Enclave SSH鍵の移行状態を変更します。"
+            MacopAuthL10n.text(
+                "auth.reason.ssh_migration",
+                fallback: "Secure Enclave SSH鍵の移行状態を変更します。"
+            )
         }
     }
 
@@ -959,7 +1024,10 @@ private enum AuthBrokerAppServer {
                         await coordinator.complete(presentation.message, isSuccess: false)
                     } else {
                         await coordinator.complete(
-                            "資格情報の承認結果と、要求元への結果通知を確認できません",
+                            MacopAuthL10n.text(
+                                "result.credentials.approval_and_delivery_indeterminate",
+                                fallback: "資格情報の承認結果と、要求元への結果通知を確認できません"
+                            ),
                             isSuccess: false
                         )
                     }
@@ -993,7 +1061,10 @@ private enum AuthBrokerAppServer {
                     await coordinator.complete(presentation.message, isSuccess: false)
                 } else {
                     await coordinator.complete(
-                        completion.message + "。要求元への結果通知は確認できません",
+                        completion.message + MacopAuthL10n.text(
+                            "result.delivery_unconfirmed_suffix",
+                            fallback: "。要求元への結果通知は確認できません"
+                        ),
                         isSuccess: false
                     )
                 }
@@ -1023,7 +1094,13 @@ private enum AuthBrokerAppServer {
                 )
                 await coordinator.complete(presentation.message, isSuccess: presentation.isSuccess)
             } else {
-                await coordinator.complete("資格情報の承認結果を確認できません", isSuccess: false)
+                await coordinator.complete(
+                    MacopAuthL10n.text(
+                        "result.credentials.approval_indeterminate",
+                        fallback: "資格情報の承認結果を確認できません"
+                    ),
+                    isSuccess: false
+                )
             }
         case .approvedPhaseTwo:
             await coordinator.beginProcessing()
@@ -1159,7 +1236,13 @@ private enum AuthBrokerAppServer {
             try self.validateSSHMigrationTransition(received, approval: approval)
             request = received
         } catch {
-            await coordinator.complete("SSH鍵の移行要求を検証できませんでした", isSuccess: false)
+            await coordinator.complete(
+                MacopAuthL10n.text(
+                    "result.ssh_migration.request_invalid",
+                    fallback: "SSH鍵の移行要求を検証できませんでした"
+                ),
+                isSuccess: false
+            )
             return
         }
 
@@ -1226,11 +1309,25 @@ private enum AuthBrokerAppServer {
             try self.validateRoot(approval)
             try AuthBrokerSocketIO.writeMessage(.sshMigrationResponse(response), to: client, timeout: 30)
             await coordinator.complete(
-                response.status == .success ? "SSH鍵の移行状態を更新しました" : "SSH鍵の移行状態を更新できませんでした",
+                response.status == .success
+                    ? MacopAuthL10n.text(
+                        "result.ssh_migration.updated",
+                        fallback: "SSH鍵の移行状態を更新しました"
+                    )
+                    : MacopAuthL10n.text(
+                        "result.ssh_migration.update_failed",
+                        fallback: "SSH鍵の移行状態を更新できませんでした"
+                    ),
                 isSuccess: response.status == .success
             )
         } catch {
-            await coordinator.complete("移行結果を要求元へ通知できませんでした", isSuccess: false)
+            await coordinator.complete(
+                MacopAuthL10n.text(
+                    "result.ssh_migration.delivery_failed",
+                    fallback: "移行結果を要求元へ通知できませんでした"
+                ),
+                isSuccess: false
+            )
         }
     }
 
@@ -1389,7 +1486,13 @@ private enum AuthBrokerAppServer {
             try self.validateDirectSSHKeyMutation(received, approval: approval)
             request = received
         } catch {
-            await coordinator.complete("SSH鍵の操作要求を検証できませんでした", isSuccess: false)
+            await coordinator.complete(
+                MacopAuthL10n.text(
+                    "result.ssh_key.request_invalid",
+                    fallback: "SSH鍵の操作要求を検証できませんでした"
+                ),
+                isSuccess: false
+            )
             return
         }
 
@@ -1464,15 +1567,28 @@ private enum AuthBrokerAppServer {
             try AuthBrokerSocketIO.writeMessage(.directSSHKeyResponse(response), to: client, timeout: 30)
             let success = response.status == .success
             let message = switch (request.operation, response.status) {
-            case (.create, .success): "Secure Enclave SSH鍵を作成しました"
-            case (.delete, .success): "Secure Enclave SSH鍵を削除しました"
-            case (_, .indeterminate): "SSH鍵の操作結果を確定できません。再実行前に一覧を確認してください"
-            default: "Secure Enclave SSH鍵を操作できませんでした"
+            case (.create, .success):
+                MacopAuthL10n.text("result.ssh_key.created", fallback: "Secure Enclave SSH鍵を作成しました")
+            case (.delete, .success):
+                MacopAuthL10n.text("result.ssh_key.deleted", fallback: "Secure Enclave SSH鍵を削除しました")
+            case (_, .indeterminate):
+                MacopAuthL10n.text(
+                    "result.ssh_key.indeterminate",
+                    fallback: "SSH鍵の操作結果を確定できません。再実行前に一覧を確認してください"
+                )
+            default:
+                MacopAuthL10n.text(
+                    "result.ssh_key.operation_failed",
+                    fallback: "Secure Enclave SSH鍵を操作できませんでした"
+                )
             }
             await coordinator.complete(message, isSuccess: success)
         } catch {
             await coordinator.complete(
-                "SSH鍵の操作は完了した可能性がありますが、要求元への通知を確認できません",
+                MacopAuthL10n.text(
+                    "result.ssh_key.operation_delivery_indeterminate",
+                    fallback: "SSH鍵の操作は完了した可能性がありますが、要求元への通知を確認できません"
+                ),
                 isSuccess: false
             )
         }
@@ -1590,7 +1706,10 @@ private enum AuthBrokerAppServer {
                 generation: document.generation,
                 status: .approved
             )
-            await coordinator.complete("Gitクライアントの信頼設定はすでに更新されています")
+            await coordinator.complete(MacopAuthL10n.text(
+                "result.trust.already_updated",
+                fallback: "Gitクライアントの信頼設定はすでに更新されています"
+            ))
             return
         }
         // swiftformat:enable wrapMultilineStatementBraces
@@ -1607,7 +1726,10 @@ private enum AuthBrokerAppServer {
                 status: .generationConflict
             )
             await coordinator.complete(
-                "信頼設定は別の変更によって更新されました。内容を確認してもう一度実行してください",
+                MacopAuthL10n.text(
+                    "result.trust.concurrent_change",
+                    fallback: "信頼設定は別の変更によって更新されました。内容を確認してもう一度実行してください"
+                ),
                 isSuccess: false
             )
             return
@@ -1625,7 +1747,10 @@ private enum AuthBrokerAppServer {
             )
             await coordinator.completeRejection(
                 .cancelled,
-                message: "Gitクライアントの信頼設定変更をキャンセルしました"
+                message: MacopAuthL10n.text(
+                    "result.trust.cancelled",
+                    fallback: "Gitクライアントの信頼設定変更をキャンセルしました"
+                )
             )
             return
         }
@@ -1643,7 +1768,10 @@ private enum AuthBrokerAppServer {
                 status: .generationConflict
             )
             await coordinator.complete(
-                "認証中に信頼設定が変更されました。内容を確認してもう一度実行してください",
+                MacopAuthL10n.text(
+                    "result.trust.changed_during_authentication",
+                    fallback: "認証中に信頼設定が変更されました。内容を確認してもう一度実行してください"
+                ),
                 isSuccess: false
             )
             return
@@ -1654,7 +1782,10 @@ private enum AuthBrokerAppServer {
             generation: document.generation,
             status: .approved
         )
-        await coordinator.complete("Gitクライアントの信頼設定を更新しました")
+        await coordinator.complete(MacopAuthL10n.text(
+            "result.trust.updated",
+            fallback: "Gitクライアントの信頼設定を更新しました"
+        ))
     }
 
     private static func validateTrustMutationPeer(_ peer: AuthBrokerVerifiedPeer) throws {
@@ -1689,37 +1820,43 @@ private enum AuthBrokerAppServer {
         guard resultStatus == errSecSuccess else {
             let message = switch operation {
             case .managedKeychainRead:
-                "Keychain項目を読み取れませんでした"
+                MacopAuthL10n.text("result.keychain.read_failed", fallback: "Keychain項目を読み取れませんでした")
             case .managedKeychainDelete:
-                "Keychain項目の削除に失敗しました"
+                MacopAuthL10n.text("result.keychain.delete_failed", fallback: "Keychain項目の削除に失敗しました")
             case .directSSHKeyCreate, .directSSHKeyDelete, .sshMigrationTransition:
-                "Secure Enclave SSH鍵の操作に失敗しました"
+                MacopAuthL10n.text(
+                    "result.ssh_key.operation_failed_after_approval",
+                    fallback: "Secure Enclave SSH鍵の操作に失敗しました"
+                )
             default:
-                "許可後の処理に失敗しました"
+                MacopAuthL10n.text("result.post_approval_failed", fallback: "許可後の処理に失敗しました")
             }
             return (message, false)
         }
         let message = switch operation {
         case .sshSession, .sshSign:
-            "SSH鍵の使用を許可しました"
+            MacopAuthL10n.text("result.ssh_key.use_allowed", fallback: "SSH鍵の使用を許可しました")
         case .managedKeychainRead:
-            "Keychain項目を読み取りました"
+            MacopAuthL10n.text("result.keychain.read", fallback: "Keychain項目を読み取りました")
         case .managedKeychainImport:
-            "Keychain項目の登録を許可しました"
+            MacopAuthL10n.text("result.keychain.add_allowed", fallback: "Keychain項目の登録を許可しました")
         case .managedKeychainUpdate:
-            "Keychain項目の更新を許可しました"
+            MacopAuthL10n.text("result.keychain.update_allowed", fallback: "Keychain項目の更新を許可しました")
         case .managedKeychainDelete:
-            "Keychainから削除しました"
+            MacopAuthL10n.text("result.keychain.deleted", fallback: "Keychainから削除しました")
         case .gitSSHSign:
-            "Git SSH署名を許可しました"
+            MacopAuthL10n.text("result.git_ssh_signing.allowed", fallback: "Git SSH署名を許可しました")
         case .passwordAutoFill:
-            "資格情報の使用を許可しました"
+            MacopAuthL10n.text("result.credentials.use_allowed", fallback: "資格情報の使用を許可しました")
         case .directSSHKeyCreate:
-            "Secure Enclave SSH鍵の作成を許可しました"
+            MacopAuthL10n.text("result.ssh_key.create_allowed", fallback: "Secure Enclave SSH鍵の作成を許可しました")
         case .directSSHKeyDelete:
-            "Secure Enclave SSH鍵の削除を許可しました"
+            MacopAuthL10n.text("result.ssh_key.delete_allowed", fallback: "Secure Enclave SSH鍵の削除を許可しました")
         case .sshMigrationTransition:
-            "Secure Enclave SSH鍵の移行状態変更を許可しました"
+            MacopAuthL10n.text(
+                "result.ssh_migration.change_allowed",
+                fallback: "Secure Enclave SSH鍵の移行状態変更を許可しました"
+            )
         }
         return (message, true)
     }
@@ -1907,7 +2044,10 @@ private struct AuthApprovalView: View {
         Group {
             switch self.coordinator.state {
             case .starting:
-                ProgressView("承認要求を確認しています…")
+                ProgressView(MacopAuthL10n.text(
+                    "auth.request.verifying",
+                    fallback: "承認要求を確認しています…"
+                ))
             case let .pending(pending):
                 Group {
                     if pending.request.operation == .passwordAutoFill {
@@ -1947,7 +2087,7 @@ private struct AuthApprovalView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             case .processing:
-                ProgressView("処理しています…")
+                ProgressView(MacopAuthL10n.text("common.processing", fallback: "処理しています…"))
             case let .completed(completion):
                 ResultView(
                     kind: completion.isSuccess ? .success : .warning,
@@ -1981,77 +2121,110 @@ private struct PasswordAutoFillRequestView: View {
                     .resizable()
                     .frame(width: 52, height: 52)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("\(self.requesterName) が資格情報を要求しています")
-                        .font(.headline)
-                    Label("検証済み", systemImage: "checkmark.seal.fill")
-                        .font(.caption)
-                        .foregroundStyle(.green)
+                    Text(MacopAuthL10n.format(
+                        "auth.header.credentials",
+                        fallback: "%@ が資格情報を要求しています",
+                        self.requesterName
+                    ))
+                    .font(.headline)
+                    Label(
+                        MacopAuthL10n.text("common.verified", fallback: "検証済み"),
+                        systemImage: "checkmark.seal.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.green)
                 }
                 Spacer()
             }
             Divider()
             VStack(alignment: .leading, spacing: 8) {
-                Text("Passwordsから選択")
+                Text(MacopAuthL10n.text("autofill.title", fallback: "Passwordsから選択"))
                     .font(.title3.weight(.semibold))
-                Text("パスワード欄をクリックし、システムのAutoFill候補から使用するログイン情報を選んでください。")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                Text(MacopAuthL10n.text(
+                    "autofill.instruction",
+                    fallback: "パスワード欄をクリックし、システムのAutoFill候補から使用するログイン情報を選んでください。"
+                ))
+                .font(.callout)
+                .foregroundStyle(.secondary)
             }
             VStack(alignment: .leading, spacing: 12) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("ユーザー名").font(.caption).foregroundStyle(.secondary)
+                    Text(MacopAuthL10n.text("autofill.username", fallback: "ユーザー名"))
+                        .font(.caption).foregroundStyle(.secondary)
                     AutoFillTextField(
                         text: self.$username,
                         placeholder: self.pending.request.keychainAccount,
-                        accessibilityLabel: "ユーザー名",
+                        accessibilityLabel: MacopAuthL10n.text("autofill.username", fallback: "ユーザー名"),
                         contentType: .username,
                         secure: false
                     )
                 }
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("パスワード").font(.caption).foregroundStyle(.secondary)
+                    Text(MacopAuthL10n.text("autofill.password", fallback: "パスワード"))
+                        .font(.caption).foregroundStyle(.secondary)
                     AutoFillTextField(
                         text: self.$password,
-                        placeholder: "Passwordsから選択",
-                        accessibilityLabel: "パスワード",
+                        placeholder: MacopAuthL10n.text("autofill.title", fallback: "Passwordsから選択"),
+                        accessibilityLabel: MacopAuthL10n.text("autofill.password", fallback: "パスワード"),
                         contentType: .password,
                         secure: true
                     )
                 }
             }
             if !self.username.isEmpty, self.username != self.pending.request.keychainAccount {
-                Text("選択したユーザー名が設定済みアカウントと一致しません。")
-                    .font(.caption)
-                    .foregroundStyle(.red)
+                Text(MacopAuthL10n.text(
+                    "autofill.username_mismatch",
+                    fallback: "選択したユーザー名が設定済みアカウントと一致しません。"
+                ))
+                .font(.caption)
+                .foregroundStyle(.red)
             } else if self.username.isEmpty, !self.password.isEmpty {
-                Text("Passwordsがユーザー名を返さなかった場合は、設定済みアカウントを入力して確認してください。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(MacopAuthL10n.text(
+                    "autofill.username_missing",
+                    fallback: "Passwordsがユーザー名を返さなかった場合は、設定済みアカウントを入力して確認してください。"
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            Toggle("macop管理のKeychainにも保存・更新する", isOn: self.$saveToKeychain)
+            Toggle(
+                MacopAuthL10n.text(
+                    "autofill.save_to_keychain",
+                    fallback: "macop管理のKeychainにも保存・更新する"
+                ),
+                isOn: self.$saveToKeychain
+            )
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
-                self.row("サービス", self.pending.request.keychainService)
-                self.row("保存先", self.pending.request.keychainAccount)
-                self.row("操作", self.pending.request.purpose.displayName)
+                self.row("details.service", fallback: "サービス", self.pending.request.keychainService)
+                self.row("details.save_destination", fallback: "保存先", self.pending.request.keychainAccount)
+                self.row("details.operation", fallback: "操作", MacopAuthL10n.purpose(self.pending.request.purpose))
             }
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
             VStack(alignment: .leading, spacing: 12) {
-                Text("資格情報は画面に再表示せず、現在の要求にだけ返します")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(MacopAuthL10n.text(
+                    "autofill.request_only",
+                    fallback: "資格情報は画面に再表示せず、現在の要求にだけ返します"
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 HStack(spacing: 10) {
-                    Button("キャンセル", action: self.cancel)
+                    Button(MacopAuthL10n.text("common.cancel", fallback: "キャンセル"), action: self.cancel)
                         .keyboardShortcut(.cancelAction)
                     Spacer(minLength: 24)
                     HStack(spacing: 10) {
-                        Button("Macのログインパスワード") {
+                        Button(MacopAuthL10n.text(
+                            "auth.action.mac_password",
+                            fallback: "Macのログインパスワード"
+                        )) {
                             self.submit(self.username, self.password, self.saveToKeychain, true)
                             self.username = ""
                             self.password = ""
                         }
-                        Button("Touch IDまたはApple Watch") {
+                        Button(MacopAuthL10n.text(
+                            "auth.action.touch_or_watch",
+                            fallback: "Touch IDまたはApple Watch"
+                        )) {
                             self.submit(self.username, self.password, self.saveToKeychain, false)
                             self.username = ""
                             self.password = ""
@@ -2066,9 +2239,9 @@ private struct PasswordAutoFillRequestView: View {
         }
     }
 
-    private func row(_ label: String, _ value: String) -> some View {
+    private func row(_ key: String, fallback: String, _ value: String) -> some View {
         GridRow {
-            Text(label).foregroundStyle(.secondary)
+            Text(MacopAuthL10n.text(key, fallback: fallback)).foregroundStyle(.secondary)
             Text(value).lineLimit(2).textSelection(.enabled)
         }
     }
@@ -2140,6 +2313,7 @@ private struct AutoFillTextField: NSViewRepresentable {
     }
 }
 
+// swiftlint:disable:next type_body_length
 private struct ApprovalRequestView: View {
     private struct SSHSessionTargetPresentation {
         let application: String
@@ -2165,9 +2339,12 @@ private struct ApprovalRequestView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(self.requestTitle)
                         .font(.headline)
-                    Label("検証済み", systemImage: "checkmark.seal.fill")
-                        .font(.caption)
-                        .foregroundStyle(.green)
+                    Label(
+                        MacopAuthL10n.text("common.verified", fallback: "検証済み"),
+                        systemImage: "checkmark.seal.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.green)
                 }
                 Spacer()
             }
@@ -2175,38 +2352,81 @@ private struct ApprovalRequestView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
                     if self.isManagedKeychainRequest {
-                        self.row("内容", self.managedKeychainAction)
+                        self.row("details.content", fallback: "内容", self.managedKeychainAction)
                         if self.isDeleteAllRequest {
-                            self.row("対象", "macop管理のKeychain項目すべて")
+                            self.row(
+                                "details.target",
+                                fallback: "対象",
+                                MacopAuthL10n.text(
+                                    "managed.target.all_items",
+                                    fallback: "macop管理のKeychain項目すべて"
+                                )
+                            )
                         } else {
-                            self.row("サービス", self.pending.request.keychainService)
-                            self.row("アカウント", self.pending.request.keychainAccount)
+                            self.row("details.service", fallback: "サービス", self.pending.request.keychainService)
+                            self.row("details.account", fallback: "アカウント", self.pending.request.keychainAccount)
                         }
-                        self.row("コマンド", self.pending.request.purpose.displayName)
+                        self.row(
+                            "details.command",
+                            fallback: "コマンド",
+                            MacopAuthL10n.purpose(self.pending.request.purpose)
+                        )
                     } else if self.isDirectSSHKeyManagementRequest {
-                        self.row("対象", self.directSSHKeyManagementAction)
-                        self.row("鍵", self.pending.request.credentialLabel)
+                        self.row("details.target", fallback: "対象", self.directSSHKeyManagementAction)
+                        self.row("details.key", fallback: "鍵", self.pending.request.credentialLabel)
                         if !self.pending.request.credentialFingerprint.isEmpty {
-                            self.row("フィンガープリント", self.pending.request.credentialFingerprint)
+                            self.row(
+                                "details.fingerprint",
+                                fallback: "フィンガープリント",
+                                self.pending.request.credentialFingerprint
+                            )
                         }
-                        self.row("保護", "Touch ID、Apple Watch、Macのログインパスワード")
-                        self.row("コマンド", self.pending.request.purpose.displayName)
+                        self.row(
+                            "details.protection",
+                            fallback: "保護",
+                            MacopAuthL10n.text(
+                                "auth.protection.device_owner",
+                                fallback: "Touch ID、Apple Watch、Macのログインパスワード"
+                            )
+                        )
+                        self.row(
+                            "details.command",
+                            fallback: "コマンド",
+                            MacopAuthL10n.purpose(self.pending.request.purpose)
+                        )
                     } else {
                         if let target = self.sshSessionTargetPresentation {
-                            self.row("実行対象", target.application)
+                            self.row("details.executable", fallback: "実行対象", target.application)
                         }
-                        self.row("接続先", self.pending.request.host.isEmpty ? "SSHセッション" : self.pending.request.host)
-                        self.row("使用する鍵", self.pending.request.credentialLabel)
-                        self.row("フィンガープリント", self.pending.request.credentialFingerprint)
-                        self.row("操作", self.pending.request.purpose.displayName)
+                        self.row(
+                            "details.destination",
+                            fallback: "接続先",
+                            self.pending.request.host.isEmpty
+                                ? MacopAuthL10n.text("purpose.ssh_session", fallback: "SSHセッション")
+                                : self.pending.request.host
+                        )
+                        self.row("details.key_to_use", fallback: "使用する鍵", self.pending.request.credentialLabel)
+                        self.row(
+                            "details.fingerprint",
+                            fallback: "フィンガープリント",
+                            self.pending.request.credentialFingerprint
+                        )
+                        self.row(
+                            "details.operation",
+                            fallback: "操作",
+                            MacopAuthL10n.purpose(self.pending.request.purpose)
+                        )
                     }
                 }
                 if let target = self.sshSessionTargetPresentation {
-                    DisclosureGroup("技術情報", isExpanded: self.$technicalDetailsExpanded) {
+                    DisclosureGroup(
+                        MacopAuthL10n.text("details.technical", fallback: "技術情報"),
+                        isExpanded: self.$technicalDetailsExpanded
+                    ) {
                         Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
-                            self.row("署名", target.signingAuthority)
-                            self.row("コードハッシュ", target.cdHash)
-                            self.row("検証", target.verification)
+                            self.row("details.signature", fallback: "署名", target.signingAuthority)
+                            self.row("details.code_hash", fallback: "コードハッシュ", target.cdHash)
+                            self.row("details.verification", fallback: "検証", target.verification)
                         }
                         .padding(.top, 8)
                     }
@@ -2226,27 +2446,42 @@ private struct ApprovalRequestView: View {
                         cancel: self.cancel
                     )
                 } else {
-                    LocalAuthenticationView("Touch IDまたはApple Watchで承認", context: self.pending.context)
-                        .controlSize(.regular)
+                    LocalAuthenticationView(
+                        LocalizedStringKey("auth.action.approve_touch_or_watch"),
+                        context: self.pending.context
+                    )
+                    .controlSize(.regular)
                     self.embeddedAuthenticationActions
                 }
             } else {
                 VStack(alignment: .leading, spacing: 10) {
-                    Label("次にmacOSの鍵認証が1回表示されます", systemImage: "lock.shield")
-                        .font(.headline)
+                    Label(
+                        MacopAuthL10n.text(
+                            "auth.ctk.next_prompt",
+                            fallback: "次にmacOSの鍵認証が1回表示されます"
+                        ),
+                        systemImage: "lock.shield"
+                    )
+                    .font(.headline)
                     Text(self.signingAuthenticationDescription)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     HStack {
-                        Text("現在のプロセスと要求内容にだけ有効")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text(MacopAuthL10n.text(
+                            "auth.current_request_only",
+                            fallback: "現在のプロセスと要求内容にだけ有効"
+                        ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         Spacer()
-                        Button("キャンセル", action: self.cancel)
+                        Button(MacopAuthL10n.text("common.cancel", fallback: "キャンセル"), action: self.cancel)
                             .keyboardShortcut(.cancelAction)
                         Button(
-                            "Touch IDまたはMacのログインパスワード認証へ進む",
+                            MacopAuthL10n.text(
+                                "auth.action.continue_ctk",
+                                fallback: "Touch IDまたはMacのログインパスワード認証へ進む"
+                            ),
                             action: self.continueToSystemSigningAuthentication
                         )
                         .buttonStyle(.borderedProminent)
@@ -2259,21 +2494,30 @@ private struct ApprovalRequestView: View {
 
     private var embeddedAuthenticationActions: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("現在のプロセスと要求内容にだけ有効")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text(MacopAuthL10n.text(
+                "auth.current_request_only",
+                fallback: "現在のプロセスと要求内容にだけ有効"
+            ))
+            .font(.caption)
+            .foregroundStyle(.secondary)
             HStack {
-                Button("キャンセル", action: self.cancel)
+                Button(MacopAuthL10n.text("common.cancel", fallback: "キャンセル"), action: self.cancel)
                     .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Macのログインパスワードを使用", action: self.usePassword)
+                Button(
+                    MacopAuthL10n.text(
+                        "auth.action.use_mac_password",
+                        fallback: "Macのログインパスワードを使用"
+                    ),
+                    action: self.usePassword
+                )
             }
         }
     }
 
-    private func row(_ label: String, _ value: String) -> some View {
+    private func row(_ key: String, fallback: String, _ value: String) -> some View {
         GridRow {
-            Text(label).foregroundStyle(.secondary)
+            Text(MacopAuthL10n.text(key, fallback: fallback)).foregroundStyle(.secondary)
             Text(value)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
@@ -2294,37 +2538,57 @@ private struct ApprovalRequestView: View {
     }
 
     private var signingAuthenticationDescription: String {
-        "CTKCardTokenでTouch IDまたはMacのログインパスワードを使用します。"
-            + "このSecure Enclave鍵はApple Watchでは解除できません。"
+        MacopAuthL10n.text(
+            "auth.ctk.description",
+            fallback: "CTKCardTokenでTouch IDまたはMacのログインパスワードを使用します。"
+        )
+            + MacopAuthL10n.text(
+                "auth.ctk.watch_unavailable",
+                fallback: "このSecure Enclave鍵はApple Watchでは解除できません。"
+            )
     }
 
     private var destructiveConfirmationTitle: String {
-        self.isDeleteAllRequest ? "管理項目をすべて削除します" : "この項目を削除します"
+        self.isDeleteAllRequest
+            ? MacopAuthL10n.text("destructive.title.delete_all", fallback: "管理項目をすべて削除します")
+            : MacopAuthL10n.text("destructive.title.delete_item", fallback: "この項目を削除します")
     }
 
     private var destructiveConfirmationMessage: String {
         if self.isDeleteAllRequest {
-            return "macop管理のKeychain項目がすべて削除されます。この操作は元に戻せません。"
+            return MacopAuthL10n.text(
+                "destructive.message.delete_all",
+                fallback: "macop管理のKeychain項目がすべて削除されます。この操作は元に戻せません。"
+            )
         }
         if self.pending.request.purpose == .sshMigrationDeletePrepared {
-            return "外部登録前の準備済みSSH鍵を削除します。この操作は元に戻せません。"
+            return MacopAuthL10n.text(
+                "destructive.message.delete_prepared_ssh_key",
+                fallback: "外部登録前の準備済みSSH鍵を削除します。この操作は元に戻せません。"
+            )
         }
         if self.pending.request.operation == .directSSHKeyDelete {
-            return "表示されたSecure Enclave SSH鍵を削除します。この操作は元に戻せません。"
+            return MacopAuthL10n.text(
+                "destructive.message.delete_ssh_key",
+                fallback: "表示されたSecure Enclave SSH鍵を削除します。この操作は元に戻せません。"
+            )
         }
-        return "表示されたKeychain項目を削除します。この操作は元に戻せません。"
+        return MacopAuthL10n.text(
+            "destructive.message.delete_keychain_item",
+            fallback: "表示されたKeychain項目を削除します。この操作は元に戻せません。"
+        )
     }
 
     private var destructiveConfirmationButtonTitle: String {
         if self.isDeleteAllRequest {
-            return "管理項目をすべて削除"
+            return MacopAuthL10n.text("destructive.action.delete_all", fallback: "管理項目をすべて削除")
         }
         let deletesSSHKey = self.pending.request.operation == .directSSHKeyDelete
             || self.pending.request.purpose == .sshMigrationDeletePrepared
         if deletesSSHKey {
-            return "SSH鍵を削除"
+            return MacopAuthL10n.text("destructive.action.delete_ssh_key", fallback: "SSH鍵を削除")
         }
-        return "Keychain項目を削除"
+        return MacopAuthL10n.text("destructive.action.delete_keychain_item", fallback: "Keychain項目を削除")
     }
 
     private func beginDestructiveAuthentication() {
@@ -2337,10 +2601,10 @@ private struct ApprovalRequestView: View {
 
     private var directSSHKeyManagementAction: String {
         switch self.pending.request.operation {
-        case .directSSHKeyCreate: "SSH鍵の新規作成"
-        case .directSSHKeyDelete: "SSH鍵の削除"
-        case .sshMigrationTransition: self.pending.request.purpose.displayName
-        default: "SSH鍵の操作"
+        case .directSSHKeyCreate: MacopAuthL10n.text("ssh.action.create", fallback: "SSH鍵の新規作成")
+        case .directSSHKeyDelete: MacopAuthL10n.text("ssh.action.delete", fallback: "SSH鍵の削除")
+        case .sshMigrationTransition: MacopAuthL10n.purpose(self.pending.request.purpose)
+        default: MacopAuthL10n.text("ssh.action.operation", fallback: "SSH鍵の操作")
         }
     }
 
@@ -2376,24 +2640,52 @@ private struct ApprovalRequestView: View {
 
     private var managedKeychainAction: String {
         switch self.pending.request.operation {
-        case .managedKeychainRead: "読み取り"
-        case .managedKeychainUpdate: self.pending.request.purpose.concernsOTP ? "OTP seedの更新" : "更新"
-        case .managedKeychainDelete: "削除"
-        default: self.pending.request.purpose.concernsOTP ? "OTP seedの登録" : "登録"
+        case .managedKeychainRead: MacopAuthL10n.text("managed.action.read", fallback: "読み取り")
+        case .managedKeychainUpdate:
+            if self.pending.request.purpose.concernsOTP {
+                MacopAuthL10n.text("managed.action.otp_update", fallback: "OTP seedの更新")
+            } else {
+                MacopAuthL10n.text("managed.action.update", fallback: "更新")
+            }
+        case .managedKeychainDelete: MacopAuthL10n.text("managed.action.delete", fallback: "削除")
+        default:
+            if self.pending.request.purpose.concernsOTP {
+                MacopAuthL10n.text("managed.action.otp_add", fallback: "OTP seedの登録")
+            } else {
+                MacopAuthL10n.text("managed.action.add", fallback: "登録")
+            }
         }
     }
 
     private var requestTitle: String {
         if self.isManagedKeychainRequest {
-            return "\(self.requesterName) がKeychain項目の\(self.managedKeychainAction)を要求しています"
+            return MacopAuthL10n.format(
+                "auth.header.keychain",
+                fallback: "%@ がKeychain項目の%@を要求しています",
+                self.requesterName,
+                self.managedKeychainAction
+            )
         }
         if self.isDirectSSHKeyManagementRequest {
-            return "\(self.requesterName) が\(self.directSSHKeyManagementAction)を要求しています"
+            return MacopAuthL10n.format(
+                "auth.header.operation",
+                fallback: "%@ が%@を要求しています",
+                self.requesterName,
+                self.directSSHKeyManagementAction
+            )
         }
         if self.pending.request.operation == .gitSSHSign {
-            return "\(self.requesterName) がGit SSH署名を要求しています"
+            return MacopAuthL10n.format(
+                "auth.header.git_ssh_signing",
+                fallback: "%@ がGit SSH署名を要求しています",
+                self.requesterName
+            )
         }
-        return "\(self.requesterName) がSSH鍵を要求しています"
+        return MacopAuthL10n.format(
+            "auth.header.ssh_key",
+            fallback: "%@ がSSH鍵を要求しています",
+            self.requesterName
+        )
     }
 
     private var requesterName: String {
@@ -2431,7 +2723,7 @@ private struct DestructiveConfirmationView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
-                Button("キャンセル", action: self.cancel)
+                Button(MacopAuthL10n.text("common.cancel", fallback: "キャンセル"), action: self.cancel)
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button(self.buttonTitle, role: .destructive, action: self.confirm)
@@ -2490,8 +2782,11 @@ private struct ResultView: View {
                 .fixedSize(horizontal: false, vertical: true)
             if self.kind.requiresManualDismissal {
                 HStack(spacing: 10) {
-                    Button("メッセージをコピー", action: self.copyDetails)
-                    Button("閉じる", action: self.dismiss)
+                    Button(
+                        MacopAuthL10n.text("common.copy_message", fallback: "メッセージをコピー"),
+                        action: self.copyDetails
+                    )
+                    Button(MacopAuthL10n.text("common.close", fallback: "閉じる"), action: self.dismiss)
                         .keyboardShortcut(.defaultAction)
                 }
             }

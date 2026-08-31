@@ -68,9 +68,16 @@ source_executable="$build_dir/MacopAuth"
 destination="$build_dir/MacopAuth.app"
 info_plist="$repo_root/Resources/MacopAuth/Info.plist"
 entitlements_template="$repo_root/Resources/MacopAuth/MacopAuth.entitlements.in"
+localization_root="$repo_root/Resources/MacopAuth"
 [[ -x "$source_executable" ]] || fail "missing build artifact: $source_executable"
 plutil -lint "$info_plist" >/dev/null
 plutil -lint "$entitlements_template" >/dev/null
+for language in ja en; do
+  strings_file="$localization_root/$language.lproj/Localizable.strings"
+  [[ -f "$strings_file" && ! -L "$strings_file" ]] \
+    || fail "missing or unsafe localization: $strings_file"
+  plutil -lint "$strings_file" >/dev/null
+done
 if [[ -n "$provisioning_profile" ]]; then
   [[ "$provisioning_profile" == /* && -f "$provisioning_profile" && ! -L "$provisioning_profile" ]] \
     || fail "MACOP_PROVISIONING_PROFILE must be an absolute path to a regular file."
@@ -98,6 +105,12 @@ trap cleanup EXIT
 install -d -m 755 "$staged/Contents/MacOS"
 install -m 644 "$info_plist" "$staged/Contents/Info.plist"
 install -m 755 "$source_executable" "$staged/Contents/MacOS/MacopAuth"
+for language in ja en; do
+  install -d -m 755 "$staged/Contents/Resources/$language.lproj"
+  install -m 644 \
+    "$localization_root/$language.lproj/Localizable.strings" \
+    "$staged/Contents/Resources/$language.lproj/Localizable.strings"
+done
 if [[ -n "$provisioning_profile" ]]; then
   install -m 644 "$provisioning_profile" "$staged/Contents/embedded.provisionprofile"
 fi
