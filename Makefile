@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 .PHONY: help setup bootstrap hooks-install
-.PHONY: format format-check lint test test-config-durability test-agent-helper test-invocation test-installation test-install-transaction test-profile-helper test-profile-bootstrap test-no-persistence test-keychain-integration test-keychain-auth-ui test-pty test-ssh-manual build release-build install uninstall
+.PHONY: format format-check lint test test-config-durability test-agent-helper test-invocation test-installation test-install-transaction test-profile-helper test-profile-bootstrap test-no-persistence test-keychain-integration test-keychain-auth-ui test-pty test-ssh-manual build release-build build-install-products release-build-install-products install uninstall
 .PHONY: ci ci-swift ci-workflows ci-secrets
 .PHONY: pin-actions pin-actions-check
 .PHONY: workflow-lint workflow-security
@@ -100,6 +100,16 @@ build:
 
 release-build:
 	$(SWIFTPM_GIT_SAFE_BARE) swift build -c release
+
+build-install-products:
+	$(SWIFTPM_GIT_SAFE_BARE) swift build --product macop
+	$(SWIFTPM_GIT_SAFE_BARE) swift build --product macop-agent
+	$(SWIFTPM_GIT_SAFE_BARE) swift build --product MacopAuth
+
+release-build-install-products:
+	$(SWIFTPM_GIT_SAFE_BARE) swift build -c release --product macop
+	$(SWIFTPM_GIT_SAFE_BARE) swift build -c release --product macop-agent
+	$(SWIFTPM_GIT_SAFE_BARE) swift build -c release --product MacopAuth
 
 install:
 	@test -n "$${MACOP_SIGNING_IDENTITY:-}" || { echo "MACOP_SIGNING_IDENTITY (certificate identity) is required for production install" >&2; exit 2; }; \

@@ -137,7 +137,8 @@ public final class VerifiedSessionRuntime: @unchecked Sendable {
             rootCodeRequirement: session.codeRequirement,
             sessionID: session.id,
             expiresAt: session.expiresAt,
-            rootExecutablePath: launchedIdentity.canonicalPath
+            rootExecutablePath: launchedIdentity.canonicalPath,
+            sshKeyBackend: identity.backend
         ))
         if let failure = result.brokerFailure {
             throw failure

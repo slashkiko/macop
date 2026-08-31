@@ -64,6 +64,23 @@ private let compatibilitySSHEntries: [CompatibilityEntry] = [
     ),
     .init(command: "ssh delete", kind: "subcommand", status: "supported"),
     .init(
+        command: "ssh migration",
+        kind: "extension",
+        status: "supported",
+        reason: "Stage a macOS 15 direct Secure Enclave key without automatic backend switching or legacy-key deletion."
+    ),
+    .init(command: "ssh migration status", kind: "subcommand", status: "supported"),
+    .init(command: "ssh migration orphans", kind: "subcommand", status: "supported"),
+    .init(command: "ssh migration prepare", kind: "subcommand", status: "supported"),
+    .init(command: "ssh migration public-key", kind: "subcommand", status: "supported"),
+    .init(command: "ssh migration confirm-registered", kind: "subcommand", status: "supported"),
+    .init(command: "ssh migration activate", kind: "subcommand", status: "supported"),
+    .init(command: "ssh migration retire", kind: "subcommand", status: "supported"),
+    .init(command: "ssh migration confirm-retired", kind: "subcommand", status: "supported"),
+    .init(command: "ssh migration rollback", kind: "subcommand", status: "supported"),
+    .init(command: "ssh migration delete-prepared", kind: "subcommand", status: "supported"),
+    .init(command: "ssh migration delete-orphan", kind: "subcommand", status: "supported"),
+    .init(
         command: "ssh agent",
         kind: "subcommand",
         status: "partial",
@@ -92,7 +109,7 @@ private let compatibilitySSHEntries: [CompatibilityEntry] = [
         command: "ssh git-signing-config",
         kind: "extension",
         status: "supported",
-        reason: "Generate repository-local Git SSH signing configuration for a CTK identity."
+        reason: "Generate repository-local Git SSH signing configuration for the protected selected backend."
     ),
     .init(
         command: "ssh git-client",

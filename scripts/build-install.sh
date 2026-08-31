@@ -190,9 +190,9 @@ fi
 
 if [[ "$skip_build" == false ]]; then
   if [[ "$configuration" == "release" ]]; then
-    make -C "$repo_root" release-build
+    make -C "$repo_root" release-build-install-products
   else
-    make -C "$repo_root" build
+    make -C "$repo_root" build-install-products
   fi
 fi
 
@@ -589,7 +589,8 @@ recover_interrupted_transactions() {
     [[ "$(stat -f '%u:%Lp' "$candidate")" == "$(id -u):700" ]] || return 1
     transaction_record="$(read_record "$candidate" transaction)" || return 1
     [[ "$transaction_record" == $'schema_version=2\nwire_protocol=7\ncomponents=macop,agent,auth_app,manifest' \
-        || "$transaction_record" == $'schema_version=2\nwire_protocol=8\ncomponents=macop,agent,auth_app,manifest' ]] \
+        || "$transaction_record" == $'schema_version=2\nwire_protocol=8\ncomponents=macop,agent,auth_app,manifest' \
+        || "$transaction_record" == $'schema_version=2\nwire_protocol=9\ncomponents=macop,agent,auth_app,manifest' ]] \
       || return 1
     [[ "$(read_record "$candidate" PENDING)" == "pending" ]] || return 1
     phase="$(read_record "$candidate" phase)" || return 1
@@ -733,7 +734,7 @@ journal_dir_id="$(python3 "$install_fs" id "$journal_dir")" || fail "cannot reta
 journal_device="${journal_dir_id%%:*}"
 journal_inode="${journal_dir_id#*:}"
 canonical_journal_dir="$(cd -- "$journal_dir" && pwd -P)" || fail "cannot canonicalize transaction journal."
-create_record "$journal_dir" transaction $'schema_version=2\nwire_protocol=8\ncomponents=macop,agent,auth_app,manifest\n'
+create_record "$journal_dir" transaction $'schema_version=2\nwire_protocol=9\ncomponents=macop,agent,auth_app,manifest\n'
 for component in macop agent auth_app manifest; do
   case "$component" in
     macop) record_initial_state "$component" "$destination_macop" ;;
@@ -842,7 +843,7 @@ manifest_component() {
   printf '{\n'
   printf '  "schema_version": 1,\n'
   printf '  "build_generation": "%s",\n' "$build_generation"
-  printf '  "broker_protocol_version": 8,\n'
+  printf '  "broker_protocol_version": 9,\n'
   printf '  "components": {\n'
   manifest_component "macop" "$staged_macop" "$staged_macop" "macop"; printf ',\n'
   manifest_component "agent" "$staged_agent" "$staged_agent" "macop-agent"; printf ',\n'
@@ -863,7 +864,7 @@ verify_generation() {
   local manifest="$root/macop-install-manifest.json"
   [[ ! -L "$manifest" && -f "$manifest" ]] || return 1
   grep -Fqx '  "schema_version": 1,' "$manifest" || return 1
-  grep -Fqx '  "broker_protocol_version": 8,' "$manifest" || return 1
+  grep -Fqx '  "broker_protocol_version": 9,' "$manifest" || return 1
   local name path hash_path expected_hash expected_identifier actual_hash actual_identifier
   for name in macop agent auth_app; do
     case "$name" in

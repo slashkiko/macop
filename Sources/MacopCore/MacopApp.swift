@@ -57,6 +57,7 @@ public struct MacopApp {
     private let managedKeychainDeleter: any ManagedKeychainDeleting
     private let keychainMutator: any KeychainMutating
     private let passwordAutoFillProvider: any PasswordAutoFillProviding
+    private let directSSHKeys: (any DirectSSHKeyBrokerProviding)?
 
     public init(
         keychainClient: any KeychainClient = DefaultKeychainClient(),
@@ -66,7 +67,8 @@ public struct MacopApp {
         managedKeychainImporter: any ManagedKeychainImporting = CompanionManagedKeychainImporter(),
         managedKeychainDeleter: any ManagedKeychainDeleting = CompanionManagedKeychainDeleter(),
         keychainMutator: any KeychainMutating = SystemKeychainMutator(),
-        passwordAutoFillProvider: any PasswordAutoFillProviding = CompanionPasswordAutoFillProvider()
+        passwordAutoFillProvider: any PasswordAutoFillProviding = CompanionPasswordAutoFillProvider(),
+        directSSHKeys: (any DirectSSHKeyBrokerProviding)? = nil
     ) {
         self.keychainClient = keychainClient
         self.otpSeedClient = otpSeedClient
@@ -76,6 +78,9 @@ public struct MacopApp {
         self.managedKeychainDeleter = managedKeychainDeleter
         self.keychainMutator = keychainMutator
         self.passwordAutoFillProvider = passwordAutoFillProvider
+        self.directSSHKeys = directSSHKeys ?? (commandExecutor is SystemCommandExecutor
+            ? DirectSSHKeyBrokerClient()
+            : nil)
     }
 
     public func run(argv: [String], env: [String: String], input: Data = Data()) -> CommandResult {
@@ -328,7 +333,8 @@ public struct MacopApp {
                 options: parsed.options,
                 env: agentHelperEnvironment(env, options: parsed.options),
                 executor: self.commandExecutor,
-                biometricChecker: self.biometricChecker
+                biometricChecker: self.biometricChecker,
+                directSSHKeys: self.directSSHKeys
             )
         // macop-agent owns debug rendering so its JSON error stream stays
         // one object even when this command is relayed by macop.

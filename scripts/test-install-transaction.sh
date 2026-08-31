@@ -52,7 +52,7 @@ assert_generation() {
   local expected="$1" manifest="$bin_dir/macop-install-manifest.json"
   test -f "$manifest"
   grep -Fqx "  \"build_generation\": \"$expected\"," "$manifest"
-  grep -Fqx '  "broker_protocol_version": 8,' "$manifest"
+  grep -Fqx '  "broker_protocol_version": 9,' "$manifest"
   local name path expected_hash actual_hash
   for name in macop agent auth_app; do
     case "$name" in
@@ -134,16 +134,16 @@ kill -TERM "$agent_fixture_pid"
 wait "$agent_fixture_pid" || true
 agent_fixture_pid=""
 
-# Legacy v4/v5/v7 manifests are update inputs, never a publish target: a v8
+# Legacy v4/v5/v7/v8 manifests are update inputs, never a publish target: a v9
 # install replaces the complete old generation rather than accepting a mixed
 # wire contract.
-for legacy_protocol in 4 5 7; do
-  sed "s/\"broker_protocol_version\": 8/\"broker_protocol_version\": $legacy_protocol/" \
+for legacy_protocol in 4 5 7 8; do
+  sed "s/\"broker_protocol_version\": 9/\"broker_protocol_version\": $legacy_protocol/" \
     "$bin_dir/macop-install-manifest.json" >"$fixture_root/legacy-manifest.json"
   mv -- "$fixture_root/legacy-manifest.json" "$bin_dir/macop-install-manifest.json"
   install_generation "upgraded-v$legacy_protocol"
   assert_generation "upgraded-v$legacy_protocol"
-  grep -Fqx '  "broker_protocol_version": 8,' "$bin_dir/macop-install-manifest.json"
+  grep -Fqx '  "broker_protocol_version": 9,' "$bin_dir/macop-install-manifest.json"
   install_generation old
   assert_generation old
 done

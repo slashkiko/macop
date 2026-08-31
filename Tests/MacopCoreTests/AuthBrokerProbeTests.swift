@@ -9,7 +9,7 @@ final class AuthBrokerProbeTests: XCTestCase {
     private let required = AuthBrokerCapability.approvalUI.rawValue | AuthBrokerCapability.sshSigning.rawValue
     private let appPath = "/Applications/MacopAuth.app/Contents/MacOS/MacopAuth"
 
-    func testInstalledProbeUsesSelectedAppAndAcceptsV8WireReply() throws {
+    func testInstalledProbeUsesSelectedAppAndAcceptsCurrentWireReply() throws {
         var launchRequest: AuthBrokerClientConnection.LaunchRequest?
         let connection = try self.connectToProbeServer { descriptor in
             try self.reply(to: descriptor, message: self.welcome())
@@ -555,10 +555,12 @@ final class AuthBrokerProbeTests: XCTestCase {
 
                 length = struct.unpack(">I", receive_exact(4))[0]
                 hello = receive_exact(length)
-                if hello[:7] != b"MCAU\x00\x08\x01":
+                if hello[:4] != b"MCAU" or struct.unpack(">H", hello[4:6])[0] != \#(AuthBrokerWire
+            .currentVersion) or hello[6] != 1:
                     sys.exit(32)
                 payload = (
-                    b"MCAU" + struct.pack(">H", 8) + b"\x02" + struct.pack(">H", 8)
+                    b"MCAU" + struct.pack(">H", \#(AuthBrokerWire
+            .currentVersion)) + b"\x02" + struct.pack(">H", \#(AuthBrokerWire.currentVersion))
                     + struct.pack(">I", 5) + struct.pack(">I", 32) + (b"\x07" * 32)
                 )
                 client.sendall(struct.pack(">I", len(payload)) + payload)

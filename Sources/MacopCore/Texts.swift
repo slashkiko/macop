@@ -89,8 +89,11 @@ public enum CompletionText {
                   subcommand_index=$(__macop_zsh_next_positional_index $(( command_index + 1 )))
                   if [[ ${words[$subcommand_index]} == git-client ]]; then
                     _values 'git client command' trust list remove migrate reset
+                  elif [[ ${words[$subcommand_index]} == migration ]]; then
+                    _values 'ssh migration command' status orphans prepare public-key confirm-registered \
+                      activate retire confirm-retired rollback delete-prepared delete-orphan
                   else
-                    _values 'ssh command' create list public-key delete test run agent shell-init git-signing-config git-client connect host-config
+                    _values 'ssh command' create list public-key delete test run agent shell-init git-signing-config git-client migration connect host-config
                   fi ;;
                 completion) _values 'shell' bash zsh fish ;;
               esac
@@ -116,7 +119,9 @@ public enum CompletionText {
               local cur="${COMP_WORDS[COMP_CWORD]}"
               local commands="read run inject generate item profile completion compatibility ssh config doctor"
               local flags="--help --version --format --config --no-color --debug --encoding"
-              local ssh_commands="create list public-key delete test run agent shell-init git-signing-config git-client connect host-config"
+              local ssh_commands="create list public-key delete test run agent shell-init git-signing-config git-client migration connect host-config"
+              local migration_commands="status orphans prepare public-key confirm-registered \
+                activate retire confirm-retired rollback delete-prepared delete-orphan"
               local command_index subcommand_index command
               command_index="$(__macop_bash_next_positional_index 1)"
               command="${COMP_WORDS[command_index]}"
@@ -135,6 +140,8 @@ public enum CompletionText {
                   subcommand_index="$(__macop_bash_next_positional_index "$(( command_index + 1 ))")"
                   if [[ "${COMP_WORDS[subcommand_index]}" == "git-client" ]]; then
                     COMPREPLY=( $(compgen -W "trust list remove migrate reset ${flags}" -- "$cur") )
+                  elif [[ "${COMP_WORDS[subcommand_index]}" == "migration" ]]; then
+                    COMPREPLY=( $(compgen -W "${migration_commands} ${flags}" -- "$cur") )
                   else
                     COMPREPLY=( $(compgen -W "${ssh_commands} ${flags}" -- "$cur") )
                   fi ;;
@@ -197,6 +204,13 @@ public enum CompletionText {
               set -l ssh_index (__macop_next_positional_index (math $command_index + 1))
               test -n "$ssh_index"; and string match -q -- git-client $words[$ssh_index]
             end
+            function __macop_ssh_migration_position
+              set -l words (commandline -opc)
+              set -l command_index (__macop_command_index)
+              test -n "$command_index"; or return 1
+              set -l ssh_index (__macop_next_positional_index (math $command_index + 1))
+              test -n "$ssh_index"; and string match -q -- migration $words[$ssh_index]
+            end
             complete -c macop -n '__macop_item_position; and not __macop_otp_position' \\
               -a 'list get create edit import acquire generate otp delete'
             complete -c op -n '__macop_item_position; and not __macop_otp_position' \\
@@ -209,15 +223,19 @@ public enum CompletionText {
             complete -c op -n '__macop_command_position profile' -a 'run shell-init'
             complete -c macop -n '__macop_command_position config' -a 'init validate'
             complete -c op -n '__macop_command_position config' -a 'init validate'
-            set -l macop_ssh_commands 'create list public-key delete test run agent shell-init git-signing-config git-client connect host-config'
-            complete -c macop -n '__macop_command_position ssh; and not __macop_git_client_position' \
+            set -l macop_ssh_commands 'create list public-key delete test run agent shell-init git-signing-config git-client migration connect host-config'
+            complete -c macop -n '__macop_command_position ssh; and not __macop_git_client_position; and not __macop_ssh_migration_position' \
               -a "$macop_ssh_commands"
-            complete -c op -n '__macop_command_position ssh; and not __macop_git_client_position' \
+            complete -c op -n '__macop_command_position ssh; and not __macop_git_client_position; and not __macop_ssh_migration_position' \
               -a "$macop_ssh_commands"
             complete -c macop -n '__macop_command_position ssh; and __macop_git_client_position' \
               -a 'trust list remove migrate reset'
             complete -c op -n '__macop_command_position ssh; and __macop_git_client_position' \
               -a 'trust list remove migrate reset'
+            complete -c macop -n '__macop_command_position ssh; and __macop_ssh_migration_position' \
+              -a 'status orphans prepare public-key confirm-registered activate retire confirm-retired rollback delete-prepared delete-orphan'
+            complete -c op -n '__macop_command_position ssh; and __macop_ssh_migration_position' \
+              -a 'status orphans prepare public-key confirm-registered activate retire confirm-retired rollback delete-prepared delete-orphan'
             """
         default:
             "macop: unsupported shell for completion: \(shell)\n"

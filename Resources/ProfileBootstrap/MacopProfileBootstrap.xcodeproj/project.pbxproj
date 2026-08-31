@@ -84,7 +84,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = MacopProfileBootstrap;
 				INFOPLIST_KEY_LSUIElement = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.slashkiko.macop.auth;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -103,7 +103,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = MacopProfileBootstrap;
 				INFOPLIST_KEY_LSUIElement = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.slashkiko.macop.auth;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -112,8 +112,8 @@
 			};
 			name = Release;
 		};
-		A10000000000000000000011 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 14.0; }; name = Debug; };
-		A10000000000000000000012 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 14.0; }; name = Release; };
+		A10000000000000000000011 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 15.0; }; name = Debug; };
+		A10000000000000000000012 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 15.0; }; name = Release; };
 		A1000000000000000000000C /* Build configuration list for PBXNativeTarget */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (A1000000000000000000000F /* Debug */, A10000000000000000000010 /* Release */);

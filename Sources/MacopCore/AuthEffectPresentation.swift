@@ -133,6 +133,7 @@ public enum AuthEffectPipeline {
         operation: AuthBrokerOperation,
         prepare: () throws -> Void = {},
         sign: () throws -> Data,
+        revalidate: () throws -> Void = {},
         deliver: (AuthBrokerSSHSignOutcome, Data) throws -> Void
     ) -> SSHSigningEffectPresentation {
         do {
@@ -151,6 +152,15 @@ public enum AuthEffectPipeline {
             return self.signingFailure(
                 operation: operation,
                 failure: .signatureFailed,
+                deliver: deliver
+            )
+        }
+        do {
+            try revalidate()
+        } catch {
+            return self.signingFailure(
+                operation: operation,
+                failure: .requesterInvalid,
                 deliver: deliver
             )
         }
@@ -217,7 +227,7 @@ public enum AuthApprovalOrchestration {
         if operation == .passwordAutoFill {
             return .passwordAutoFill
         }
-        if hasSigner || operation == .managedKeychainImport || operation == .managedKeychainUpdate {
+        if hasSigner || operation.phaseTwoKind != .none {
             return .approvedPhaseTwo
         }
         return .approvedImmediate

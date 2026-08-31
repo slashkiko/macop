@@ -17,6 +17,7 @@ public enum AuthBrokerCapability: UInt32, Sendable {
     case passwordAutoFill = 8
     case passwordAutoFillUsername = 16
     case gitClientTrust = 32
+    case directSSHKeyManagement = 64
 }
 
 public struct AuthBrokerHello: Sendable, Equatable {
@@ -54,17 +55,22 @@ public enum AuthBrokerOperation: UInt8, Sendable {
     case managedKeychainDelete = 6
     case gitSSHSign = 7
     case managedKeychainUpdate = 8
+    case directSSHKeyCreate = 9
+    case directSSHKeyDelete = 10
+    case sshMigrationTransition = 11
 }
 
 public enum AuthBrokerOperationFamily: Sendable, Equatable {
     case signing
     case managedKeychain
+    case directSSHKeyManagement
 }
 
 public enum AuthBrokerPhaseTwoKind: Sendable, Equatable {
     case none
     case signing
     case managedKeychainMutation
+    case directSSHKeyMutation
 }
 
 public extension AuthBrokerOperation {
@@ -75,6 +81,8 @@ public extension AuthBrokerOperation {
         case .managedKeychainRead, .managedKeychainImport, .passwordAutoFill,
              .managedKeychainDelete, .managedKeychainUpdate:
             .managedKeychain
+        case .directSSHKeyCreate, .directSSHKeyDelete, .sshMigrationTransition:
+            .directSSHKeyManagement
         }
     }
 
@@ -85,6 +93,8 @@ public extension AuthBrokerOperation {
         case .managedKeychainRead, .managedKeychainImport, .passwordAutoFill,
              .managedKeychainDelete, .managedKeychainUpdate:
             .managedKeychain
+        case .directSSHKeyCreate, .directSSHKeyDelete, .sshMigrationTransition:
+            .directSSHKeyManagement
         }
     }
 
@@ -94,6 +104,8 @@ public extension AuthBrokerOperation {
             .signing
         case .managedKeychainImport, .managedKeychainUpdate:
             .managedKeychainMutation
+        case .directSSHKeyCreate, .directSSHKeyDelete, .sshMigrationTransition:
+            .directSSHKeyMutation
         case .sshSign, .managedKeychainRead, .passwordAutoFill, .managedKeychainDelete:
             .none
         }
@@ -130,6 +142,14 @@ public enum AuthBrokerPurpose: UInt8, Sendable, Equatable {
     case passwordAutoFillInject = 24
     case passwordAutoFillProfile = 25
     case passwordAutoFillItemAcquire = 26
+    case directSSHKeyCreate = 27
+    case directSSHKeyDelete = 28
+    case sshMigrationConfirmExternal = 29
+    case sshMigrationActivate = 30
+    case sshMigrationBeginRetirement = 31
+    case sshMigrationConfirmRetired = 32
+    case sshMigrationRollback = 33
+    case sshMigrationDeletePrepared = 34
 
     public func isValid(for operation: AuthBrokerOperation) -> Bool {
         switch (operation, self) {
@@ -158,7 +178,15 @@ public enum AuthBrokerPurpose: UInt8, Sendable, Equatable {
              (.managedKeychainDelete, .managedKeychainDelete),
              (.managedKeychainDelete, .otpDelete),
              (.managedKeychainDelete, .managedKeychainDeleteAll),
-             (.gitSSHSign, .gitSSHSign):
+             (.gitSSHSign, .gitSSHSign),
+             (.directSSHKeyCreate, .directSSHKeyCreate),
+             (.directSSHKeyDelete, .directSSHKeyDelete),
+             (.sshMigrationTransition, .sshMigrationConfirmExternal),
+             (.sshMigrationTransition, .sshMigrationActivate),
+             (.sshMigrationTransition, .sshMigrationBeginRetirement),
+             (.sshMigrationTransition, .sshMigrationConfirmRetired),
+             (.sshMigrationTransition, .sshMigrationRollback),
+             (.sshMigrationTransition, .sshMigrationDeletePrepared):
             true
         default:
             false
@@ -193,6 +221,14 @@ public enum AuthBrokerPurpose: UInt8, Sendable, Equatable {
         case .passwordAutoFillInject: "macop inject (Passwords)"
         case .passwordAutoFillProfile: "macop profile run (Passwords)"
         case .passwordAutoFillItemAcquire: "macop item acquire (Passwords)"
+        case .directSSHKeyCreate: "macop ssh migration prepare"
+        case .directSSHKeyDelete: "macop ssh migration delete-orphan"
+        case .sshMigrationConfirmExternal: "macop ssh migration confirm-registered"
+        case .sshMigrationActivate: "macop ssh migration activate"
+        case .sshMigrationBeginRetirement: "macop ssh migration retire"
+        case .sshMigrationConfirmRetired: "macop ssh migration confirm-retired"
+        case .sshMigrationRollback: "macop ssh migration rollback"
+        case .sshMigrationDeletePrepared: "macop ssh migration delete-prepared"
         }
     }
 
@@ -204,6 +240,11 @@ public enum AuthBrokerPurpose: UInt8, Sendable, Equatable {
             false
         }
     }
+}
+
+public enum AuthBrokerSSHKeyBackend: UInt8, Sendable, Equatable {
+    case legacyCTK = 1
+    case directSecureEnclaveV1 = 2
 }
 
 /// Display-only information for an approval request. The requester binding is
@@ -254,6 +295,7 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
     public let keychainService: String
     public let keychainAccount: String
     public let keychainSynchronizable: Bool
+    public let sshKeyBackend: AuthBrokerSSHKeyBackend
 
     public init(
         requestID: UUID,
@@ -272,7 +314,8 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
         host: String,
         keychainService: String = "",
         keychainAccount: String = "",
-        keychainSynchronizable: Bool = false
+        keychainSynchronizable: Bool = false,
+        sshKeyBackend: AuthBrokerSSHKeyBackend = .legacyCTK
     ) {
         self.requestID = requestID
         self.issuedAtMilliseconds = issuedAtMilliseconds
@@ -291,6 +334,7 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
         self.keychainService = keychainService
         self.keychainAccount = keychainAccount
         self.keychainSynchronizable = keychainSynchronizable
+        self.sshKeyBackend = sshKeyBackend
     }
 }
 
@@ -466,6 +510,147 @@ public struct AuthBrokerGitClientTrustStateResponse: Sendable, Equatable {
     }
 }
 
+public enum AuthBrokerDirectSSHKeyOperation: UInt8, Sendable, Equatable {
+    case list = 1
+    case create = 2
+    case delete = 3
+}
+
+public struct AuthBrokerDirectSSHKeyRecord: Sendable, Equatable {
+    public let id: DirectSecureEnclaveKeyID
+    public let label: String
+    public let publicKeyBlob: Data
+
+    public init(id: DirectSecureEnclaveKeyID, label: String, publicKeyBlob: Data) {
+        self.id = id
+        self.label = label
+        self.publicKeyBlob = publicKeyBlob
+    }
+
+    public init(_ record: DirectSecureEnclaveKeyRecord) {
+        self.init(id: record.id, label: record.label, publicKeyBlob: record.publicKeyBlob)
+    }
+}
+
+/// A closed request for the MacopAuth-owned Secure Enclave key store. Create
+/// and delete requests are accepted only as phase two of an approved request;
+/// list is the sole first-message operation.
+public struct AuthBrokerDirectSSHKeyRequest: Sendable, Equatable {
+    public let authorizationID: UUID
+    public let operation: AuthBrokerDirectSSHKeyOperation
+    public let id: DirectSecureEnclaveKeyID?
+    public let label: String
+    public let expectedPublicKeyBlob: Data
+    public let expectedGeneration: UInt64
+    public let legacyFingerprint: String
+
+    public init(
+        authorizationID: UUID,
+        operation: AuthBrokerDirectSSHKeyOperation,
+        id: DirectSecureEnclaveKeyID? = nil,
+        label: String = "",
+        expectedPublicKeyBlob: Data = Data(),
+        expectedGeneration: UInt64 = 0,
+        legacyFingerprint: String = ""
+    ) {
+        self.authorizationID = authorizationID
+        self.operation = operation
+        self.id = id
+        self.label = label
+        self.expectedPublicKeyBlob = expectedPublicKeyBlob
+        self.expectedGeneration = expectedGeneration
+        self.legacyFingerprint = legacyFingerprint
+    }
+}
+
+public enum AuthBrokerDirectSSHKeyStatus: UInt8, Sendable, Equatable {
+    case success = 1
+    case notFound = 2
+    case duplicate = 3
+    case denied = 4
+    case unavailable = 5
+    case failed = 6
+    case indeterminate = 7
+    case generationConflict = 8
+}
+
+public struct AuthBrokerDirectSSHKeyResponse: Sendable, Equatable {
+    public let authorizationID: UUID
+    public let operation: AuthBrokerDirectSSHKeyOperation
+    public let status: AuthBrokerDirectSSHKeyStatus
+    public let records: [AuthBrokerDirectSSHKeyRecord]
+
+    public init(
+        authorizationID: UUID,
+        operation: AuthBrokerDirectSSHKeyOperation,
+        status: AuthBrokerDirectSSHKeyStatus,
+        records: [AuthBrokerDirectSSHKeyRecord] = []
+    ) {
+        self.authorizationID = authorizationID
+        self.operation = operation
+        self.status = status
+        self.records = records
+    }
+}
+
+public enum AuthBrokerSSHMigrationAction: UInt8, Sendable, Equatable {
+    case list = 1
+    case transition = 2
+}
+
+public struct AuthBrokerSSHMigrationRequest: Sendable, Equatable {
+    public let requestID: UUID
+    public let action: AuthBrokerSSHMigrationAction
+    public let label: String
+    public let expectedGeneration: UInt64
+    public let transition: SSHKeyMigrationTransition?
+
+    public init(
+        requestID: UUID,
+        action: AuthBrokerSSHMigrationAction,
+        label: String = "",
+        expectedGeneration: UInt64 = 0,
+        transition: SSHKeyMigrationTransition? = nil
+    ) {
+        self.requestID = requestID
+        self.action = action
+        self.label = label
+        self.expectedGeneration = expectedGeneration
+        self.transition = transition
+    }
+}
+
+public enum AuthBrokerSSHMigrationStatus: UInt8, Sendable, Equatable {
+    case success = 1
+    case notFound = 2
+    case generationConflict = 3
+    case denied = 4
+    case unavailable = 5
+    case failed = 6
+}
+
+public struct AuthBrokerSSHMigrationResponse: Sendable, Equatable {
+    public let requestID: UUID
+    public let action: AuthBrokerSSHMigrationAction
+    public let status: AuthBrokerSSHMigrationStatus
+    public let generation: UInt64
+    public let entries: [SSHKeyMigrationEntry]
+
+    public init(
+        requestID: UUID,
+        action: AuthBrokerSSHMigrationAction,
+        status: AuthBrokerSSHMigrationStatus,
+        generation: UInt64,
+        entries: [SSHKeyMigrationEntry] = []
+    ) {
+        self.requestID = requestID
+        self.action = action
+        self.status = status
+        self.generation = generation
+        self.entries = entries
+    }
+}
+
 /// Closed, secret-free result of an approved signing flow. Preparation
 /// failures are intentionally split so the client can explain which
 /// fail-closed boundary stopped the operation without receiving arbitrary
@@ -493,11 +678,15 @@ public enum AuthBrokerMessage: Sendable, Equatable {
     case gitClientTrustMutationResponse(AuthBrokerGitClientTrustMutationResponse)
     case gitClientTrustStateRequest(AuthBrokerGitClientTrustStateRequest)
     case gitClientTrustStateResponse(AuthBrokerGitClientTrustStateResponse)
+    case directSSHKeyRequest(AuthBrokerDirectSSHKeyRequest)
+    case directSSHKeyResponse(AuthBrokerDirectSSHKeyResponse)
+    case sshMigrationRequest(AuthBrokerSSHMigrationRequest)
+    case sshMigrationResponse(AuthBrokerSSHMigrationResponse)
 }
 
 // swiftlint:disable:next type_body_length
 public enum AuthBrokerWire {
-    public static let currentVersion: UInt16 = 8
+    public static let currentVersion: UInt16 = 9
     public static let maximumFrameLength = 256 * 1024
     public static let maximumCommandLength = 4 * 1024
     public static let maximumMetadataLength = 512
@@ -575,6 +764,7 @@ public enum AuthBrokerWire {
             value += try self.text(request.keychainService, maximum: self.maximumMetadataLength)
             value += try self.text(request.keychainAccount, maximum: self.maximumMetadataLength)
             value.append(request.keychainSynchronizable ? 1 : 0)
+            value.append(request.sshKeyBackend.rawValue)
         case let .approvalResponse(response):
             value.append(4)
             value += try self.text(response.requestID.uuidString, maximum: 36)
@@ -641,6 +831,51 @@ public enum AuthBrokerWire {
             value.append(14)
             value += try self.text(response.requestID.uuidString, maximum: 36) + self.u64(response.generation)
             value.append(response.status.rawValue)
+        case let .directSSHKeyRequest(request):
+            try self.validateDirectSSHKeyRequest(request)
+            value.append(15)
+            value += try self.text(request.authorizationID.uuidString, maximum: 36)
+            value.append(request.operation.rawValue)
+            value += try self.text(request.id?.rawValue ?? "", maximum: 36)
+            value += try self.text(request.label, maximum: self.maximumMetadataLength)
+            value += self.bytes(request.expectedPublicKeyBlob)
+            value += self.u64(request.expectedGeneration)
+            value += try self.text(request.legacyFingerprint, maximum: self.maximumMetadataLength)
+        case let .directSSHKeyResponse(response):
+            try self.validateDirectSSHKeyResponse(response)
+            value.append(16)
+            value += try self.text(response.authorizationID.uuidString, maximum: 36)
+            value.append(response.operation.rawValue)
+            value.append(response.status.rawValue)
+            value += self.u16(UInt16(response.records.count))
+            for record in response.records {
+                value += try self.text(record.id.rawValue, maximum: 36)
+                value += try self.text(record.label, maximum: self.maximumMetadataLength)
+                value += self.bytes(record.publicKeyBlob)
+            }
+        case let .sshMigrationRequest(request):
+            try self.validateSSHMigrationRequest(request)
+            value.append(17)
+            value += try self.text(request.requestID.uuidString, maximum: 36)
+            value.append(request.action.rawValue)
+            value += try self.text(request.label, maximum: self.maximumMetadataLength)
+            value += self.u64(request.expectedGeneration)
+            value.append(request.transition.map { Self.migrationTransitionCode($0) } ?? 0)
+        case let .sshMigrationResponse(response):
+            try self.validateSSHMigrationResponse(response)
+            value.append(18)
+            value += try self.text(response.requestID.uuidString, maximum: 36)
+            value.append(response.action.rawValue)
+            value.append(response.status.rawValue)
+            value += self.u64(response.generation)
+            value += self.u16(UInt16(response.entries.count))
+            for entry in response.entries {
+                value += try self.text(entry.label, maximum: self.maximumMetadataLength)
+                value += try self.text(entry.legacyFingerprint, maximum: self.maximumMetadataLength)
+                value += try self.text(entry.directKeyID.rawValue, maximum: 36)
+                value += self.bytes(entry.directPublicKeyBlob)
+                value.append(Self.migrationPhaseCode(entry.phase))
+            }
         }
         return value
     }
@@ -706,6 +941,9 @@ public enum AuthBrokerWire {
             let keychainService = try cursor.text(maximum: self.maximumMetadataLength)
             let keychainAccount = try cursor.text(maximum: self.maximumMetadataLength)
             let keychainSynchronizable = try cursor.byte()
+            guard let sshKeyBackend = try AuthBrokerSSHKeyBackend(rawValue: cursor.byte()) else {
+                throw AuthBrokerProtocolError.malformed
+            }
             guard cursor.isAtEnd, rootPID > 0, rootStartTime > 0,
                   !rootIdentifier.isEmpty, !rootCodeRequirement.isEmpty, !rootExecutablePath.isEmpty,
                   presentation.isValid(for: operation),
@@ -728,7 +966,8 @@ public enum AuthBrokerWire {
                 host: host,
                 keychainService: keychainService,
                 keychainAccount: keychainAccount,
-                keychainSynchronizable: keychainSynchronizable == 1
+                keychainSynchronizable: keychainSynchronizable == 1,
+                sshKeyBackend: sshKeyBackend
             ))
         case 4:
             guard let requestID = try UUID(uuidString: cursor.text(maximum: 36)),
@@ -868,6 +1107,111 @@ public enum AuthBrokerWire {
             return .gitClientTrustStateResponse(AuthBrokerGitClientTrustStateResponse(
                 requestID: requestID, generation: generation, status: status
             ))
+        case 15:
+            guard let authorizationID = try UUID(uuidString: cursor.text(maximum: 36)),
+                  let operation = try AuthBrokerDirectSSHKeyOperation(rawValue: cursor.byte())
+            else { throw AuthBrokerProtocolError.malformed }
+            let rawID = try cursor.text(maximum: 36)
+            let id = rawID.isEmpty ? nil : DirectSecureEnclaveKeyID(rawValue: rawID)
+            guard rawID.isEmpty || id != nil else { throw AuthBrokerProtocolError.malformed }
+            let request = try AuthBrokerDirectSSHKeyRequest(
+                authorizationID: authorizationID,
+                operation: operation,
+                id: id,
+                label: cursor.text(maximum: self.maximumMetadataLength),
+                expectedPublicKeyBlob: cursor.bytes(),
+                expectedGeneration: cursor.u64(),
+                legacyFingerprint: cursor.text(maximum: self.maximumMetadataLength)
+            )
+            guard cursor.isAtEnd else { throw AuthBrokerProtocolError.malformed }
+            try self.validateDirectSSHKeyRequest(request)
+            return .directSSHKeyRequest(request)
+        case 16:
+            guard let authorizationID = try UUID(uuidString: cursor.text(maximum: 36)),
+                  let operation = try AuthBrokerDirectSSHKeyOperation(rawValue: cursor.byte()),
+                  let status = try AuthBrokerDirectSSHKeyStatus(rawValue: cursor.byte())
+            else { throw AuthBrokerProtocolError.malformed }
+            let count = try Int(cursor.u16())
+            guard count <= 128 else { throw AuthBrokerProtocolError.tooLarge }
+            var records: [AuthBrokerDirectSSHKeyRecord] = []
+            records.reserveCapacity(count)
+            for _ in 0 ..< count {
+                guard let id = try DirectSecureEnclaveKeyID(rawValue: cursor.text(maximum: 36)) else {
+                    throw AuthBrokerProtocolError.malformed
+                }
+                try records.append(AuthBrokerDirectSSHKeyRecord(
+                    id: id,
+                    label: cursor.text(maximum: self.maximumMetadataLength),
+                    publicKeyBlob: cursor.bytes()
+                ))
+            }
+            let response = AuthBrokerDirectSSHKeyResponse(
+                authorizationID: authorizationID,
+                operation: operation,
+                status: status,
+                records: records
+            )
+            guard cursor.isAtEnd else { throw AuthBrokerProtocolError.malformed }
+            try self.validateDirectSSHKeyResponse(response)
+            return .directSSHKeyResponse(response)
+        case 17:
+            guard let requestID = try UUID(uuidString: cursor.text(maximum: 36)),
+                  let action = try AuthBrokerSSHMigrationAction(rawValue: cursor.byte())
+            else { throw AuthBrokerProtocolError.malformed }
+            let label = try cursor.text(maximum: self.maximumMetadataLength)
+            let expectedGeneration = try cursor.u64()
+            let transitionCode = try cursor.byte()
+            let transition = transitionCode == 0 ? nil : Self.migrationTransition(code: transitionCode)
+            guard transitionCode == 0 || transition != nil, cursor.isAtEnd else {
+                throw AuthBrokerProtocolError.malformed
+            }
+            let request = AuthBrokerSSHMigrationRequest(
+                requestID: requestID,
+                action: action,
+                label: label,
+                expectedGeneration: expectedGeneration,
+                transition: transition
+            )
+            try self.validateSSHMigrationRequest(request)
+            return .sshMigrationRequest(request)
+        case 18:
+            guard let requestID = try UUID(uuidString: cursor.text(maximum: 36)),
+                  let action = try AuthBrokerSSHMigrationAction(rawValue: cursor.byte()),
+                  let status = try AuthBrokerSSHMigrationStatus(rawValue: cursor.byte())
+            else { throw AuthBrokerProtocolError.malformed }
+            let generation = try cursor.u64()
+            let count = try Int(cursor.u16())
+            guard count <= 128 else { throw AuthBrokerProtocolError.tooLarge }
+            var entries: [SSHKeyMigrationEntry] = []
+            entries.reserveCapacity(count)
+            for _ in 0 ..< count {
+                let label = try cursor.text(maximum: self.maximumMetadataLength)
+                let legacyFingerprint = try cursor.text(maximum: self.maximumMetadataLength)
+                guard let id = try DirectSecureEnclaveKeyID(rawValue: cursor.text(maximum: 36)) else {
+                    throw AuthBrokerProtocolError.malformed
+                }
+                let publicKey = try cursor.bytes()
+                guard let phase = try Self.migrationPhase(code: cursor.byte()) else {
+                    throw AuthBrokerProtocolError.malformed
+                }
+                try entries.append(SSHKeyMigrationEntry(
+                    label: label,
+                    legacyFingerprint: legacyFingerprint,
+                    directKeyID: id,
+                    directPublicKeyBlob: publicKey,
+                    phase: phase
+                ))
+            }
+            let response = AuthBrokerSSHMigrationResponse(
+                requestID: requestID,
+                action: action,
+                status: status,
+                generation: generation,
+                entries: entries
+            )
+            guard cursor.isAtEnd else { throw AuthBrokerProtocolError.malformed }
+            try self.validateSSHMigrationResponse(response)
+            return .sshMigrationResponse(response)
         default:
             throw AuthBrokerProtocolError.unsupportedMessage
         }
@@ -906,6 +1250,126 @@ public enum AuthBrokerWire {
               let calculated = try? decoded.digest()
         else { return false }
         return constantTimeEqual(document, canonical) && constantTimeEqual(digest, calculated)
+    }
+
+    private static func validateDirectSSHKeyRequest(_ request: AuthBrokerDirectSSHKeyRequest) throws {
+        let labelIsValid = (try? SSHIdentityLabelValidator.validate(request.label)) != nil
+        switch request.operation {
+        case .list:
+            guard request.id == nil, request.label.isEmpty, request.expectedPublicKeyBlob.isEmpty,
+                  request.expectedGeneration == 0, request.legacyFingerprint.isEmpty
+            else {
+                throw AuthBrokerProtocolError.malformed
+            }
+        case .create:
+            guard request.id == nil, labelIsValid, request.expectedPublicKeyBlob.isEmpty,
+                  !request.legacyFingerprint.isEmpty
+            else {
+                throw AuthBrokerProtocolError.malformed
+            }
+        case .delete:
+            guard request.id != nil, labelIsValid, !request.expectedPublicKeyBlob.isEmpty,
+                  request.expectedGeneration == 0, request.legacyFingerprint.isEmpty
+            else {
+                throw AuthBrokerProtocolError.malformed
+            }
+        }
+    }
+
+    private static func validateDirectSSHKeyResponse(_ response: AuthBrokerDirectSSHKeyResponse) throws {
+        guard response.records.count <= 128,
+              response.records.allSatisfy({ record in
+                  !record.publicKeyBlob.isEmpty
+                      && (try? SSHIdentityLabelValidator.validate(record.label)) != nil
+              })
+        else { throw AuthBrokerProtocolError.malformed }
+        if response.status != .success {
+            guard response.status == .indeterminate, response.records.count <= 1 else {
+                guard response.records.isEmpty else { throw AuthBrokerProtocolError.malformed }
+                return
+            }
+            return
+        }
+        switch response.operation {
+        case .list:
+            break
+        case .create:
+            guard response.records.count == 1 else { throw AuthBrokerProtocolError.malformed }
+        case .delete:
+            guard response.records.isEmpty else { throw AuthBrokerProtocolError.malformed }
+        }
+    }
+
+    private static func validateSSHMigrationRequest(_ request: AuthBrokerSSHMigrationRequest) throws {
+        switch request.action {
+        case .list:
+            guard request.label.isEmpty, request.expectedGeneration == 0, request.transition == nil else {
+                throw AuthBrokerProtocolError.malformed
+            }
+        case .transition:
+            guard request.expectedGeneration > 0, request.transition != nil,
+                  (try? SSHIdentityLabelValidator.validate(request.label)) != nil
+            else { throw AuthBrokerProtocolError.malformed }
+        }
+    }
+
+    private static func validateSSHMigrationResponse(_ response: AuthBrokerSSHMigrationResponse) throws {
+        guard response.entries.count <= 128 else { throw AuthBrokerProtocolError.tooLarge }
+        if response.status != .success {
+            guard response.entries.isEmpty else { throw AuthBrokerProtocolError.malformed }
+            return
+        }
+        _ = try SSHKeyMigrationDocument(generation: response.generation, entries: response.entries)
+    }
+
+    private static func migrationTransitionCode(_ value: SSHKeyMigrationTransition) -> UInt8 {
+        switch value {
+        case .confirmExternalRegistration: 1
+        case .activateDirectBackend: 2
+        case .beginLegacyRetirement: 3
+        case .confirmLegacyRetired: 4
+        case .returnToPreparation: 5
+        case .returnToExternalRegistration: 6
+        case .returnToActive: 7
+        case .confirmDirectKeyDeleted: 8
+        }
+    }
+
+    private static func migrationTransition(code: UInt8) -> SSHKeyMigrationTransition? {
+        switch code {
+        case 1: .confirmExternalRegistration
+        case 2: .activateDirectBackend
+        case 3: .beginLegacyRetirement
+        case 4: .confirmLegacyRetired
+        case 5: .returnToPreparation
+        case 6: .returnToExternalRegistration
+        case 7: .returnToActive
+        case 8: .confirmDirectKeyDeleted
+        default: nil
+        }
+    }
+
+    private static func migrationPhaseCode(_ value: SSHKeyMigrationPhase) -> UInt8 {
+        switch value {
+        case .prepared: 1
+        case .externallyRegistered: 2
+        case .active: 3
+        case .retiring: 4
+        case .retired: 5
+        case .deleting: 6
+        }
+    }
+
+    private static func migrationPhase(code: UInt8) -> SSHKeyMigrationPhase? {
+        switch code {
+        case 1: .prepared
+        case 2: .externallyRegistered
+        case 3: .active
+        case 4: .retiring
+        case 5: .retired
+        case 6: .deleting
+        default: nil
+        }
     }
 
     private static func appendPresentation(

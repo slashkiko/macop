@@ -194,7 +194,7 @@ public enum DoctorCommand {
         let version = ProcessInfo.processInfo.operatingSystemVersion
         add(
             "macos",
-            version.majorVersion >= 14 ? .pass : .fail,
+            version.majorVersion >= 15 ? .pass : .fail,
             "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
         )
 

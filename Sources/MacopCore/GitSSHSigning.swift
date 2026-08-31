@@ -51,7 +51,8 @@ public struct CompanionGitSSHSigningProvider: GitSSHSigningProviding {
             let value = try AuthBrokerRequester.gitSSHSigningApprovalRequest(
                 credentialLabel: identity.label,
                 credentialFingerprint: identity.fingerprint,
-                rootPID: requesterPID
+                rootPID: requesterPID,
+                sshKeyBackend: identity.backend
             )
             _ = try AuthBrokerWire.frame(.approvalRequest(value))
             return value
@@ -91,7 +92,8 @@ public enum GitSSHSigningCommand {
         env: [String: String],
         executor: CommandExecutor = SystemCommandExecutor(),
         provider: any GitSSHSigningProviding = CompanionGitSSHSigningProvider(),
-        requesterValidator: any GitSSHSigningRequesterValidating = SystemGitSSHSigningRequesterValidator()
+        requesterValidator: any GitSSHSigningRequesterValidating = SystemGitSSHSigningRequesterValidator(),
+        directSSHKeys: (any DirectSSHKeyBrokerProviding)? = nil
     ) -> CommandResult {
         do {
             let invocation = try self.parse(argv: argv)
@@ -101,7 +103,8 @@ public enum GitSSHSigningCommand {
             let identity = try SSHCommand.verifiedSessionIdentity(
                 matchingPublicKeyBlob: publicKey,
                 env: env,
-                executor: executor
+                executor: executor,
+                directSSHKeys: directSSHKeys
             )
             let message = try self.readRegularFile(path: invocation.messagePath, limit: 4 * 1024 * 1024)
             let signedData = try self.signedData(message: message, namespace: invocation.namespace)

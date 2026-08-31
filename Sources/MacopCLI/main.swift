@@ -23,7 +23,11 @@ if GitSSHSigningCommand.isAdapterInvocation(CommandLine.arguments) {
     let result = if GitSSHVerificationCommand.isVerificationInvocation(CommandLine.arguments) {
         GitSSHVerificationCommand.run(argv: CommandLine.arguments)
     } else {
-        GitSSHSigningCommand.run(argv: CommandLine.arguments, env: environment)
+        GitSSHSigningCommand.run(
+            argv: CommandLine.arguments,
+            env: environment,
+            directSSHKeys: DirectSSHKeyBrokerClient()
+        )
     }
     if !result.stdout.isEmpty {
         write(result.stdout, to: .standardOutput)

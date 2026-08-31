@@ -41,6 +41,11 @@ public enum BiometricAvailability: Sendable, Equatable {
     case unavailable(reason: String)
 }
 
+public enum VerifiedSessionKeySelection: Sendable, Equatable {
+    case activeBackend
+    case externallyRegisteredMigrationCandidate
+}
+
 public protocol BiometricAvailabilityChecking: Sendable {
     func checkAvailability() -> BiometricAvailability
 }
@@ -101,16 +106,24 @@ private final class BoundedCommandCapture: @unchecked Sendable {
     }
 }
 
+// swiftlint:disable:next type_body_length
 public enum SSHCommand {
     public struct VerifiedSessionIdentity: Sendable {
         public let fingerprint: String
         public let label: String
         public let publicKeyBlob: Data
+        public let backend: AuthBrokerSSHKeyBackend
 
-        public init(fingerprint: String, label: String, publicKeyBlob: Data) {
+        public init(
+            fingerprint: String,
+            label: String,
+            publicKeyBlob: Data,
+            backend: AuthBrokerSSHKeyBackend = .legacyCTK
+        ) {
             self.fingerprint = fingerprint
             self.label = label
             self.publicKeyBlob = publicKeyBlob
+            self.backend = backend
         }
     }
 
@@ -124,7 +137,8 @@ public enum SSHCommand {
         executor: CommandExecutor,
         biometricChecker: any BiometricAvailabilityChecking = SystemBiometricAvailabilityChecker(),
         gitClientRegistry: GitClientTrustRegistry = GitClientTrustRegistry(),
-        gitClientVersionProbe: any GitClientVersionProbing = SystemGitClientVersionProbe()
+        gitClientVersionProbe: any GitClientVersionProbing = SystemGitClientVersionProbe(),
+        directSSHKeys: (any DirectSSHKeyBrokerProviding)? = nil
     ) throws -> CommandResult {
         let context = SSHContext(env: env, executor: executor)
         guard let subcommand = args.first
@@ -143,15 +157,21 @@ public enum SSHCommand {
         case "public-key": return try self.publicKey(
                 Array(args.dropFirst()),
                 options: options,
-                context: context
+                context: context,
+                directSSHKeys: directSSHKeys
             )
-        case "delete": return try self.delete(Array(args.dropFirst()), options: options, context: context)
+        case "delete": return try self.delete(
+                Array(args.dropFirst()), options: options, context: context, directSSHKeys: directSSHKeys
+            )
+        case "migration": return try self.migration(
+                Array(args.dropFirst()), options: options, context: context, directSSHKeys: directSSHKeys
+            )
         case "test": return try self.test(Array(args.dropFirst()), options: options, context: context)
         case "run": return try self.runWrapped(Array(args.dropFirst()), context: context)
         case "agent": return try self.agent(Array(args.dropFirst()), context: context)
         case "shell-init": return try self.shellInit(Array(args.dropFirst()))
         case "git-signing-config": return try self.gitSigningConfig(
-                Array(args.dropFirst()), options: options, context: context
+                Array(args.dropFirst()), options: options, context: context, directSSHKeys: directSSHKeys
             )
         case "git-client": return try GitClientTrustCommand.run(
                 args: Array(args.dropFirst()), options: options,
@@ -345,11 +365,31 @@ public enum SSHCommand {
         label: String,
         env: [String: String] = ProcessInfo.processInfo.environment,
         executor: CommandExecutor = SystemCommandExecutor(),
+        directSSHKeys: (any DirectSSHKeyBrokerProviding)? = nil,
+        selection: VerifiedSessionKeySelection = .activeBackend,
         publicKeyResolver: @Sendable (String, String) throws -> Data = {
             try CTKIdentitySigner.publicKeyBlob(identityLabel: $0, publicKeyHash: $1)
         }
     ) throws -> VerifiedSessionIdentity {
         let context = SSHContext(env: env, executor: executor)
+        if selection == .externallyRegisteredMigrationCandidate {
+            guard let directSSHKeys else {
+                throw CLIError.providerUnavailable(
+                    provider: "MacopAuth",
+                    reason: "Direct SSH key migration support is unavailable."
+                )
+            }
+            return try directSSHKeys.migrationCandidateIdentity(label: label)
+        }
+        let migration: SSHKeyMigrationEntry?
+        if let directSSHKeys {
+            migration = try directSSHKeys.migrationDocument().entries.first { $0.label == label }
+            if migration?.selectedBackend == .directSecureEnclaveV1 {
+                return try directSSHKeys.identity(label: label)
+            }
+        } else {
+            migration = nil
+        }
         let identity = try self.identity(label, context: context)
         guard let publicKeyHash = identity.hash else {
             throw CLIError.providerUnavailable(
@@ -366,9 +406,17 @@ public enum SSHCommand {
                 reason: "Could not resolve exactly one Security identity for the selected CTK label."
             )
         }
-        return VerifiedSessionIdentity(
+        let legacy = VerifiedSessionIdentity(
             fingerprint: sshFingerprint(for: blob), label: label, publicKeyBlob: blob
         )
+        guard let migration else { return legacy }
+        guard constantTimeEqual(
+            Data(legacy.fingerprint.utf8),
+            Data(migration.legacyFingerprint.utf8)
+        ) else {
+            throw CLIError.denied(message: "The legacy SSH identity no longer matches the protected migration state.")
+        }
+        return legacy
     }
 }
 
@@ -376,8 +424,34 @@ public extension SSHCommand {
     static func verifiedSessionIdentity(
         matchingPublicKeyBlob expected: Data,
         env: [String: String] = ProcessInfo.processInfo.environment,
-        executor: CommandExecutor = SystemCommandExecutor()
+        executor: CommandExecutor = SystemCommandExecutor(),
+        directSSHKeys: (any DirectSSHKeyBrokerProviding)? = nil
     ) throws -> VerifiedSessionIdentity {
+        if let directSSHKeys {
+            let document = try directSSHKeys.migrationDocument()
+            let expectedFingerprint = sshFingerprint(for: expected)
+            let directMatches = document.entries.filter {
+                $0.selectedBackend == .directSecureEnclaveV1
+                    && constantTimeEqual($0.directPublicKeyBlob, expected)
+            }
+            if directMatches.count == 1 {
+                return try directSSHKeys.identity(matchingPublicKeyBlob: expected)
+            }
+            guard directMatches.isEmpty else {
+                throw CLIError.providerUnavailable(
+                    provider: "MacopAuth",
+                    reason: "More than one protected direct SSH identity matches the configured key."
+                )
+            }
+            if document.entries.contains(where: {
+                $0.selectedBackend == .directSecureEnclaveV1
+                    && constantTimeEqual(Data($0.legacyFingerprint.utf8), Data(expectedFingerprint.utf8))
+            }) {
+                throw CLIError.denied(
+                    message: "The configured Git signing key is the retired legacy backend for an active migration."
+                )
+            }
+        }
         let context = SSHContext(env: env, executor: executor)
         let identities = try self.identities(context: context)
         let matches = try identities.compactMap { identity -> VerifiedSessionIdentity? in
@@ -417,12 +491,17 @@ private extension SSHCommand {
     private static func gitSigningConfig(
         _ args: [String],
         options: GlobalOptions,
-        context: SSHContext
+        context: SSHContext,
+        directSSHKeys: (any DirectSSHKeyBrokerProviding)?
     ) throws -> CommandResult {
         guard args.count == 1, let label = args.first else {
             throw CLIError.invalidArguments(message: "Usage: macop ssh git-signing-config <label>")
         }
-        let identity = try self.selectedPublicIdentity(label: label, context: context)
+        let identity = try self.selectedPublicIdentity(
+            label: label,
+            context: context,
+            directSSHKeys: directSSHKeys
+        )
         let publicKey = "ecdsa-sha2-nistp256 \(identity.publicKeyBlob.base64EncodedString()) \(label)"
         let program = try RunningExecutable.path()
         if options.format == .json {
@@ -475,13 +554,15 @@ private extension SSHCommand {
     }
 
     private static func agentInvocation(_ args: [String], context: SSHContext) throws -> SSHInvocation {
-        guard let mode = args.first, mode == "shell" || mode == "application" else {
+        guard let mode = args.first,
+              mode == "shell" || mode == "migration-test" || mode == "application"
+        else {
             throw CLIError.invalidArguments(
                 message: "Usage: macop ssh agent shell <identity-label> -- <program> [arguments...] | "
                     + "macop ssh agent application <identity-label> <application-path>"
             )
         }
-        if mode == "shell" {
+        if mode == "shell" || mode == "migration-test" {
             guard args.count >= 4, args[2] == "--" else {
                 throw CLIError
                     .invalidArguments(
@@ -604,15 +685,174 @@ private extension SSHCommand {
         try self.render(self.identities(context: context), action: nil, options)
     }
 
+    private static func migration(
+        _ args: [String],
+        options: GlobalOptions,
+        context: SSHContext,
+        directSSHKeys: (any DirectSSHKeyBrokerProviding)?
+    ) throws -> CommandResult {
+        guard let directSSHKeys, let action = args.first else {
+            throw CLIError.invalidArguments(
+                message: "Usage: macop ssh migration <status|orphans|prepare|public-key|confirm-registered|activate|"
+                    + "retire|confirm-retired|rollback|delete-prepared|delete-orphan> [label]"
+            )
+        }
+        if action == "status" {
+            guard args.count <= 2 else {
+                throw CLIError.invalidArguments(message: "Usage: macop ssh migration status [label]")
+            }
+            return try self.renderMigration(
+                directSSHKeys.migrationDocument(),
+                label: args.count == 2 ? args[1] : nil,
+                action: "status",
+                options: options
+            )
+        }
+        if action == "orphans" {
+            guard args.count == 1 else {
+                throw CLIError.invalidArguments(message: "Usage: macop ssh migration orphans")
+            }
+            let document = try directSSHKeys.migrationDocument()
+            let protectedIDs = Set(document.entries.map(\ .directKeyID))
+            let records = try directSSHKeys.list().filter { !protectedIDs.contains($0.id) }
+            return self.renderOrphans(records, action: action, options: options)
+        }
+        guard args.count == 2 else {
+            throw CLIError.invalidArguments(message: "Usage: macop ssh migration \(action) <label>")
+        }
+        let label = args[1]
+        try self.validate(label: label)
+        if action == "delete-orphan" {
+            let document = try directSSHKeys.migrationDocument()
+            let protectedIDs = Set(document.entries.map(\ .directKeyID))
+            let matches = try directSSHKeys.list().filter {
+                $0.label == label && !protectedIDs.contains($0.id)
+            }
+            guard matches.count == 1, let record = matches.first else {
+                throw matches.isEmpty
+                    ? CLIError.notFound(message: "No unprotected direct SSH key exists for \"\(label)\".")
+                    : CLIError.providerUnavailable(
+                        provider: "MacopAuth",
+                        reason: "More than one unprotected direct SSH key has this label; refusing broad deletion."
+                    )
+            }
+            try directSSHKeys.delete(record)
+            return self.renderOrphans([], action: action, options: options)
+        }
+        if action == "prepare" {
+            let legacy = try self.publicIdentity(self.identity(label, context: context), context: context)
+            _ = try directSSHKeys.create(label: label, legacyFingerprint: legacy.fingerprint)
+            return try self.renderMigration(
+                directSSHKeys.migrationDocument(),
+                label: label,
+                action: action,
+                options: options
+            )
+        }
+        let current = try directSSHKeys.migrationDocument()
+        guard let entry = current.entries.first(where: { $0.label == label }) else {
+            throw CLIError.notFound(message: "No SSH key migration exists for \"\(label)\".")
+        }
+        if action == "public-key" {
+            let line = "ecdsa-sha2-nistp256 \(entry.directPublicKeyBlob.base64EncodedString()) \(entry.label)"
+            if options.format == .json {
+                return self.json(SSHMigrationPublicKeyResponse(
+                    label: entry.label,
+                    phase: entry.phase.rawValue,
+                    publicKey: line
+                ))
+            }
+            return CommandResult(exitCode: 0, stdout: line + "\n")
+        }
+        let transition: SSHKeyMigrationTransition = switch (action, entry.phase) {
+        case ("confirm-registered", .prepared): .confirmExternalRegistration
+        case ("activate", .externallyRegistered): .activateDirectBackend
+        case ("retire", .active): .beginLegacyRetirement
+        case ("confirm-retired", .retiring): .confirmLegacyRetired
+        case ("delete-prepared", .prepared), ("delete-prepared", .deleting): .confirmDirectKeyDeleted
+        case ("rollback", .externallyRegistered): .returnToPreparation
+        case ("rollback", .active): .returnToExternalRegistration
+        case ("rollback", .retiring): .returnToActive
+        default:
+            throw CLIError.invalidArguments(
+                message: "Migration action \"\(action)\" is not valid while \"\(label)\" is \(entry.phase.rawValue)."
+            )
+        }
+        let updated = try directSSHKeys.transition(
+            label: label,
+            expectedGeneration: current.generation,
+            transition: transition
+        )
+        return try self.renderMigration(updated, label: label, action: action, options: options)
+    }
+
+    private static func renderMigration(
+        _ document: SSHKeyMigrationDocument,
+        label: String?,
+        action: String,
+        options: GlobalOptions
+    ) throws -> CommandResult {
+        let entries = label.map { selected in
+            document.entries.filter { $0.label == selected }
+        } ?? document.entries
+        if let label, entries.isEmpty {
+            throw CLIError.notFound(message: "No SSH key migration exists for \"\(label)\".")
+        }
+        let response = SSHMigrationCommandResponse(
+            action: action,
+            stateRevision: document.generation,
+            entries: entries.map(SSHMigrationEntryResponse.init)
+        )
+        if options.format == .json {
+            return self.json(response)
+        }
+        var lines = ["state revision: \(document.generation)"]
+        for entry in response.entries {
+            lines += [
+                "\(entry.label): phase=\(entry.phase) backend=\(entry.backend)",
+                "  legacy fingerprint: \(entry.legacyFingerprint)",
+                "  direct fingerprint: \(entry.directFingerprint)",
+                "  direct public key: \(entry.directPublicKey)",
+                "  next: \(entry.nextAction)"
+            ]
+        }
+        return CommandResult(exitCode: 0, stdout: lines.joined(separator: "\n") + "\n")
+    }
+
+    private static func renderOrphans(
+        _ records: [AuthBrokerDirectSSHKeyRecord],
+        action: String,
+        options: GlobalOptions
+    ) -> CommandResult {
+        let values = records.map(SSHMigrationOrphanResponse.init)
+        if options.format == .json {
+            return self.json(SSHMigrationOrphansResponse(action: action, keys: values))
+        }
+        guard !values.isEmpty else {
+            return CommandResult(exitCode: 0, stdout: "no unprotected direct SSH keys\n")
+        }
+        return CommandResult(
+            exitCode: 0,
+            stdout: values.map {
+                "\($0.label) id=\($0.id) fingerprint=\($0.fingerprint)"
+            }.joined(separator: "\n") + "\n"
+        )
+    }
+
     private static func publicKey(
         _ args: [String],
         options: GlobalOptions,
-        context: SSHContext
+        context: SSHContext,
+        directSSHKeys: (any DirectSSHKeyBrokerProviding)?
     ) throws -> CommandResult {
         guard args.count == 1,
               let label = args.first
         else { throw CLIError.invalidArguments(message: "Usage: macop ssh public-key <label>") }
-        let identity = try self.selectedPublicIdentity(label: label, context: context)
+        let identity = try self.selectedPublicIdentity(
+            label: label,
+            context: context,
+            directSSHKeys: directSSHKeys
+        )
         let line = "ecdsa-sha2-nistp256 \(identity.publicKeyBlob.base64EncodedString()) \(label)"
         switch options.format {
         case .humanReadable: return CommandResult(exitCode: 0, stdout: line + "\n")
@@ -624,11 +864,19 @@ private extension SSHCommand {
     private static func delete(
         _ args: [String],
         options: GlobalOptions,
-        context: SSHContext
+        context: SSHContext,
+        directSSHKeys: (any DirectSSHKeyBrokerProviding)?
     ) throws -> CommandResult {
         guard args.count == 1,
               let label = args.first
         else { throw CLIError.invalidArguments(message: "Usage: macop ssh delete <label>") }
+        if let migration = try directSSHKeys?.migrationDocument().entries.first(where: { $0.label == label }) {
+            guard migration.phase == .retiring else {
+                throw CLIError.denied(
+                    message: "The legacy SSH key can be deleted only after `macop ssh migration retire \(label)`."
+                )
+            }
+        }
         let selected = try identity(label, context: context)
         guard let hash = selected.hash, self.isSHA1Hash(hash) else {
             throw CLIError.providerUnavailable(
@@ -644,18 +892,16 @@ private extension SSHCommand {
     private static func test(
         _ args: [String], options: GlobalOptions, context: SSHContext
     ) throws -> CommandResult {
-        guard args.count <= 2,
-              let label = args.first
-        else { throw CLIError.invalidArguments(message: "Usage: macop ssh test <label> [destination]") }
-        let destination = args.count == 2 ? args[1] : "git@github.com"
-        try self.validate(label: label); try self.validateDestination(destination)
+        let request = try self.parseTestRequest(args)
         let invocation = try self.testInvocation(args, context: context)
         let raw = try self.execute(invocation, context: context)
         let combined = Data((raw.stdout + raw.stderr).utf8)
-        let normalized = self.normalizedTestExitCode(raw.exitCode, output: combined, destination: destination)
+        let normalized = self.normalizedTestExitCode(
+            raw.exitCode, output: combined, destination: request.destination
+        )
         if options.format == .json {
             return self.json(SSHTestResponse(
-                destination: destination,
+                destination: request.destination,
                 status: normalized == 0 ? "authenticated" : "failed",
                 rawExitCode: raw.exitCode,
                 exitCode: normalized
@@ -680,7 +926,6 @@ private extension SSHCommand {
         guard !command.isEmpty
         else { throw CLIError.invalidArguments(message: "ssh run requires a command after \"--\".") }
         try self.validate(label: label)
-        _ = try self.identity(label, context: context)
         // Git shell-interprets GIT_SSH_COMMAND. This value remains safe because
         // every token is a fixed internal constant and no user input is interpolated.
         guard command[0] == "git" || command[0] == "/usr/bin/git" else {
@@ -700,14 +945,11 @@ private extension SSHCommand {
     }
 
     private static func testInvocation(_ args: [String], context: SSHContext) throws -> SSHInvocation {
-        guard args.count <= 2, let label = args.first else {
-            throw CLIError.invalidArguments(message: "Usage: macop ssh test <label> [destination]")
-        }
-        let destination = args.count == 2 ? args[1] : "git@github.com"
-        try self.validate(label: label); try self.validateDestination(destination)
-        _ = try self.identity(label, context: context)
+        let request = try self.parseTestRequest(args)
+        let agentMode = request.usesMigrationCandidate ? "migration-test" : "shell"
         return try self.agentInvocation(
-            ["shell", label, "--", self.ssh] + self.isolatedAgentSSHOptions() + ["-T", destination],
+            [agentMode, request.label, "--", self.ssh]
+                + self.isolatedAgentSSHOptions() + ["-T", request.destination],
             context: context
         )
     }
@@ -723,7 +965,6 @@ private extension SSHCommand {
             throw CLIError.notFound(message: "SSH host alias was not found.")
         }
         try self.validate(label: host.identity)
-        _ = try self.identity(host.identity, context: context)
         var sshArguments = self.isolatedAgentSSHOptions()
         if let port = host.port {
             sshArguments += ["-p", String(port)]
@@ -762,7 +1003,33 @@ private extension SSHCommand {
     }
 
     private static func testDestination(_ args: [String]) -> String {
-        args.count >= 3 ? args[2] : "git@github.com"
+        (try? self.parseTestRequest(Array(args.dropFirst())).destination) ?? "git@github.com"
+    }
+
+    private struct TestRequest {
+        let label: String
+        let destination: String
+        let usesMigrationCandidate: Bool
+    }
+
+    private static func parseTestRequest(_ args: [String]) throws -> TestRequest {
+        let usage = "Usage: macop ssh test <label> [destination] [--migration-candidate]"
+        guard let label = args.first, (1 ... 3).contains(args.count) else {
+            throw CLIError.invalidArguments(message: usage)
+        }
+        let usesCandidate = args.last == "--migration-candidate"
+        let positional = usesCandidate ? Array(args.dropLast()) : args
+        guard (1 ... 2).contains(positional.count),
+              !positional.contains(where: { $0.hasPrefix("--") })
+        else { throw CLIError.invalidArguments(message: usage) }
+        let destination = positional.count == 2 ? positional[1] : "git@github.com"
+        try self.validate(label: label)
+        try self.validateDestination(destination)
+        return TestRequest(
+            label: label,
+            destination: destination,
+            usesMigrationCandidate: usesCandidate
+        )
     }
 
     private static func normalizedTestExitCode(_ raw: Int32, output: Data, destination: String) -> Int32 {
@@ -892,9 +1159,28 @@ private extension SSHCommand {
 
     private static func selectedPublicIdentity(
         label: String,
-        context: SSHContext
+        context: SSHContext,
+        directSSHKeys: (any DirectSSHKeyBrokerProviding)?
     ) throws -> VerifiedSessionIdentity {
-        try self.publicIdentity(self.identity(label, context: context), context: context)
+        if let directSSHKeys {
+            let migration = try directSSHKeys.migrationDocument().entries.first { $0.label == label }
+            if migration?.selectedBackend == .directSecureEnclaveV1 {
+                return try directSSHKeys.identity(label: label)
+            }
+            let legacy = try self.publicIdentity(self.identity(label, context: context), context: context)
+            if let migration {
+                guard constantTimeEqual(
+                    Data(legacy.fingerprint.utf8),
+                    Data(migration.legacyFingerprint.utf8)
+                ) else {
+                    throw CLIError.denied(
+                        message: "The legacy SSH identity no longer matches the protected migration state."
+                    )
+                }
+            }
+            return legacy
+        }
+        return try self.publicIdentity(self.identity(label, context: context), context: context)
     }
 
     private static func publicIdentity(
@@ -1067,6 +1353,81 @@ private struct SSHPublicKeyResponse: Encodable {
     let provider = "security-framework"
     enum CodingKeys: String,
         CodingKey { case schemaVersion = "schema_version", label; case publicKey = "public_key"; case provider }
+}
+
+private struct SSHMigrationCommandResponse: Encodable {
+    let action: String
+    let stateRevision: UInt64
+    let entries: [SSHMigrationEntryResponse]
+
+    enum CodingKeys: String, CodingKey {
+        case action
+        case stateRevision = "state_revision"
+        case entries
+    }
+}
+
+private struct SSHMigrationEntryResponse: Encodable {
+    let label: String
+    let phase: String
+    let backend: String
+    let legacyFingerprint: String
+    let directFingerprint: String
+    let directPublicKey: String
+    let nextAction: String
+
+    init(_ entry: SSHKeyMigrationEntry) {
+        self.label = entry.label
+        self.phase = entry.phase.rawValue
+        self.backend = entry.selectedBackend == .legacyCTK ? "legacy-ctk" : "direct-secure-enclave-v1"
+        self.legacyFingerprint = entry.legacyFingerprint
+        self.directFingerprint = entry.directFingerprint
+        self.directPublicKey = "ecdsa-sha2-nistp256 \(entry.directPublicKeyBlob.base64EncodedString()) \(entry.label)"
+        self.nextAction = switch entry.phase {
+        case .prepared: "register the direct public key, then run confirm-registered"
+        case .externallyRegistered: "run activate after external authentication succeeds"
+        case .active: "run retire only after SSH and Git signing checks succeed"
+        case .retiring: "delete the legacy CTK key, then run confirm-retired"
+        case .retired: "migration complete"
+        case .deleting: "retry delete-prepared to finish cleanup"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case label, phase, backend
+        case legacyFingerprint = "legacy_fingerprint"
+        case directFingerprint = "direct_fingerprint"
+        case directPublicKey = "direct_public_key"
+        case nextAction = "next_action"
+    }
+}
+
+private struct SSHMigrationPublicKeyResponse: Encodable {
+    let label: String
+    let phase: String
+    let publicKey: String
+
+    enum CodingKeys: String, CodingKey {
+        case label, phase
+        case publicKey = "public_key"
+    }
+}
+
+private struct SSHMigrationOrphansResponse: Encodable {
+    let action: String
+    let keys: [SSHMigrationOrphanResponse]
+}
+
+private struct SSHMigrationOrphanResponse: Encodable {
+    let id: String
+    let label: String
+    let fingerprint: String
+
+    init(_ record: AuthBrokerDirectSSHKeyRecord) {
+        self.id = record.id.rawValue
+        self.label = record.label
+        self.fingerprint = sshFingerprint(for: record.publicKeyBlob)
+    }
 }
 
 private struct SSHTestResponse: Encodable {

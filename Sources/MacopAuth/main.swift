@@ -25,10 +25,11 @@ struct MacopAuthApplication: App {
     var body: some Scene {
         WindowGroup("Macop") {
             AuthApprovalView(coordinator: self.coordinator)
-                .frame(minWidth: 480, idealWidth: 560, minHeight: 520, idealHeight: 620)
+                .frame(minWidth: 620, idealWidth: 660, minHeight: 440, idealHeight: 500)
                 .task { self.coordinator.start() }
         }
-        .windowResizability(.contentSize)
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 660, height: 500)
     }
 
     private static func socketPath() -> String? {
@@ -116,16 +117,41 @@ private final class AuthApprovalCoordinator: ObservableObject {
             let context = LAContext()
             context.localizedCancelTitle = "キャンセル"
             context.localizedFallbackTitle = "パスワードを使用"
+            let attemptID = UUID()
             self.continuation = continuation
             self.state = .pending(PendingApproval(
                 request: request,
                 peer: peer,
                 context: context,
-                attemptID: UUID()
+                attemptID: attemptID
             ))
             NSApplication.shared.activate(ignoringOtherApps: true)
             NSApplication.shared.windows.first?.makeKeyAndOrderFront(nil)
             NSRunningApplication.current.activate(options: [.activateAllWindows])
+            self.resizeApprovalWindow(for: request)
+            let now = UInt64(Date().timeIntervalSince1970 * 1000)
+            let deadline = min(request.expiresAtMilliseconds, now + 110_000)
+            let delay = deadline > now ? deadline - now : 0
+            Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(Int64(delay)))
+                self?.expireApproval(attemptID: attemptID)
+            }
+        }
+    }
+
+    private func resizeApprovalWindow(for request: AuthBrokerApprovalRequest) {
+        let height: CGFloat = switch request.operation {
+        case .passwordAutoFill:
+            600
+        case .sshSession:
+            580
+        default:
+            500
+        }
+        Task { @MainActor in
+            guard let window = NSApplication.shared.windows.first else { return }
+            window.setContentSize(NSSize(width: 660, height: height))
+            window.center()
         }
     }
 
@@ -185,6 +211,11 @@ private final class AuthApprovalCoordinator: ObservableObject {
                 self.finish(.denied, pending: pending)
             }
         }
+    }
+
+    func continueToSystemSigningAuthentication(_ pending: PendingApproval) {
+        guard pending.request.operation.phaseTwoKind == .signing else { return }
+        self.finish(.approved, includeAuthenticationContext: false, pending: pending)
     }
 
     func authenticateWithPassword(_ pending: PendingApproval) {
@@ -297,18 +328,27 @@ private final class AuthApprovalCoordinator: ObservableObject {
         }
     }
 
+    private func expireApproval(attemptID: UUID) {
+        guard case let .pending(pending) = self.state,
+              pending.attemptID == attemptID
+        else { return }
+        pending.context.invalidate()
+        self.finish(.denied, pending: pending)
+    }
+
     private func finish(
         _ status: AuthBrokerApprovalStatus,
         credential: Data? = nil,
         username: String? = nil,
         saveToKeychain: Bool = false,
+        includeAuthenticationContext: Bool = true,
         pending: PendingApproval
     ) {
         guard let continuation = self.continuation,
               case let .pending(current) = self.state,
               current.attemptID == pending.attemptID
         else { return }
-        let context: LAContext? = if status == .approved {
+        let context: LAContext? = if status == .approved, includeAuthenticationContext {
             current.context
         } else {
             nil
@@ -350,6 +390,12 @@ private final class AuthApprovalCoordinator: ObservableObject {
             "macop管理のKeychain項目を削除します。"
         case .gitSSHSign:
             "Secure EnclaveのSSH鍵でGit commitまたはtagへ署名します。"
+        case .directSSHKeyCreate:
+            "Touch ID、Apple Watch、またはMacパスワードで保護するSecure Enclave SSH鍵を作成します。"
+        case .directSSHKeyDelete:
+            "Secure Enclave SSH鍵を削除します。"
+        case .sshMigrationTransition:
+            "Secure Enclave SSH鍵の移行状態を変更します。"
         }
     }
 
@@ -386,6 +432,9 @@ private enum AuthBrokerRuntimeCapabilities {
                 | AuthBrokerCapability.passwordAutoFill.rawValue
                 | AuthBrokerCapability.passwordAutoFillUsername.rawValue
         }
+        if AuthBrokerRuntimeCapabilities.sshKeyAccessGroup != nil {
+            capabilities |= AuthBrokerCapability.directSSHKeyManagement.rawValue
+        }
         return capabilities
     }()
 
@@ -393,7 +442,7 @@ private enum AuthBrokerRuntimeCapabilities {
         self.gitClientTrustAccessGroup != nil
     }
 
-    static let gitClientTrustAccessGroup: String? = {
+    private static let resolvedKeychainAccessGroups: MacopAuthEntitlementPolicy.Resolved? = {
         var code: SecCode?
         guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return nil }
         var staticCode: SecStaticCode?
@@ -409,13 +458,14 @@ private enum AuthBrokerRuntimeCapabilities {
             let applicationIdentifier = entitlements["com.apple.application-identifier"] as? String,
             let accessGroups = entitlements["keychain-access-groups"] as? [String]
         else { return nil }
-        let expectedSuffix = ".io.github.slashkiko.macop.auth"
-        guard applicationIdentifier.hasSuffix(expectedSuffix),
-              let teamID = applicationIdentifier.split(separator: ".").first,
-              applicationIdentifier == "\(teamID)\(expectedSuffix)",
-              accessGroups.contains(applicationIdentifier) else { return nil }
-        return applicationIdentifier
+        return MacopAuthEntitlementPolicy.resolve(
+            applicationIdentifier: applicationIdentifier,
+            keychainAccessGroups: accessGroups
+        )
     }()
+
+    static let gitClientTrustAccessGroup = resolvedKeychainAccessGroups?.managedKeychainAccessGroup
+    static let sshKeyAccessGroup = resolvedKeychainAccessGroups?.sshKeyAccessGroup
 }
 
 /// This item is deliberately owned by the MacopAuth app's private access
@@ -473,6 +523,85 @@ private final class MacopAuthGitClientTrustStateStore: GitClientTrustStateStorin
     private func generationData(_ value: UInt64) -> Data {
         withUnsafeBytes(of: value.bigEndian) { Data($0) }
     }
+}
+
+private final class MacopAuthSSHKeyMigrationStateStore: SSHKeyMigrationStateStoring, @unchecked Sendable {
+    private let queries: SSHKeyMigrationKeychainQueryBuilder
+
+    init(accessGroup: String) throws {
+        self.queries = try SSHKeyMigrationKeychainQueryBuilder(accessGroup: accessGroup)
+    }
+
+    func load() throws -> SSHKeyMigrationDocument? {
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(self.queries.read() as CFDictionary, &result)
+        if status == errSecItemNotFound {
+            return nil
+        }
+        guard status == errSecSuccess, let data = result as? Data else {
+            throw AgentProtocolError.denied
+        }
+        return try SSHKeyMigrationDocument.decode(data)
+    }
+
+    func compareAndSwap(expectedGeneration: UInt64?, next: SSHKeyMigrationDocument) throws -> Bool {
+        guard (expectedGeneration ?? 0) < UInt64.max else { throw AgentProtocolError.denied }
+        let expectedNext = (expectedGeneration ?? 0) + 1
+        guard next.generation == expectedNext else { throw AgentProtocolError.denied }
+        let data = try next.encoded()
+        if let expectedGeneration {
+            let status = SecItemUpdate(
+                self.queries.update(generation: self.generationData(expectedGeneration)) as CFDictionary,
+                [kSecValueData: data, kSecAttrGeneric: self.generationData(next.generation)] as CFDictionary
+            )
+            if status == errSecItemNotFound {
+                return false
+            }
+            guard status == errSecSuccess else { throw AgentProtocolError.denied }
+            return true
+        }
+        let attributes = self.queries.add().merging([
+            kSecAttrGeneric: self.generationData(next.generation),
+            kSecValueData: data
+        ]) { _, new in new }
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            return false
+        }
+        guard status == errSecSuccess else { throw AgentProtocolError.denied }
+        return true
+    }
+
+    private func generationData(_ value: UInt64) -> Data {
+        withUnsafeBytes(of: value.bigEndian) { Data($0) }
+    }
+}
+
+private enum SSHKeyMigrationBrokerFailure: Error {
+    case notFound
+    case generationConflict(UInt64)
+    case denied
+
+    var status: AuthBrokerSSHMigrationStatus {
+        switch self {
+        case .notFound: .notFound
+        case .generationConflict: .generationConflict
+        case .denied: .denied
+        }
+    }
+
+    var generation: UInt64 {
+        if case let .generationConflict(value) = self {
+            return value
+        }
+        return 0
+    }
+}
+
+private enum DirectSSHKeyMutationFailure: Error {
+    case generationConflict
+    case protectedRecord
+    case indeterminate
 }
 
 // swiftlint:disable:next type_body_length
@@ -543,6 +672,24 @@ private enum AuthBrokerAppServer {
             )
             await coordinator.terminateSoon(after: .seconds(2))
             return
+        case let .directSSHKeyRequest(request):
+            guard request.operation == .list,
+                  let accessGroup = AuthBrokerRuntimeCapabilities.sshKeyAccessGroup
+            else { throw AgentProtocolError.denied }
+            try self.serveDirectSSHKeyList(
+                client: client,
+                request: request,
+                accessGroup: accessGroup
+            )
+            await coordinator.terminateSoon(after: .milliseconds(250))
+            return
+        case let .sshMigrationRequest(request):
+            guard request.action == .list,
+                  let accessGroup = AuthBrokerRuntimeCapabilities.sshKeyAccessGroup
+            else { throw AgentProtocolError.denied }
+            try self.serveSSHMigrationList(client: client, request: request, accessGroup: accessGroup)
+            await coordinator.terminateSoon(after: .milliseconds(250))
+            return
         case let .approvalRequest(request):
             try await self.serveApprovalRequest(
                 client: client,
@@ -583,6 +730,21 @@ private enum AuthBrokerAppServer {
                 throw AgentProtocolError.denied
             }
         }
+        if request.operation.family == .directSSHKeyManagement {
+            guard request.keychainService.isEmpty, request.keychainAccount.isEmpty,
+                  request.host.isEmpty,
+                  request.sshKeyBackend == .directSecureEnclaveV1,
+                  (try? SSHIdentityLabelValidator.validate(request.credentialLabel)) != nil
+            else { throw AgentProtocolError.denied }
+            switch request.operation {
+            case .directSSHKeyCreate:
+                guard !request.credentialFingerprint.isEmpty else { throw AgentProtocolError.denied }
+            case .directSSHKeyDelete, .sshMigrationTransition:
+                guard !request.credentialFingerprint.isEmpty else { throw AgentProtocolError.denied }
+            default:
+                throw AgentProtocolError.denied
+            }
+        }
         try self.validateRoot(request)
         let outcome = await coordinator.requestApproval(request, peer: peer)
         let signer: (any AgentKeySigning)?
@@ -590,7 +752,7 @@ private enum AuthBrokerAppServer {
         var resultData = Data()
         var resultMessage = ""
         let isSigningRequest = request.operation.phaseTwoKind == .signing
-        if outcome.status == .approved, let context = outcome.context, isSigningRequest {
+        if outcome.status == .approved, isSigningRequest {
             do {
                 try self.validateRoot(request)
             } catch {
@@ -603,11 +765,11 @@ private enum AuthBrokerAppServer {
                 await coordinator.terminateSoon(after: .seconds(2))
                 return
             }
-            let candidate: CTKIdentitySigner
+            let candidate: any AgentKeySigning
             do {
-                candidate = try SSHCommand.makeVerifiedSessionSigner(
-                    label: request.credentialLabel,
-                    authenticationContext: context
+                candidate = try self.signer(
+                    for: request,
+                    authenticationContext: outcome.context
                 )
             } catch {
                 await self.completeSigningFailure(
@@ -820,10 +982,474 @@ private enum AuthBrokerAppServer {
             )
             await coordinator.terminateSoon(after: .seconds(2))
             return
+        } else if outcome.status == .approved,
+                  request.operation == .directSSHKeyCreate || request.operation == .directSSHKeyDelete,
+                  let accessGroup = AuthBrokerRuntimeCapabilities.sshKeyAccessGroup
+        // swiftlint:disable:next opening_brace
+        {
+            await self.serveDirectSSHKeyMutation(
+                client: client,
+                approval: request,
+                accessGroup: accessGroup,
+                coordinator: coordinator
+            )
+            await coordinator.terminateSoon(after: .seconds(2))
+            return
+        } else if outcome.status == .approved,
+                  request.operation == .sshMigrationTransition,
+                  let accessGroup = AuthBrokerRuntimeCapabilities.sshKeyAccessGroup
+        // swiftlint:disable:next opening_brace
+        {
+            await self.serveSSHMigrationTransition(
+                client: client,
+                approval: request,
+                accessGroup: accessGroup,
+                coordinator: coordinator
+            )
+            await coordinator.terminateSoon(after: .seconds(2))
+            return
         }
         await coordinator.terminateSoon(
             after: request.operation == .passwordAutoFill ? .seconds(2) : .milliseconds(250)
         )
+    }
+
+    private static func serveDirectSSHKeyList(
+        client: Int32,
+        request: AuthBrokerDirectSSHKeyRequest,
+        accessGroup: String
+    ) throws {
+        let response: AuthBrokerDirectSSHKeyResponse
+        do {
+            let records = try DirectSecureEnclaveKeyStore(accessGroup: accessGroup).list()
+                .map(AuthBrokerDirectSSHKeyRecord.init)
+            response = AuthBrokerDirectSSHKeyResponse(
+                authorizationID: request.authorizationID,
+                operation: .list,
+                status: .success,
+                records: records
+            )
+        } catch {
+            response = AuthBrokerDirectSSHKeyResponse(
+                authorizationID: request.authorizationID,
+                operation: .list,
+                status: self.directSSHKeyStatus(for: error)
+            )
+        }
+        try AuthBrokerSocketIO.writeMessage(.directSSHKeyResponse(response), to: client, timeout: 10)
+    }
+
+    private static func serveSSHMigrationList(
+        client: Int32,
+        request: AuthBrokerSSHMigrationRequest,
+        accessGroup: String
+    ) throws {
+        let response: AuthBrokerSSHMigrationResponse
+        do {
+            let document = try MacopAuthSSHKeyMigrationStateStore(accessGroup: accessGroup).load()
+            response = AuthBrokerSSHMigrationResponse(
+                requestID: request.requestID,
+                action: .list,
+                status: .success,
+                generation: document?.generation ?? 0,
+                entries: document?.entries ?? []
+            )
+        } catch {
+            response = AuthBrokerSSHMigrationResponse(
+                requestID: request.requestID,
+                action: .list,
+                status: .unavailable,
+                generation: 0
+            )
+        }
+        try AuthBrokerSocketIO.writeMessage(.sshMigrationResponse(response), to: client, timeout: 10)
+    }
+
+    private static func serveSSHMigrationTransition(
+        client: Int32,
+        approval: AuthBrokerApprovalRequest,
+        accessGroup: String,
+        coordinator: AuthApprovalCoordinator
+    ) async {
+        let request: AuthBrokerSSHMigrationRequest
+        do {
+            guard case let .sshMigrationRequest(received) = try AuthBrokerSocketIO.readMessage(
+                from: client,
+                timeout: 30
+            ), received.requestID == approval.requestID,
+            received.action == .transition else { throw AgentProtocolError.denied }
+            try self.validateRoot(approval)
+            try self.validateSSHMigrationTransition(received, approval: approval)
+            request = received
+        } catch {
+            await coordinator.complete("SSH鍵の移行要求を検証できませんでした", isSuccess: false)
+            return
+        }
+
+        let response: AuthBrokerSSHMigrationResponse
+        do {
+            let store = try MacopAuthSSHKeyMigrationStateStore(accessGroup: accessGroup)
+            guard let current = try store.load() else {
+                throw SSHKeyMigrationBrokerFailure.notFound
+            }
+            guard current.generation == request.expectedGeneration else {
+                throw SSHKeyMigrationBrokerFailure.generationConflict(current.generation)
+            }
+            guard let index = current.entries.firstIndex(where: { $0.label == request.label }),
+                  let transition = request.transition
+            else { throw SSHKeyMigrationBrokerFailure.notFound }
+            let selected = current.entries[index]
+            guard constantTimeEqual(
+                Data(selected.directFingerprint.utf8),
+                Data(approval.credentialFingerprint.utf8)
+            ) else { throw SSHKeyMigrationBrokerFailure.denied }
+            if transition == .confirmDirectKeyDeleted {
+                response = try self.deletePreparedDirectSSHKey(
+                    request: request,
+                    current: current,
+                    selectedIndex: index,
+                    accessGroup: accessGroup,
+                    migrationStore: store
+                )
+            } else {
+                guard current.generation < UInt64.max,
+                      let updated = try selected.applying(transition)
+                else { throw SSHKeyMigrationBrokerFailure.denied }
+                var entries = current.entries
+                entries[index] = updated
+                let next = try SSHKeyMigrationDocument(generation: current.generation + 1, entries: entries)
+                guard try store.compareAndSwap(expectedGeneration: current.generation, next: next) else {
+                    throw try SSHKeyMigrationBrokerFailure.generationConflict((store.load())?.generation ?? 0)
+                }
+                response = AuthBrokerSSHMigrationResponse(
+                    requestID: request.requestID,
+                    action: .transition,
+                    status: .success,
+                    generation: next.generation,
+                    entries: next.entries
+                )
+            }
+        } catch let failure as SSHKeyMigrationBrokerFailure {
+            response = AuthBrokerSSHMigrationResponse(
+                requestID: request.requestID,
+                action: .transition,
+                status: failure.status,
+                generation: failure.generation
+            )
+        } catch {
+            response = AuthBrokerSSHMigrationResponse(
+                requestID: request.requestID,
+                action: .transition,
+                status: .failed,
+                generation: request.expectedGeneration
+            )
+        }
+
+        do {
+            try self.validateRoot(approval)
+            try AuthBrokerSocketIO.writeMessage(.sshMigrationResponse(response), to: client, timeout: 30)
+            await coordinator.complete(
+                response.status == .success ? "SSH鍵の移行状態を更新しました" : "SSH鍵の移行状態を更新できませんでした",
+                isSuccess: response.status == .success
+            )
+        } catch {
+            await coordinator.complete("移行結果を要求元へ通知できませんでした", isSuccess: false)
+        }
+    }
+
+    private static func deletePreparedDirectSSHKey(
+        request: AuthBrokerSSHMigrationRequest,
+        current: SSHKeyMigrationDocument,
+        selectedIndex: Int,
+        accessGroup: String,
+        migrationStore: MacopAuthSSHKeyMigrationStateStore
+    ) throws -> AuthBrokerSSHMigrationResponse {
+        let selected = current.entries[selectedIndex]
+        guard selected.phase == .prepared || selected.phase == .deleting else {
+            throw SSHKeyMigrationBrokerFailure.denied
+        }
+        var deletingDocument = current
+        if selected.phase == .prepared {
+            guard current.generation < UInt64.max else { throw SSHKeyMigrationBrokerFailure.denied }
+            var entries = current.entries
+            entries[selectedIndex] = try selected.changingPhase(to: .deleting)
+            deletingDocument = try SSHKeyMigrationDocument(
+                generation: current.generation + 1,
+                entries: entries
+            )
+            guard try migrationStore.compareAndSwap(
+                expectedGeneration: current.generation,
+                next: deletingDocument
+            ) else {
+                throw try SSHKeyMigrationBrokerFailure.generationConflict(
+                    migrationStore.load()?.generation ?? 0
+                )
+            }
+        }
+
+        do {
+            try DirectSecureEnclaveKeyStore(accessGroup: accessGroup).delete(
+                id: selected.directKeyID,
+                expectedPublicKeyBlob: selected.directPublicKeyBlob
+            )
+        } catch DirectSecureEnclaveKeyStoreError.notFound {
+            // A prior attempt can crash after deleting the key but before the
+            // final CAS. The protected deleting marker makes that retry safe.
+        }
+
+        guard let afterDeletion = try migrationStore.load(),
+              afterDeletion.generation < UInt64.max,
+              let deletingIndex = afterDeletion.entries.firstIndex(where: {
+                  $0.label == selected.label
+                      && $0.directKeyID == selected.directKeyID
+                      && $0.phase == .deleting
+              })
+        else { throw SSHKeyMigrationBrokerFailure.notFound }
+        var remaining = afterDeletion.entries
+        remaining.remove(at: deletingIndex)
+        let final = try SSHKeyMigrationDocument(
+            generation: afterDeletion.generation + 1,
+            entries: remaining
+        )
+        guard try migrationStore.compareAndSwap(
+            expectedGeneration: afterDeletion.generation,
+            next: final
+        ) else {
+            throw try SSHKeyMigrationBrokerFailure.generationConflict(
+                migrationStore.load()?.generation ?? 0
+            )
+        }
+        return AuthBrokerSSHMigrationResponse(
+            requestID: request.requestID,
+            action: .transition,
+            status: .success,
+            generation: final.generation,
+            entries: final.entries
+        )
+    }
+
+    private static func validateSSHMigrationTransition(
+        _ request: AuthBrokerSSHMigrationRequest,
+        approval: AuthBrokerApprovalRequest
+    ) throws {
+        guard request.label == approval.credentialLabel, let transition = request.transition else {
+            throw AgentProtocolError.denied
+        }
+        let valid = switch approval.purpose {
+        case .sshMigrationConfirmExternal: transition == .confirmExternalRegistration
+        case .sshMigrationActivate: transition == .activateDirectBackend
+        case .sshMigrationBeginRetirement: transition == .beginLegacyRetirement
+        case .sshMigrationConfirmRetired: transition == .confirmLegacyRetired
+        case .sshMigrationRollback:
+            transition == .returnToPreparation || transition == .returnToExternalRegistration
+                || transition == .returnToActive
+        case .sshMigrationDeletePrepared: transition == .confirmDirectKeyDeleted
+        default: false
+        }
+        guard valid else { throw AgentProtocolError.denied }
+    }
+
+    private static func signer(
+        for request: AuthBrokerApprovalRequest,
+        authenticationContext: LAContext?
+    ) throws -> any AgentKeySigning {
+        switch request.sshKeyBackend {
+        case .legacyCTK:
+            if let accessGroup = AuthBrokerRuntimeCapabilities.sshKeyAccessGroup {
+                let migration = try MacopAuthSSHKeyMigrationStateStore(accessGroup: accessGroup)
+                    .load()?.entries.first(where: { $0.label == request.credentialLabel })
+                if let migration {
+                    guard migration.selectedBackend == .legacyCTK,
+                          constantTimeEqual(
+                              Data(migration.legacyFingerprint.utf8),
+                              Data(request.credentialFingerprint.utf8)
+                          )
+                    else { throw AgentProtocolError.denied }
+                }
+            }
+            return try SSHCommand.makeVerifiedSessionSigner(label: request.credentialLabel)
+        case .directSecureEnclaveV1:
+            guard let authenticationContext else { throw AgentProtocolError.denied }
+            guard let accessGroup = AuthBrokerRuntimeCapabilities.sshKeyAccessGroup else {
+                throw DirectSecureEnclaveKeyStoreError.invalidAccessGroup
+            }
+            guard let migration = try MacopAuthSSHKeyMigrationStateStore(accessGroup: accessGroup)
+                .load()?.entries.first(where: { $0.label == request.credentialLabel }),
+                // The externally-registered phase permits an explicit
+                // pre-activation SSH proof. Normal selection remains on the
+                // legacy backend; only `ssh test --migration-candidate`
+                // requests the exact direct fingerprint in this phase.
+                migration.permitsDirectSigning,
+                constantTimeEqual(
+                    Data(migration.directFingerprint.utf8),
+                    Data(request.credentialFingerprint.utf8)
+                )
+            else { throw AgentProtocolError.denied }
+            let store = try DirectSecureEnclaveKeyStore(accessGroup: accessGroup)
+            return try store.signer(
+                id: migration.directKeyID,
+                expectedPublicKeyBlob: migration.directPublicKeyBlob,
+                authenticationContext: authenticationContext
+            )
+        }
+    }
+
+    private static func serveDirectSSHKeyMutation(
+        client: Int32,
+        approval: AuthBrokerApprovalRequest,
+        accessGroup: String,
+        coordinator: AuthApprovalCoordinator
+    ) async {
+        let request: AuthBrokerDirectSSHKeyRequest
+        do {
+            guard case let .directSSHKeyRequest(received) = try AuthBrokerSocketIO.readMessage(
+                from: client,
+                timeout: 30
+            ), received.authorizationID == approval.requestID else {
+                throw AgentProtocolError.denied
+            }
+            try self.validateRoot(approval)
+            try self.validateDirectSSHKeyMutation(received, approval: approval)
+            request = received
+        } catch {
+            await coordinator.complete("SSH鍵の操作要求を検証できませんでした", isSuccess: false)
+            return
+        }
+
+        let response: AuthBrokerDirectSSHKeyResponse
+        do {
+            let store = try DirectSecureEnclaveKeyStore(accessGroup: accessGroup)
+            switch request.operation {
+            case .create:
+                let migrationStore = try MacopAuthSSHKeyMigrationStateStore(accessGroup: accessGroup)
+                let current = try migrationStore.load()
+                let generation = current?.generation ?? 0
+                guard generation == request.expectedGeneration,
+                      current?.entries.allSatisfy({ $0.label != request.label }) ?? true,
+                      generation < UInt64.max
+                else { throw DirectSSHKeyMutationFailure.generationConflict }
+                let record = try store.create(label: request.label)
+                do {
+                    let entry = try SSHKeyMigrationEntry(
+                        label: record.label,
+                        legacyFingerprint: request.legacyFingerprint,
+                        directKeyID: record.id,
+                        directPublicKeyBlob: record.publicKeyBlob,
+                        phase: .prepared
+                    )
+                    let next = try SSHKeyMigrationDocument(
+                        generation: generation + 1,
+                        entries: (current?.entries ?? []) + [entry]
+                    )
+                    guard try migrationStore.compareAndSwap(
+                        expectedGeneration: current?.generation,
+                        next: next
+                    ) else { throw DirectSSHKeyMutationFailure.generationConflict }
+                } catch {
+                    do {
+                        try store.delete(id: record.id, expectedPublicKeyBlob: record.publicKeyBlob)
+                    } catch {
+                        throw DirectSSHKeyMutationFailure.indeterminate
+                    }
+                    throw error
+                }
+                response = AuthBrokerDirectSSHKeyResponse(
+                    authorizationID: request.authorizationID,
+                    operation: .create,
+                    status: .success,
+                    records: [AuthBrokerDirectSSHKeyRecord(record)]
+                )
+            case .delete:
+                guard let id = request.id else { throw AgentProtocolError.denied }
+                let migration = try MacopAuthSSHKeyMigrationStateStore(accessGroup: accessGroup).load()
+                guard migration?.entries.allSatisfy({ $0.directKeyID != id }) ?? true else {
+                    throw DirectSSHKeyMutationFailure.protectedRecord
+                }
+                try store.delete(id: id, expectedPublicKeyBlob: request.expectedPublicKeyBlob)
+                response = AuthBrokerDirectSSHKeyResponse(
+                    authorizationID: request.authorizationID,
+                    operation: .delete,
+                    status: .success
+                )
+            case .list:
+                throw AgentProtocolError.denied
+            }
+        } catch {
+            response = AuthBrokerDirectSSHKeyResponse(
+                authorizationID: request.authorizationID,
+                operation: request.operation,
+                status: self.directSSHKeyStatus(for: error)
+            )
+        }
+
+        do {
+            try self.validateRoot(approval)
+            try AuthBrokerSocketIO.writeMessage(.directSSHKeyResponse(response), to: client, timeout: 30)
+            let success = response.status == .success
+            let message = switch (request.operation, response.status) {
+            case (.create, .success): "Secure Enclave SSH鍵を作成しました"
+            case (.delete, .success): "Secure Enclave SSH鍵を削除しました"
+            case (_, .indeterminate): "SSH鍵の操作結果を確定できません。再実行前に一覧を確認してください"
+            default: "Secure Enclave SSH鍵を操作できませんでした"
+            }
+            await coordinator.complete(message, isSuccess: success)
+        } catch {
+            await coordinator.complete(
+                "SSH鍵の操作は完了した可能性がありますが、要求元への通知を確認できません",
+                isSuccess: false
+            )
+        }
+    }
+
+    private static func validateDirectSSHKeyMutation(
+        _ request: AuthBrokerDirectSSHKeyRequest,
+        approval: AuthBrokerApprovalRequest
+    ) throws {
+        switch (approval.operation, request.operation) {
+        case (.directSSHKeyCreate, .create):
+            guard request.label == approval.credentialLabel,
+                  constantTimeEqual(
+                      Data(request.legacyFingerprint.utf8),
+                      Data(approval.credentialFingerprint.utf8)
+                  )
+            else { throw AgentProtocolError.denied }
+        case (.directSSHKeyDelete, .delete):
+            guard request.label == approval.credentialLabel,
+                  constantTimeEqual(
+                      Data(sshFingerprint(for: request.expectedPublicKeyBlob).utf8),
+                      Data(approval.credentialFingerprint.utf8)
+                  )
+            else { throw AgentProtocolError.denied }
+        default:
+            throw AgentProtocolError.denied
+        }
+    }
+
+    private static func directSSHKeyStatus(for error: Error) -> AuthBrokerDirectSSHKeyStatus {
+        switch error {
+        case DirectSSHKeyMutationFailure.generationConflict:
+            .generationConflict
+        case DirectSSHKeyMutationFailure.protectedRecord:
+            .denied
+        case DirectSSHKeyMutationFailure.indeterminate:
+            .indeterminate
+        case DirectSecureEnclaveKeyStoreError.notFound:
+            .notFound
+        case DirectSecureEnclaveKeyStoreError.duplicateLabel:
+            .duplicate
+        case DirectSecureEnclaveKeyStoreError.fingerprintMismatch:
+            .denied
+        case DirectSecureEnclaveKeyStoreError.indeterminate:
+            .indeterminate
+        case DirectSecureEnclaveKeyStoreError.invalidAccessGroup,
+             DirectSecureEnclaveKeyStoreError.malformedStore,
+             DirectSecureEnclaveKeyStoreError.creationFailed:
+            .unavailable
+        case DirectSecureEnclaveKeyStoreError.securityFailure:
+            .failed
+        default:
+            .failed
+        }
     }
 
     private static func serveGitClientTrustVerify(
@@ -975,6 +1601,8 @@ private enum AuthBrokerAppServer {
                 "Keychain項目を読み取れませんでした"
             case .managedKeychainDelete:
                 "Keychain項目の削除に失敗しました"
+            case .directSSHKeyCreate, .directSSHKeyDelete, .sshMigrationTransition:
+                "Secure Enclave SSH鍵の操作に失敗しました"
             default:
                 "許可後の処理に失敗しました"
             }
@@ -995,6 +1623,12 @@ private enum AuthBrokerAppServer {
             "Git SSH署名を許可しました"
         case .passwordAutoFill:
             "資格情報の使用を許可しました"
+        case .directSSHKeyCreate:
+            "Secure Enclave SSH鍵の作成を許可しました"
+        case .directSSHKeyDelete:
+            "Secure Enclave SSH鍵の削除を許可しました"
+        case .sshMigrationTransition:
+            "Secure Enclave SSH鍵の移行状態変更を許可しました"
         }
         return (message, true)
     }
@@ -1108,6 +1742,9 @@ private enum AuthBrokerAppServer {
                 sign: {
                     try signer.sign(data: signRequest.data, flags: signRequest.flags)
                 },
+                revalidate: {
+                    try self.validateRoot(request)
+                },
                 deliver: { outcome, signature in
                     try AuthBrokerSocketIO.writeMessage(.sshSignResponse(AuthBrokerSSHSignResponse(
                         authorizationID: request.requestID,
@@ -1181,28 +1818,41 @@ private struct AuthApprovalView: View {
             case .starting:
                 ProgressView("承認要求を確認しています…")
             case let .pending(pending):
-                if pending.request.operation == .passwordAutoFill {
-                    PasswordAutoFillRequestView(
-                        pending: pending,
-                        submit: { username, password, save, passwordOnly in
-                            self.coordinator.submitCredential(
-                                username: username,
-                                password,
-                                saveToKeychain: save,
-                                passwordOnly: passwordOnly,
-                                pending: pending
-                            )
-                        },
-                        cancel: self.coordinator.cancel
-                    )
-                } else {
-                    ApprovalRequestView(
-                        pending: pending,
-                        usePassword: { self.coordinator.authenticateWithPassword(pending) },
-                        cancel: self.coordinator.cancel
-                    )
-                    .task(id: pending.request.requestID) { self.coordinator.authenticate(pending) }
+                Group {
+                    if pending.request.operation == .passwordAutoFill {
+                        PasswordAutoFillRequestView(
+                            pending: pending,
+                            submit: { username, password, save, passwordOnly in
+                                self.coordinator.submitCredential(
+                                    username: username,
+                                    password,
+                                    saveToKeychain: save,
+                                    passwordOnly: passwordOnly,
+                                    pending: pending
+                                )
+                            },
+                            cancel: self.coordinator.cancel
+                        )
+                    } else {
+                        ApprovalRequestView(
+                            pending: pending,
+                            continueToSystemSigningAuthentication: {
+                                self.coordinator.continueToSystemSigningAuthentication(pending)
+                            },
+                            usePassword: { self.coordinator.authenticateWithPassword(pending) },
+                            cancel: self.coordinator.cancel
+                        )
+                        .task(id: pending.request.requestID) {
+                            if pending.request.operation.phaseTwoKind != .signing
+                                || pending.request.sshKeyBackend == .directSecureEnclaveV1
+                            // swiftlint:disable:next opening_brace
+                            {
+                                self.coordinator.authenticate(pending)
+                            }
+                        }
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             case .processing:
                 ProgressView("処理しています…")
             case let .completed(completion):
@@ -1395,6 +2045,7 @@ private struct ApprovalRequestView: View {
     }
 
     let pending: AuthApprovalCoordinator.PendingApproval
+    let continueToSystemSigningAuthentication: () -> Void
     let usePassword: () -> Void
     let cancel: () -> Void
 
@@ -1414,8 +2065,6 @@ private struct ApprovalRequestView: View {
                 Spacer()
             }
             Divider()
-            LocalAuthenticationView("Touch ID／Apple Watchで許可", context: self.pending.context)
-                .controlSize(.large)
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
                 if self.isManagedKeychainRequest {
                     self.row("操作", self.managedKeychainAction)
@@ -1425,6 +2074,13 @@ private struct ApprovalRequestView: View {
                         self.row("サービス", self.pending.request.keychainService)
                         self.row("アカウント", self.pending.request.keychainAccount)
                     }
+                } else if self.isDirectSSHKeyManagementRequest {
+                    self.row("対象", self.directSSHKeyManagementAction)
+                    self.row("鍵", self.pending.request.credentialLabel)
+                    if !self.pending.request.credentialFingerprint.isEmpty {
+                        self.row("フィンガープリント", self.pending.request.credentialFingerprint)
+                    }
+                    self.row("保護", "Touch ID／Apple Watch／Macパスワード")
                 } else {
                     if let target = self.sshSessionTargetPresentation {
                         self.row("実行対象", target.application)
@@ -1439,23 +2095,79 @@ private struct ApprovalRequestView: View {
                 self.row("操作", self.pending.request.purpose.displayName)
             }
             .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
-            HStack {
-                Text("現在のプロセスと要求内容にだけ有効")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Macのパスワードを使用", action: self.usePassword)
-                Button("キャンセル", action: self.cancel)
-                    .keyboardShortcut(.cancelAction)
+            if self.usesEmbeddedAuthentication {
+                LocalAuthenticationView("Touch ID／Apple Watchで許可", context: self.pending.context)
+                    .controlSize(.regular)
+                self.embeddedAuthenticationActions
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("次にmacOSの鍵認証が1回表示されます", systemImage: "lock.shield")
+                        .font(.headline)
+                    Text(self.signingAuthenticationDescription)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Text("現在のプロセスと要求内容にだけ有効")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("キャンセル", action: self.cancel)
+                            .keyboardShortcut(.cancelAction)
+                        Button(
+                            "Touch ID／Macパスワード認証へ進む",
+                            action: self.continueToSystemSigningAuthentication
+                        )
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                    }
+                }
             }
+        }
+    }
+
+    private var embeddedAuthenticationActions: some View {
+        HStack {
+            Text("現在のプロセスと要求内容にだけ有効")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("キャンセル", action: self.cancel)
+                .keyboardShortcut(.cancelAction)
+            Button("Macのパスワードを使用", action: self.usePassword)
         }
     }
 
     private func row(_ label: String, _ value: String) -> some View {
         GridRow {
             Text(label).foregroundStyle(.secondary)
-            Text(value).lineLimit(2).textSelection(.enabled)
+            Text(value)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+
+    private var isSigningRequest: Bool {
+        self.pending.request.operation.phaseTwoKind == .signing
+    }
+
+    private var usesEmbeddedAuthentication: Bool {
+        !self.isSigningRequest || self.pending.request.sshKeyBackend == .directSecureEnclaveV1
+    }
+
+    private var signingAuthenticationDescription: String {
+        "CTKCardTokenでTouch IDまたはMacのパスワードを使用します。"
+            + "このSecure Enclave鍵はApple Watchでは解除できません。"
+    }
+
+    private var directSSHKeyManagementAction: String {
+        switch self.pending.request.operation {
+        case .directSSHKeyCreate: "SSH鍵の新規作成"
+        case .directSSHKeyDelete: "SSH鍵の削除"
+        case .sshMigrationTransition: self.pending.request.purpose.displayName
+        default: "SSH鍵の操作"
         }
     }
 
@@ -1465,6 +2177,10 @@ private struct ApprovalRequestView: View {
 
     private var isManagedKeychainRequest: Bool {
         self.pending.request.operation.family == .managedKeychain
+    }
+
+    private var isDirectSSHKeyManagementRequest: Bool {
+        self.pending.request.operation.family == .directSSHKeyManagement
     }
 
     private var sshSessionTargetPresentation: SSHSessionTargetPresentation? {
@@ -1497,6 +2213,9 @@ private struct ApprovalRequestView: View {
     private var requestTitle: String {
         if self.isManagedKeychainRequest {
             return "\(self.requesterName) がKeychain項目の\(self.managedKeychainAction)を要求しています"
+        }
+        if self.isDirectSSHKeyManagementRequest {
+            return "\(self.requesterName) が\(self.directSSHKeyManagementAction)を要求しています"
         }
         if self.pending.request.operation == .gitSSHSign {
             return "\(self.requesterName) がGit SSH署名を要求しています"

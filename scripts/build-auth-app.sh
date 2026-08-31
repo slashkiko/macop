@@ -7,6 +7,7 @@ configuration="${1:-debug}"
 signing_identity="${MACOP_SIGNING_IDENTITY:--}"
 provisioning_profile="${MACOP_PROVISIONING_PROFILE:-}"
 bundle_identifier="io.github.slashkiko.macop.auth"
+ssh_access_group_suffix=".ssh"
 
 fail() {
   printf 'macop auth bundle: %s\n' "$1" >&2
@@ -111,16 +112,29 @@ if [[ "$signing_identity" != "-" && -n "$provisioning_profile" ]]; then
   profile_team="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$decoded_profile")"
   profile_app_identifier="$(/usr/libexec/PlistBuddy \
     -c 'Print :Entitlements:com.apple.application-identifier' "$decoded_profile")"
-  profile_access_group="$(/usr/libexec/PlistBuddy \
-    -c 'Print :Entitlements:keychain-access-groups:0' "$decoded_profile")"
+  profile_authorizes_access_group() {
+    local expected_group="$1"
+    local index=0
+    local candidate
+    while candidate="$(/usr/libexec/PlistBuddy \
+      -c "Print :Entitlements:keychain-access-groups:$index" "$decoded_profile" 2>/dev/null)"; do
+      if [[ "$candidate" == "$expected_group" || "$candidate" == "$team_id.*" ]]; then
+        return 0
+      fi
+      index=$((index + 1))
+    done
+    return 1
+  }
   profile_platform="$(/usr/libexec/PlistBuddy -c 'Print :Platform:0' "$decoded_profile")"
   profile_expiration="$(plutil -extract ExpirationDate raw "$decoded_profile")"
   profile_expiration_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$profile_expiration" '+%s')"
   [[ "$profile_team" == "$team_id" ]] || fail "provisioning profile Team ID does not match the identity."
   [[ "$profile_app_identifier" == "$team_id.$bundle_identifier" ]] \
     || fail "provisioning profile does not authorize the MacopAuth application identifier."
-  [[ "$profile_access_group" == "$profile_app_identifier" || "$profile_access_group" == "$team_id.*" ]] \
-    || fail "provisioning profile does not authorize the MacopAuth Keychain access group."
+  profile_authorizes_access_group "$profile_app_identifier" \
+    || fail "provisioning profile does not authorize the MacopAuth managed Keychain access group."
+  profile_authorizes_access_group "$profile_app_identifier$ssh_access_group_suffix" \
+    || fail "provisioning profile does not authorize the MacopAuth SSH Keychain access group."
   [[ "$profile_platform" == "OSX" || "$profile_platform" == "macOS" ]] \
     || fail "provisioning profile is not for macOS."
   [[ "$profile_expiration_epoch" -gt "$(date -u '+%s')" ]] || fail "provisioning profile is expired."
@@ -144,11 +158,14 @@ if [[ "$signing_identity" != "-" && -n "$provisioning_profile" ]]; then
   entitlements_readback="$(mktemp "$build_dir/.MacopAuth.entitlements-readback.XXXXXX")"
   codesign -d --entitlements :- "$staged" >"$entitlements_readback" 2>/dev/null
   actual_app_identifier="$(plutil -extract 'com\.apple\.application-identifier' raw "$entitlements_readback")"
-  actual_access_group="$(plutil -extract 'keychain-access-groups.0' raw "$entitlements_readback")"
+  actual_managed_access_group="$(plutil -extract 'keychain-access-groups.0' raw "$entitlements_readback")"
+  actual_ssh_access_group="$(plutil -extract 'keychain-access-groups.1' raw "$entitlements_readback")"
   [[ "$actual_app_identifier" == "$team_id.$bundle_identifier" ]] \
     || fail "application identifier entitlement readback failed."
-  [[ "$actual_access_group" == "$actual_app_identifier" ]] \
-    || fail "Keychain access group entitlement readback failed."
+  [[ "$actual_managed_access_group" == "$actual_app_identifier" ]] \
+    || fail "managed Keychain access group entitlement readback failed."
+  [[ "$actual_ssh_access_group" == "$actual_app_identifier$ssh_access_group_suffix" ]] \
+    || fail "SSH Keychain access group entitlement readback failed."
   if [[ "$configuration" == "release" ]] \
       && plutil -extract 'com\.apple\.security\.get-task-allow' raw "$entitlements_readback" >/dev/null 2>&1; then
     fail "release app must not contain get-task-allow."

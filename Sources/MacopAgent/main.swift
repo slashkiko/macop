@@ -18,6 +18,7 @@ if case let .blocked(reason) = InstallGenerationGuard.invocationDecision(argv: C
 private let usage = """
 Usage:
   macop-agent shell <identity-label> -- <program> [arguments...]
+  macop-agent migration-test <identity-label> -- <program> [arguments...]
   macop-agent application <identity-label> <application-path>
 
 Each invocation creates one private, short-lived SSH_AUTH_SOCK. It never
@@ -484,10 +485,18 @@ private func run(mode: String, label: String, target: [String], signals: SignalC
     let registry = try SessionRegistry(root: root)
     defer { _ = rmdir(root.path) }
     let dependencies = VerifiedSessionRuntimeDependencies(
-        selectIdentity: { try SSHCommand.verifiedSessionIdentity(label: $0) },
+        selectIdentity: {
+            try SSHCommand.verifiedSessionIdentity(
+                label: $0,
+                directSSHKeys: DirectSSHKeyBrokerClient(),
+                selection: mode == "migration-test"
+                    ? .externallyRegisteredMigrationCandidate
+                    : .activeBackend
+            )
+        },
         launch: { reservation in
             let launchEnvironment = environment(for: reservation)
-            if mode == "shell" {
+            if mode == "shell" || mode == "migration-test" {
                 let prepared = try prepareDeferredShellLaunch(
                     target: target,
                     environment: launchEnvironment,
@@ -596,7 +605,7 @@ let label = args[1]
 do {
     try TrustedAgentHelperVerifier.requireTrustedRunningHelper()
     switch mode {
-    case "shell", "git":
+    case "shell", "git", "migration-test":
         guard let separator = args.firstIndex(of: "--"), separator >= 2, separator + 1 < args.count else { fail(usage) }
         let status = try run(mode: mode, label: label, target: Array(args[(separator + 1)...]), signals: signals)
         debugSuccess(status)

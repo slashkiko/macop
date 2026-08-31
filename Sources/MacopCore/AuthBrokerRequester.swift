@@ -11,6 +11,7 @@ public enum AuthBrokerRequester {
         credentialLabel: String,
         credentialFingerprint: String,
         rootPID: Int32,
+        sshKeyBackend: AuthBrokerSSHKeyBackend = .legacyCTK,
         requesterEnvironment: GitClientRequesterValidationEnvironment? = nil
     ) throws -> AuthBrokerApprovalRequest {
         guard rootPID > 1 else { throw AgentProtocolError.denied }
@@ -51,7 +52,8 @@ public enum AuthBrokerRequester {
             purpose: .gitSSHSign,
             credentialLabel: credentialLabel,
             credentialFingerprint: credentialFingerprint,
-            host: ""
+            host: "",
+            sshKeyBackend: sshKeyBackend
         )
     }
 
@@ -64,6 +66,7 @@ public enum AuthBrokerRequester {
         keychainSynchronizable: Bool = false,
         credentialFingerprint: String = "",
         host: String = "",
+        sshKeyBackend: AuthBrokerSSHKeyBackend = .legacyCTK,
         rootPID: Int32 = getpid()
     ) throws -> AuthBrokerApprovalRequest {
         guard purpose.isValid(for: operation) else { throw AuthBrokerProtocolError.malformed }
@@ -92,7 +95,8 @@ public enum AuthBrokerRequester {
             host: host,
             keychainService: service,
             keychainAccount: account,
-            keychainSynchronizable: keychainSynchronizable
+            keychainSynchronizable: keychainSynchronizable,
+            sshKeyBackend: sshKeyBackend
         )
     }
 

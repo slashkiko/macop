@@ -427,7 +427,8 @@ if [[ -e "$install_manifest" || -L "$install_manifest" ]]; then
   if [[ ! -L "$install_manifest" && -f "$install_manifest" ]] \
       && grep -Fqx '  "schema_version": 1,' "$install_manifest" \
       && { grep -Fqx '  "broker_protocol_version": 7,' "$install_manifest" \
-        || grep -Fqx '  "broker_protocol_version": 8,' "$install_manifest"; }; then
+        || grep -Fqx '  "broker_protocol_version": 8,' "$install_manifest" \
+        || grep -Fqx '  "broker_protocol_version": 9,' "$install_manifest"; }; then
     rm -f -- "$install_manifest"
     printf 'Removed %s\n' "$install_manifest"
   else

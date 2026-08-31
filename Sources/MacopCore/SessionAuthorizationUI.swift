@@ -16,6 +16,7 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
     public let rootExecutablePath: String
     public let sessionID: UUID
     public let expiresAt: Date
+    public let sshKeyBackend: AuthBrokerSSHKeyBackend
 
     public init(
         identityLabel: String,
@@ -30,7 +31,8 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
         rootCodeRequirement: String,
         sessionID: UUID,
         expiresAt: Date,
-        rootExecutablePath: String? = nil
+        rootExecutablePath: String? = nil,
+        sshKeyBackend: AuthBrokerSSHKeyBackend = .legacyCTK
     ) {
         self.identityLabel = identityLabel
         self.application = application
@@ -45,6 +47,7 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
         self.rootExecutablePath = rootExecutablePath ?? application
         self.sessionID = sessionID
         self.expiresAt = expiresAt
+        self.sshKeyBackend = sshKeyBackend
     }
 }
 

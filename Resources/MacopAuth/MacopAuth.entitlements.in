@@ -9,6 +9,7 @@
     <key>keychain-access-groups</key>
     <array>
         <string>__TEAM_ID__.io.github.slashkiko.macop.auth</string>
+        <string>__TEAM_ID__.io.github.slashkiko.macop.auth.ssh</string>
     </array>
 </dict>
 </plist>

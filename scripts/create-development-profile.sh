@@ -6,6 +6,7 @@ repo_root="$(cd -- "$script_dir/.." && pwd)"
 signing_identity="${MACOP_SIGNING_IDENTITY:-}"
 output_path="${MACOP_PROVISIONING_PROFILE_OUTPUT:-$HOME/Library/Application Support/macop/MacopAuth.provisionprofile}"
 bundle_identifier="io.github.slashkiko.macop.auth"
+ssh_access_group_suffix=".ssh"
 
 fail() {
   printf 'macop development profile: %s\n' "$1" >&2
@@ -137,16 +138,29 @@ security cms -D -i "$profile_path" >"$decoded_profile"
 profile_team="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$decoded_profile")"
 application_identifier="$(/usr/libexec/PlistBuddy \
   -c 'Print :Entitlements:com.apple.application-identifier' "$decoded_profile")"
-access_group="$(/usr/libexec/PlistBuddy \
-  -c 'Print :Entitlements:keychain-access-groups:0' "$decoded_profile")"
+profile_authorizes_access_group() {
+  local expected_group="$1"
+  local index=0
+  local candidate
+  while candidate="$(/usr/libexec/PlistBuddy \
+    -c "Print :Entitlements:keychain-access-groups:$index" "$decoded_profile" 2>/dev/null)"; do
+    if [[ "$candidate" == "$expected_group" || "$candidate" == "$team_id.*" ]]; then
+      return 0
+    fi
+    index=$((index + 1))
+  done
+  return 1
+}
 platform="$(/usr/libexec/PlistBuddy -c 'Print :Platform:0' "$decoded_profile")"
 expiration="$(plutil -extract ExpirationDate raw "$decoded_profile")"
 expiration_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$expiration" '+%s')"
 [[ "$profile_team" == "$team_id" ]] || fail "profile Team ID does not match the signing identity."
 [[ "$application_identifier" == "$team_id.$bundle_identifier" ]] \
   || fail "profile application identifier does not match MacopAuth."
-[[ "$access_group" == "$application_identifier" || "$access_group" == "$team_id.*" ]] \
-  || fail "profile does not authorize the MacopAuth Keychain access group."
+profile_authorizes_access_group "$application_identifier" \
+  || fail "profile does not authorize the MacopAuth managed Keychain access group."
+profile_authorizes_access_group "$application_identifier$ssh_access_group_suffix" \
+  || fail "profile does not authorize the MacopAuth SSH Keychain access group."
 [[ "$platform" == "OSX" || "$platform" == "macOS" ]] || fail "profile is not for macOS."
 [[ "$expiration_epoch" -gt "$(date -u '+%s')" ]] || fail "profile is already expired."
 

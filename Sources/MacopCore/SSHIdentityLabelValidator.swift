@@ -1,7 +1,7 @@
 import Foundation
 
-enum SSHIdentityLabelValidator {
-    static func validate(_ label: String) throws {
+public enum SSHIdentityLabelValidator {
+    public static func validate(_ label: String) throws {
         guard !label.isEmpty,
               label == label.trimmingCharacters(in: .whitespacesAndNewlines),
               label.utf8.count <= 128,

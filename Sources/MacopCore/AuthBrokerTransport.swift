@@ -705,7 +705,8 @@ public final class AuthBrokerClientConnection: @unchecked Sendable {
     public static func verifyInstalledBroker() throws {
         _ = try self.launchAndConnect(
             requiredCapabilities: AuthBrokerCapability.approvalUI.rawValue
-                | AuthBrokerCapability.sshSigning.rawValue,
+                | AuthBrokerCapability.sshSigning.rawValue
+                | AuthBrokerCapability.directSSHKeyManagement.rawValue,
             probe: true
         )
     }
@@ -737,7 +738,8 @@ public final class AuthBrokerClientConnection: @unchecked Sendable {
                 | AuthBrokerCapability.sshSigning.rawValue
                 | AuthBrokerCapability.passwordAutoFill.rawValue
                 | AuthBrokerCapability.passwordAutoFillUsername.rawValue
-                | AuthBrokerCapability.gitClientTrust.rawValue,
+                | AuthBrokerCapability.gitClientTrust.rawValue
+                | AuthBrokerCapability.directSSHKeyManagement.rawValue,
             nonce: nonce
         ))
         do {

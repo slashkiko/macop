@@ -33,7 +33,8 @@ public struct CompanionAuthenticationSessionPrompt: SessionAuthorizationResultPr
                     purpose: .sshSession,
                     credentialLabel: presentation.identityLabel,
                     credentialFingerprint: presentation.fingerprint,
-                    host: ""
+                    host: "",
+                    sshKeyBackend: presentation.sshKeyBackend
                 )
                 guard case let .approvalResponse(response) = try connection.send(.approvalRequest(request)),
                       response.requestID == request.requestID
