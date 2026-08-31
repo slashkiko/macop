@@ -21,6 +21,7 @@ let package = Package(
         .executableTarget(name: "MacopCLI", dependencies: ["MacopCore"]),
         .executableTarget(name: "MacopAgent", dependencies: ["MacopCore", "MacopPTY"]),
         .executableTarget(name: "MacopAuth", dependencies: ["MacopCore"]),
-        .executableTarget(name: "MacopSelftest", dependencies: ["MacopCore"])
+        .executableTarget(name: "MacopSelftest", dependencies: ["MacopCore"]),
+        .testTarget(name: "MacopCoreTests", dependencies: ["MacopCore"])
     ]
 )
