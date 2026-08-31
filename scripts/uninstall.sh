@@ -2,6 +2,8 @@
 set -euo pipefail
 
 bin_dir="${MACOP_BIN_DIR:-$HOME/.local/bin}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+install_fs="$script_dir/install-fs.py"
 shell_profile="${MACOP_SHELL_PROFILE:-}"
 keep_path=false
 delete_managed_keychain=false
@@ -207,6 +209,7 @@ remove_machine_local_data() {
     || fail "could not remove the trusted Git registry safely."
   if [[ "$registry_was_present" == true ]]; then
     printf 'Removed %s\n' "$registry_path"
+    printf '%s\n' 'The protected Git trust state was intentionally retained. After reinstalling, run: macop ssh git-client reset'
   fi
 }
 
@@ -222,6 +225,134 @@ fi
 [[ -d "$bin_dir" ]] || fail "install path is not a directory: $bin_dir"
 [[ "$(stat -f '%u' "$bin_dir")" == "$(id -u)" ]] \
   || fail "install directory must be owned by the current user."
+
+if [[ "${MACOP_INSTALL_TEST_MODE:-0}" == "1" ]]; then
+  canonical_test_bin_dir="$(cd -- "$bin_dir" 2>/dev/null && pwd -P)" \
+    || fail "MACOP_INSTALL_TEST_MODE requires an existing real directory."
+  [[ "$canonical_test_bin_dir" == /private/tmp/macop-install-test-*/* ]] \
+    || fail "MACOP_INSTALL_TEST_MODE requires --bin-dir beneath /private/tmp/macop-install-test-*."
+  [[ ! -L "$bin_dir" && "$(stat -f '%u:%Lp' "$bin_dir")" == "$(id -u):700" ]] \
+    || fail "MACOP_INSTALL_TEST_MODE requires an owner-only non-symlink destination."
+  state_dir="$bin_dir/.macop-install-state"
+else
+  state_dir="$HOME/Library/Application Support/macop/install-state"
+fi
+if [[ ! -e "$state_dir" && ! -L "$state_dir" ]]; then
+  if [[ "${MACOP_INSTALL_TEST_MODE:-0}" == "1" ]]; then
+    bin_id="$(python3 "$install_fs" id "$bin_dir")" \
+      || fail "cannot retain install directory identity."
+    python3 "$install_fs" mkdir "$bin_dir" "$bin_id" .macop-install-state 700 \
+      || fail "cannot create uninstall state for a legacy installation."
+  else
+    state_parent="$(dirname "$state_dir")"
+    if [[ ! -e "$state_parent" && ! -L "$state_parent" ]]; then
+      install -d -m 700 "$state_parent" \
+        || fail "cannot create uninstall state parent for a legacy installation."
+    fi
+    [[ ! -L "$state_parent" && -d "$state_parent" \
+        && "$(stat -f '%u:%Lp' "$state_parent")" == "$(id -u):700" ]] \
+      || fail "uninstall state parent must be current-user-owned, owner-only, and not a symlink: $state_parent"
+    state_parent_id="$(python3 "$install_fs" id "$state_parent")" \
+      || fail "cannot retain uninstall state parent identity."
+    python3 "$install_fs" mkdir "$state_parent" "$state_parent_id" install-state 700 \
+      || fail "cannot create uninstall state for a legacy installation."
+  fi
+fi
+[[ ! -L "$state_dir" && -d "$state_dir" && "$(stat -f '%u:%Lp' "$state_dir")" == "$(id -u):700" ]] \
+  || fail "installer state directory must be current-user-owned, owner-only, and not a symlink: $state_dir"
+state_id="$(python3 "$install_fs" id "$state_dir")" || fail "cannot validate installer state directory."
+uninstall_lock_id=""
+release_uninstall_lock_pause() {
+  local point="$1"
+  [[ "${MACOP_INSTALL_TEST_MODE:-0}" == "1" && "${MACOP_INSTALL_TEST_RELEASE_PAUSE_AT:-}" == "uninstaller-$point" ]] || return 0
+  printf 'macop uninstall test: pause at uninstaller-%s\n' "$point" >&2
+  sleep "${MACOP_INSTALL_TEST_RELEASE_PAUSE_SECONDS:-2}"
+}
+owner_record_pause() {
+  local point="$1"
+  [[ "${MACOP_INSTALL_TEST_MODE:-0}" == "1" && "${MACOP_INSTALL_TEST_LOCK_OWNER_PAUSE_AT:-}" == "uninstaller-$point" ]] || return 0
+  printf 'macop uninstall test: pause at uninstaller-%s\n' "$point" >&2
+  sleep "${MACOP_INSTALL_TEST_LOCK_OWNER_PAUSE_SECONDS:-2}"
+}
+release_uninstall_lock() {
+  local retired_lock_leaf
+  [[ -n "$uninstall_lock_id" ]] || return
+  # The original PID remains in the visible lock through the atomic handoff.
+  # That prevents a concurrent installer from reclaiming it as PID-less before
+  # this process has bound cleanup to its own retired directory identity.
+  release_uninstall_lock_pause retire-before
+  retired_lock_leaf="$(python3 "$install_fs" retire-child "$state_dir" "$state_id" lock "$uninstall_lock_id" retired-lock.)" \
+    || return
+  release_uninstall_lock_pause retire-after
+  python3 "$install_fs" remove-child "$state_dir" "$state_id" "$retired_lock_leaf" "$uninstall_lock_id" pid file >/dev/null 2>&1 || return
+  python3 "$install_fs" rmdir-child "$state_dir" "$state_id" "$retired_lock_leaf" "$uninstall_lock_id" >/dev/null 2>&1 || return
+  uninstall_lock_id=""
+}
+
+if ! python3 "$install_fs" mkdir "$state_dir" "$state_id" lock 700 2>/dev/null; then
+  lock_id="$(python3 "$install_fs" child-id "$state_dir" "$state_id" lock dir)" \
+    || fail "refusing to inspect an unsafe installer lock."
+  if ! lock_pid="$(python3 "$install_fs" read-child "$state_dir" "$state_id" lock "$lock_id" pid 2>/dev/null)"; then
+    if python3 "$install_fs" absent-child "$state_dir" "$state_id" lock "$lock_id" pid >/dev/null 2>&1; then
+      fail "installer lock is missing its owner PID record; manual recovery is required: $state_dir/lock"
+    fi
+    fail "refusing to inspect an unsafe installer lock."
+  fi
+  if [[ "$lock_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    fail "a macop install transaction is active (pid $lock_pid)."
+  fi
+  [[ "$lock_pid" =~ ^[1-9][0-9]*$ ]] \
+    || fail "installer lock PID record is malformed; manual recovery is required: $state_dir/lock"
+  retired_lock_leaf="$(python3 "$install_fs" retire-child "$state_dir" "$state_id" lock "$lock_id" retired-lock.)" \
+    || fail "cannot retire stale installer lock: $state_dir/lock"
+  python3 "$install_fs" remove-child "$state_dir" "$state_id" "$retired_lock_leaf" "$lock_id" pid file \
+    || fail "cannot remove stale installer PID record: $state_dir/lock"
+  python3 "$install_fs" rmdir-child "$state_dir" "$state_id" "$retired_lock_leaf" "$lock_id" \
+    || fail "cannot recover stale installer lock: $state_dir/lock"
+  python3 "$install_fs" mkdir "$state_dir" "$state_id" lock 700 \
+    || fail "cannot acquire uninstall lock after stale-lock recovery."
+fi
+owner_record_pause after-lock-mkdir
+uninstall_lock_id="$(python3 "$install_fs" child-id "$state_dir" "$state_id" lock dir)" \
+  || fail "cannot validate uninstall lock."
+python3 "$install_fs" record-child "$state_dir" "$state_id" lock "$uninstall_lock_id" pid "$$"$'\n' \
+  || fail "cannot create uninstall lock."
+trap release_uninstall_lock EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# Never interpret missing or malformed recovery evidence as permission to
+# delete a generation. These checks keep the state directory as their
+# authority and inspect only direct leaves through its validated descriptor.
+python3 "$install_fs" absent "$state_dir" "$state_id" pending \
+  || fail "transaction recovery is required before uninstalling: $state_dir/pending"
+for journal in "$state_dir"/journal.*; do
+  [[ -e "$journal" || -L "$journal" ]] || continue
+  [[ ! -L "$journal" && -d "$journal" \
+      && "$(stat -f '%u:%Lp' "$journal")" == "$(id -u):700" ]] \
+    || fail "transaction recovery is required before uninstalling: unsafe transaction journal $journal"
+  terminal_marker=""
+  terminal_value=""
+  if [[ -e "$journal/COMMITTED" ]]; then
+    terminal_marker="COMMITTED"
+    terminal_value="committed"
+  fi
+  if [[ -e "$journal/ROLLED_BACK" ]]; then
+    [[ -z "$terminal_marker" ]] \
+      || fail "transaction recovery is required before uninstalling: conflicting terminal markers in $journal"
+    terminal_marker="ROLLED_BACK"
+    terminal_value="rolled-back"
+  fi
+  [[ -n "$terminal_marker" && ! -e "$journal/ROLLBACK_INCOMPLETE" \
+      && ! -L "$journal/$terminal_marker" && -f "$journal/$terminal_marker" \
+      && "$(stat -f '%u:%Lp' "$journal/$terminal_marker")" == "$(id -u):600" \
+      && "$(cat "$journal/$terminal_marker")" == "$terminal_value" ]] \
+    || fail "transaction recovery is required before uninstalling: retained transaction journal in $state_dir"
+  python3 "$install_fs" remove "$state_dir" "$state_id" "$(basename "$journal")" dir \
+    || fail "cannot remove completed transaction journal before uninstalling: $journal"
+done
+python3 "$install_fs" absent-prefix "$state_dir" "$state_id" journal. \
+  || fail "transaction recovery is required before uninstalling: retained transaction journal in $state_dir"
 
 remove_machine_local_data
 
@@ -289,6 +420,19 @@ if [[ -e "$auth_app" ]]; then
     || fail "refusing to remove $auth_app because its code-signing identifier is unexpected."
   rm -rf "$auth_app"
   printf 'Removed %s\n' "$auth_app"
+fi
+
+install_manifest="$bin_dir/macop-install-manifest.json"
+if [[ -e "$install_manifest" || -L "$install_manifest" ]]; then
+  if [[ ! -L "$install_manifest" && -f "$install_manifest" ]] \
+      && grep -Fqx '  "schema_version": 1,' "$install_manifest" \
+      && { grep -Fqx '  "broker_protocol_version": 7,' "$install_manifest" \
+        || grep -Fqx '  "broker_protocol_version": 8,' "$install_manifest"; }; then
+    rm -f -- "$install_manifest"
+    printf 'Removed %s\n' "$install_manifest"
+  else
+    printf 'Preserved unrecognized generation manifest: %s\n' "$install_manifest"
+  fi
 fi
 remove_managed_path
 
