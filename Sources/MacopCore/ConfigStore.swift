@@ -86,12 +86,25 @@ public enum ConfigStore {
     }
 
     public static func initialize(configDirectory: String?) throws -> URL {
+        try self.initialize(configDirectory: configDirectory, fsyncOperation: Darwin.fsync)
+    }
+
+    static func initialize(
+        configDirectory: String?,
+        fsyncOperation: (Int32) -> Int32
+    ) throws -> URL {
         let fileURL = try configFilePath(configDirectory: configDirectory)
         let directoryURL = fileURL.deletingLastPathComponent()
         let fileManager = FileManager.default
+        let directoryExisted = fileManager.fileExists(atPath: directoryURL.path)
 
         try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directoryURL.path)
+        if !directoryExisted {
+            try self.syncDirectory(
+                at: directoryURL.deletingLastPathComponent(), fsyncOperation: fsyncOperation
+            )
+        }
 
         if fileManager.fileExists(atPath: fileURL.path) {
             throw CLIError.invalidArguments(message: "Config already exists at \(fileURL.path)")
@@ -102,11 +115,15 @@ public enum ConfigStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         var data = try encoder.encode(document)
         data.append(contentsOf: Data("\n".utf8))
-        try self.writeNewConfig(data, to: fileURL)
+        try self.writeNewConfig(data, to: fileURL, fsyncOperation: fsyncOperation)
         return fileURL
     }
 
-    private static func writeNewConfig(_ data: Data, to fileURL: URL) throws {
+    static func writeNewConfig(
+        _ data: Data,
+        to fileURL: URL,
+        fsyncOperation: (Int32) -> Int32 = Darwin.fsync
+    ) throws {
         let temporaryURL = fileURL.deletingLastPathComponent()
             .appendingPathComponent(".config-\(UUID().uuidString).tmp")
         let descriptor = open(
@@ -133,7 +150,9 @@ public enum ConfigStore {
             guard count > 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
             offset += count
         }
-        guard fsync(descriptor) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard fsyncOperation(descriptor) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
         guard renameatx_np(
             AT_FDCWD,
             temporaryURL.path,
@@ -144,6 +163,24 @@ public enum ConfigStore {
             if errno == EEXIST {
                 throw CLIError.invalidArguments(message: "Config already exists at \(fileURL.path)")
             }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        try self.syncDirectory(
+            at: fileURL.deletingLastPathComponent(), fsyncOperation: fsyncOperation
+        )
+    }
+
+    private static func syncDirectory(
+        at directoryURL: URL,
+        fsyncOperation: (Int32) -> Int32
+    ) throws {
+        let directoryDescriptor = open(
+            directoryURL.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard directoryDescriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { close(directoryDescriptor) }
+        guard fsyncOperation(directoryDescriptor) == 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
     }
