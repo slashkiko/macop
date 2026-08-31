@@ -25,11 +25,11 @@ struct MacopAuthApplication: App {
     var body: some Scene {
         WindowGroup("Macop") {
             AuthApprovalView(coordinator: self.coordinator)
-                .frame(minWidth: 620, idealWidth: 660, minHeight: 440, idealHeight: 500)
+                .frame(minWidth: 400, idealWidth: 580, minHeight: 220, idealHeight: 440)
                 .task { self.coordinator.start() }
         }
         .windowResizability(.contentMinSize)
-        .defaultSize(width: 660, height: 500)
+        .defaultSize(width: 440, height: 240)
     }
 
     private static func socketPath() -> String? {
@@ -45,7 +45,7 @@ struct MacopAuthApplication: App {
 
 @MainActor
 // swiftlint:disable:next type_body_length
-private final class AuthApprovalCoordinator: ObservableObject {
+private final class AuthApprovalCoordinator: NSObject, ObservableObject {
     private enum PasswordPoCError: Error {
         case accessControlUnavailable
     }
@@ -80,20 +80,27 @@ private final class AuthApprovalCoordinator: ObservableObject {
         let saveToKeychain: Bool
     }
 
-    @Published private(set) var state: State = .starting
+    @Published private(set) var state: State = .starting {
+        didSet { self.resizeWindow(for: self.state) }
+    }
+
     private let socketPath: String?
     private let probe: Bool
     private var started = false
     private var continuation: CheckedContinuation<ApprovalOutcome, Never>?
+    private weak var observedWindow: NSWindow?
+    private var isTerminating = false
 
     init(socketPath: String?, probe: Bool = false) {
         self.socketPath = socketPath
         self.probe = probe
+        super.init()
     }
 
     func start() {
         guard !self.started else { return }
         self.started = true
+        self.resizeWindow(for: self.state)
         guard let socketPath = self.socketPath else {
             self.state = .failed("MacopAuthはmacopから起動してください。")
             return
@@ -128,7 +135,6 @@ private final class AuthApprovalCoordinator: ObservableObject {
             NSApplication.shared.activate(ignoringOtherApps: true)
             NSApplication.shared.windows.first?.makeKeyAndOrderFront(nil)
             NSRunningApplication.current.activate(options: [.activateAllWindows])
-            self.resizeApprovalWindow(for: request)
             let now = UInt64(Date().timeIntervalSince1970 * 1000)
             let deadline = min(request.expiresAtMilliseconds, now + 110_000)
             let delay = deadline > now ? deadline - now : 0
@@ -139,19 +145,66 @@ private final class AuthApprovalCoordinator: ObservableObject {
         }
     }
 
-    private func resizeApprovalWindow(for request: AuthBrokerApprovalRequest) {
-        let height: CGFloat = switch request.operation {
-        case .passwordAutoFill:
-            600
-        case .sshSession:
-            580
-        default:
-            500
+    private func resizeWindow(for state: State) {
+        let size = switch state {
+        case let .pending(pending): self.approvalWindowSize(for: pending.request)
+        case .starting, .processing, .completed, .cancelled, .denied, .failed:
+            NSSize(width: 440, height: 240)
         }
         Task { @MainActor in
+            await Task.yield()
             guard let window = NSApplication.shared.windows.first else { return }
-            window.setContentSize(NSSize(width: 660, height: height))
+            window.setContentSize(size)
+            window.standardWindowButton(.miniaturizeButton)?.isEnabled = false
+            window.standardWindowButton(.zoomButton)?.isEnabled = false
+            window.standardWindowButton(.closeButton)?.isEnabled = self.state.allowsWindowClose
+            self.observeWindowClose(window)
             window.center()
+        }
+    }
+
+    private func observeWindowClose(_ window: NSWindow) {
+        guard self.observedWindow !== window else { return }
+        if let observedWindow {
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSWindow.willCloseNotification,
+                object: observedWindow
+            )
+        }
+        self.observedWindow = window
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(self.windowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
+            object: window
+        )
+    }
+
+    @objc private func windowWillClose(_ notification: Notification) {
+        guard !self.isTerminating, notification.object as? NSWindow === self.observedWindow else { return }
+        switch self.state {
+        case .pending:
+            self.cancel()
+        case .completed, .cancelled, .denied, .failed:
+            self.dismissResult()
+        case .starting, .processing:
+            break
+        }
+    }
+
+    private func approvalWindowSize(for request: AuthBrokerApprovalRequest) -> NSSize {
+        switch request.operation {
+        case .passwordAutoFill:
+            NSSize(width: 620, height: 580)
+        case .sshSession:
+            NSSize(width: 640, height: 560)
+        case .gitSSHSign:
+            NSSize(width: 640, height: 440)
+        case .directSSHKeyCreate, .directSSHKeyDelete, .sshMigrationTransition:
+            NSSize(width: 580, height: 500)
+        default:
+            NSSize(width: 580, height: 460)
         }
     }
 
@@ -183,6 +236,8 @@ private final class AuthApprovalCoordinator: ObservableObject {
             + "\(presentation.resultDescription)\n"
             + "\(presentation.listIntroduction)"
             + (entries.isEmpty ? "" : "\n\n\(entries)")
+        alert.icon = NSImage(systemSymbolName: "lock.shield", accessibilityDescription: "Macop")
+        alert.accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 1))
         alert.addButton(withTitle: presentation.confirmationTitle)
         alert.addButton(withTitle: "キャンセル")
         guard alert.runModal() == .alertFirstButtonReturn else { return false }
@@ -324,7 +379,22 @@ private final class AuthApprovalCoordinator: ObservableObject {
     func terminateSoon(after delay: Duration = .milliseconds(250)) {
         Task {
             try? await Task.sleep(for: delay)
+            guard !self.retainsResultUntilDismissed else { return }
+            self.isTerminating = true
             NSApplication.shared.terminate(nil)
+        }
+    }
+
+    func dismissResult() {
+        self.isTerminating = true
+        NSApplication.shared.terminate(nil)
+    }
+
+    private var retainsResultUntilDismissed: Bool {
+        switch self.state {
+        case let .completed(completion): !completion.isSuccess
+        case .denied, .failed: true
+        case .starting, .pending, .processing, .cancelled: false
         }
     }
 
@@ -378,11 +448,11 @@ private final class AuthApprovalCoordinator: ObservableObject {
             "Secure EnclaveのSSH鍵で署名します。"
         case .managedKeychainImport:
             request.purpose.concernsOTP
-                ? "OTP seedをTouch ID、Apple Watch、またはMacパスワードで保護して登録します。"
-                : "Touch ID、Apple Watch、またはMacパスワードで保護するKeychain項目を登録します。"
+                ? "OTP seedをTouch ID、Apple Watch、またはMacのログインパスワードで保護して登録します。"
+                : "Touch ID、Apple Watch、またはMacのログインパスワードで保護するKeychain項目を登録します。"
         case .managedKeychainUpdate:
             request.purpose.concernsOTP
-                ? "OTP seedをTouch ID、Apple Watch、またはMacパスワードで更新します。"
+                ? "OTP seedをTouch ID、Apple Watch、またはMacのログインパスワードで更新します。"
                 : "macop管理のKeychain項目を更新します。"
         case .passwordAutoFill:
             "Passwordsから選んだ資格情報をmacopで使用します。"
@@ -391,7 +461,7 @@ private final class AuthApprovalCoordinator: ObservableObject {
         case .gitSSHSign:
             "Secure EnclaveのSSH鍵でGit commitまたはtagへ署名します。"
         case .directSSHKeyCreate:
-            "Touch ID、Apple Watch、またはMacパスワードで保護するSecure Enclave SSH鍵を作成します。"
+            "Touch ID、Apple Watch、またはMacのログインパスワードで保護するSecure Enclave SSH鍵を作成します。"
         case .directSSHKeyDelete:
             "Secure Enclave SSH鍵を削除します。"
         case .sshMigrationTransition:
@@ -417,6 +487,15 @@ private final class AuthApprovalCoordinator: ObservableObject {
             operation: .useItem,
             localizedReason: self.localizedReason(for: pending.request)
         )
+    }
+}
+
+private extension AuthApprovalCoordinator.State {
+    var allowsWindowClose: Bool {
+        switch self {
+        case .pending, .completed, .cancelled, .denied, .failed: true
+        case .starting, .processing: false
+        }
     }
 }
 
@@ -1009,9 +1088,7 @@ private enum AuthBrokerAppServer {
             await coordinator.terminateSoon(after: .seconds(2))
             return
         }
-        await coordinator.terminateSoon(
-            after: request.operation == .passwordAutoFill ? .seconds(2) : .milliseconds(250)
-        )
+        await coordinator.terminateSoon(after: .seconds(2))
     }
 
     private static func serveDirectSSHKeyList(
@@ -1513,6 +1590,7 @@ private enum AuthBrokerAppServer {
                 generation: document.generation,
                 status: .approved
             )
+            await coordinator.complete("Gitクライアントの信頼設定はすでに更新されています")
             return
         }
         // swiftformat:enable wrapMultilineStatementBraces
@@ -1528,6 +1606,10 @@ private enum AuthBrokerAppServer {
                 generation: document.generation,
                 status: .generationConflict
             )
+            await coordinator.complete(
+                "信頼設定は別の変更によって更新されました。内容を確認してもう一度実行してください",
+                isSuccess: false
+            )
             return
         }
         guard await coordinator.requestGitClientTrustMutation(
@@ -1540,6 +1622,10 @@ private enum AuthBrokerAppServer {
                 request: request,
                 generation: document.generation,
                 status: .rejected
+            )
+            await coordinator.completeRejection(
+                .cancelled,
+                message: "Gitクライアントの信頼設定変更をキャンセルしました"
             )
             return
         }
@@ -1556,6 +1642,10 @@ private enum AuthBrokerAppServer {
                 generation: document.generation,
                 status: .generationConflict
             )
+            await coordinator.complete(
+                "認証中に信頼設定が変更されました。内容を確認してもう一度実行してください",
+                isSuccess: false
+            )
             return
         }
         try self.writeTrustMutationResponse(
@@ -1564,6 +1654,7 @@ private enum AuthBrokerAppServer {
             generation: document.generation,
             status: .approved
         )
+        await coordinator.complete("Gitクライアントの信頼設定を更新しました")
     }
 
     private static func validateTrustMutationPeer(_ peer: AuthBrokerVerifiedPeer) throws {
@@ -1836,6 +1927,7 @@ private struct AuthApprovalView: View {
                     } else {
                         ApprovalRequestView(
                             pending: pending,
+                            authenticate: { self.coordinator.authenticate(pending) },
                             continueToSystemSigningAuthentication: {
                                 self.coordinator.continueToSystemSigningAuthentication(pending)
                             },
@@ -1843,8 +1935,9 @@ private struct AuthApprovalView: View {
                             cancel: self.coordinator.cancel
                         )
                         .task(id: pending.request.requestID) {
-                            if pending.request.operation.phaseTwoKind != .signing
-                                || pending.request.sshKeyBackend == .directSecureEnclaveV1
+                            if !pending.request.purpose.requiresExplicitDestructiveConfirmation,
+                               pending.request.operation.phaseTwoKind != .signing
+                               || pending.request.sshKeyBackend == .directSecureEnclaveV1
                             // swiftlint:disable:next opening_brace
                             {
                                 self.coordinator.authenticate(pending)
@@ -1857,15 +1950,16 @@ private struct AuthApprovalView: View {
                 ProgressView("処理しています…")
             case let .completed(completion):
                 ResultView(
-                    symbol: completion.isSuccess ? "checkmark.circle.fill" : "exclamationmark.triangle",
-                    title: completion.message
+                    kind: completion.isSuccess ? .success : .warning,
+                    title: completion.message,
+                    dismiss: self.coordinator.dismissResult
                 )
             case let .cancelled(message):
-                ResultView(symbol: "xmark.circle", title: message)
+                ResultView(kind: .cancelled, title: message, dismiss: self.coordinator.dismissResult)
             case let .denied(message):
-                ResultView(symbol: "exclamationmark.triangle", title: message)
+                ResultView(kind: .failure, title: message, dismiss: self.coordinator.dismissResult)
             case let .failed(message):
-                ResultView(symbol: "exclamationmark.triangle", title: message)
+                ResultView(kind: .failure, title: message, dismiss: self.coordinator.dismissResult)
             }
         }
         .padding(28)
@@ -1878,7 +1972,7 @@ private struct PasswordAutoFillRequestView: View {
     let cancel: () -> Void
     @State private var password = ""
     @State private var username = ""
-    @State private var saveToKeychain = true
+    @State private var saveToKeychain = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -1904,18 +1998,26 @@ private struct PasswordAutoFillRequestView: View {
                     .foregroundStyle(.secondary)
             }
             VStack(alignment: .leading, spacing: 12) {
-                AutoFillTextField(
-                    text: self.$username,
-                    placeholder: "ユーザー名（\(self.pending.request.keychainAccount)）",
-                    contentType: .username,
-                    secure: false
-                )
-                AutoFillTextField(
-                    text: self.$password,
-                    placeholder: "パスワード",
-                    contentType: .password,
-                    secure: true
-                )
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("ユーザー名").font(.caption).foregroundStyle(.secondary)
+                    AutoFillTextField(
+                        text: self.$username,
+                        placeholder: self.pending.request.keychainAccount,
+                        accessibilityLabel: "ユーザー名",
+                        contentType: .username,
+                        secure: false
+                    )
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("パスワード").font(.caption).foregroundStyle(.secondary)
+                    AutoFillTextField(
+                        text: self.$password,
+                        placeholder: "Passwordsから選択",
+                        accessibilityLabel: "パスワード",
+                        contentType: .password,
+                        secure: true
+                    )
+                }
             }
             if !self.username.isEmpty, self.username != self.pending.request.keychainAccount {
                 Text("選択したユーザー名が設定済みアカウントと一致しません。")
@@ -1926,7 +2028,7 @@ private struct PasswordAutoFillRequestView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Toggle("選んだパスワードをmacop管理のKeychainに保存・更新する", isOn: self.$saveToKeychain)
+            Toggle("macop管理のKeychainにも保存・更新する", isOn: self.$saveToKeychain)
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
                 self.row("サービス", self.pending.request.keychainService)
                 self.row("保存先", self.pending.request.keychainAccount)
@@ -1944,12 +2046,12 @@ private struct PasswordAutoFillRequestView: View {
                         .keyboardShortcut(.cancelAction)
                     Spacer(minLength: 24)
                     HStack(spacing: 10) {
-                        Button("Macパスワード") {
+                        Button("Macのログインパスワード") {
                             self.submit(self.username, self.password, self.saveToKeychain, true)
                             self.username = ""
                             self.password = ""
                         }
-                        Button("Touch ID／Apple Watch") {
+                        Button("Touch IDまたはApple Watch") {
                             self.submit(self.username, self.password, self.saveToKeychain, false)
                             self.username = ""
                             self.password = ""
@@ -1996,6 +2098,7 @@ private struct PasswordAutoFillRequestView: View {
 private struct AutoFillTextField: NSViewRepresentable {
     @Binding var text: String
     let placeholder: String
+    let accessibilityLabel: String
     let contentType: NSTextContentType
     let secure: Bool
 
@@ -2006,6 +2109,7 @@ private struct AutoFillTextField: NSViewRepresentable {
     func makeNSView(context: Context) -> NSTextField {
         let field: NSTextField = self.secure ? NSSecureTextField() : NSTextField()
         field.placeholderString = self.placeholder
+        field.setAccessibilityLabel(self.accessibilityLabel)
         field.contentType = self.contentType
         field.delegate = context.coordinator
         field.isEditable = true
@@ -2044,7 +2148,10 @@ private struct ApprovalRequestView: View {
         let verification: String
     }
 
+    @State private var destructiveAuthenticationStarted = false
+    @State private var technicalDetailsExpanded = false
     let pending: AuthApprovalCoordinator.PendingApproval
+    let authenticate: () -> Void
     let continueToSystemSigningAuthentication: () -> Void
     let usePassword: () -> Void
     let cancel: () -> Void
@@ -2065,42 +2172,64 @@ private struct ApprovalRequestView: View {
                 Spacer()
             }
             Divider()
-            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
-                if self.isManagedKeychainRequest {
-                    self.row("操作", self.managedKeychainAction)
-                    if self.isDeleteAllRequest {
-                        self.row("対象", "macop管理のKeychain項目すべて")
+            VStack(alignment: .leading, spacing: 12) {
+                Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
+                    if self.isManagedKeychainRequest {
+                        self.row("内容", self.managedKeychainAction)
+                        if self.isDeleteAllRequest {
+                            self.row("対象", "macop管理のKeychain項目すべて")
+                        } else {
+                            self.row("サービス", self.pending.request.keychainService)
+                            self.row("アカウント", self.pending.request.keychainAccount)
+                        }
+                        self.row("コマンド", self.pending.request.purpose.displayName)
+                    } else if self.isDirectSSHKeyManagementRequest {
+                        self.row("対象", self.directSSHKeyManagementAction)
+                        self.row("鍵", self.pending.request.credentialLabel)
+                        if !self.pending.request.credentialFingerprint.isEmpty {
+                            self.row("フィンガープリント", self.pending.request.credentialFingerprint)
+                        }
+                        self.row("保護", "Touch ID、Apple Watch、Macのログインパスワード")
+                        self.row("コマンド", self.pending.request.purpose.displayName)
                     } else {
-                        self.row("サービス", self.pending.request.keychainService)
-                        self.row("アカウント", self.pending.request.keychainAccount)
-                    }
-                } else if self.isDirectSSHKeyManagementRequest {
-                    self.row("対象", self.directSSHKeyManagementAction)
-                    self.row("鍵", self.pending.request.credentialLabel)
-                    if !self.pending.request.credentialFingerprint.isEmpty {
+                        if let target = self.sshSessionTargetPresentation {
+                            self.row("実行対象", target.application)
+                        }
+                        self.row("接続先", self.pending.request.host.isEmpty ? "SSHセッション" : self.pending.request.host)
+                        self.row("使用する鍵", self.pending.request.credentialLabel)
                         self.row("フィンガープリント", self.pending.request.credentialFingerprint)
+                        self.row("操作", self.pending.request.purpose.displayName)
                     }
-                    self.row("保護", "Touch ID／Apple Watch／Macパスワード")
-                } else {
-                    if let target = self.sshSessionTargetPresentation {
-                        self.row("実行対象", target.application)
-                        self.row("署名", target.signingAuthority)
-                        self.row("コードハッシュ", target.cdHash)
-                        self.row("検証", target.verification)
-                    }
-                    self.row("接続先", self.pending.request.host.isEmpty ? "SSHセッション" : self.pending.request.host)
-                    self.row("使用する鍵", self.pending.request.credentialLabel)
-                    self.row("フィンガープリント", self.pending.request.credentialFingerprint)
                 }
-                self.row("操作", self.pending.request.purpose.displayName)
+                if let target = self.sshSessionTargetPresentation {
+                    DisclosureGroup("技術情報", isExpanded: self.$technicalDetailsExpanded) {
+                        Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
+                            self.row("署名", target.signingAuthority)
+                            self.row("コードハッシュ", target.cdHash)
+                            self.row("検証", target.verification)
+                        }
+                        .padding(.top, 8)
+                    }
+                    .font(.callout)
+                }
             }
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
             if self.usesEmbeddedAuthentication {
-                LocalAuthenticationView("Touch ID／Apple Watchで許可", context: self.pending.context)
-                    .controlSize(.regular)
-                self.embeddedAuthenticationActions
+                if self.showsDestructiveConfirmation {
+                    DestructiveConfirmationView(
+                        title: self.destructiveConfirmationTitle,
+                        message: self.destructiveConfirmationMessage,
+                        buttonTitle: self.destructiveConfirmationButtonTitle,
+                        confirm: self.beginDestructiveAuthentication,
+                        cancel: self.cancel
+                    )
+                } else {
+                    LocalAuthenticationView("Touch IDまたはApple Watchで承認", context: self.pending.context)
+                        .controlSize(.regular)
+                    self.embeddedAuthenticationActions
+                }
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Label("次にmacOSの鍵認証が1回表示されます", systemImage: "lock.shield")
@@ -2117,7 +2246,7 @@ private struct ApprovalRequestView: View {
                         Button("キャンセル", action: self.cancel)
                             .keyboardShortcut(.cancelAction)
                         Button(
-                            "Touch ID／Macパスワード認証へ進む",
+                            "Touch IDまたはMacのログインパスワード認証へ進む",
                             action: self.continueToSystemSigningAuthentication
                         )
                         .buttonStyle(.borderedProminent)
@@ -2129,14 +2258,16 @@ private struct ApprovalRequestView: View {
     }
 
     private var embeddedAuthenticationActions: some View {
-        HStack {
+        VStack(alignment: .leading, spacing: 10) {
             Text("現在のプロセスと要求内容にだけ有効")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Spacer()
-            Button("キャンセル", action: self.cancel)
-                .keyboardShortcut(.cancelAction)
-            Button("Macのパスワードを使用", action: self.usePassword)
+            HStack {
+                Button("キャンセル", action: self.cancel)
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Macのログインパスワードを使用", action: self.usePassword)
+            }
         }
     }
 
@@ -2157,9 +2288,51 @@ private struct ApprovalRequestView: View {
         !self.isSigningRequest || self.pending.request.sshKeyBackend == .directSecureEnclaveV1
     }
 
+    private var showsDestructiveConfirmation: Bool {
+        self.pending.request.purpose.requiresExplicitDestructiveConfirmation
+            && !self.destructiveAuthenticationStarted
+    }
+
     private var signingAuthenticationDescription: String {
-        "CTKCardTokenでTouch IDまたはMacのパスワードを使用します。"
+        "CTKCardTokenでTouch IDまたはMacのログインパスワードを使用します。"
             + "このSecure Enclave鍵はApple Watchでは解除できません。"
+    }
+
+    private var destructiveConfirmationTitle: String {
+        self.isDeleteAllRequest ? "管理項目をすべて削除します" : "この項目を削除します"
+    }
+
+    private var destructiveConfirmationMessage: String {
+        if self.isDeleteAllRequest {
+            return "macop管理のKeychain項目がすべて削除されます。この操作は元に戻せません。"
+        }
+        if self.pending.request.purpose == .sshMigrationDeletePrepared {
+            return "外部登録前の準備済みSSH鍵を削除します。この操作は元に戻せません。"
+        }
+        if self.pending.request.operation == .directSSHKeyDelete {
+            return "表示されたSecure Enclave SSH鍵を削除します。この操作は元に戻せません。"
+        }
+        return "表示されたKeychain項目を削除します。この操作は元に戻せません。"
+    }
+
+    private var destructiveConfirmationButtonTitle: String {
+        if self.isDeleteAllRequest {
+            return "管理項目をすべて削除"
+        }
+        let deletesSSHKey = self.pending.request.operation == .directSSHKeyDelete
+            || self.pending.request.purpose == .sshMigrationDeletePrepared
+        if deletesSSHKey {
+            return "SSH鍵を削除"
+        }
+        return "Keychain項目を削除"
+    }
+
+    private func beginDestructiveAuthentication() {
+        self.destructiveAuthenticationStarted = true
+        Task { @MainActor in
+            await Task.yield()
+            self.authenticate()
+        }
     }
 
     private var directSSHKeyManagementAction: String {
@@ -2241,14 +2414,93 @@ private struct ApprovalRequestView: View {
     }
 }
 
-private struct ResultView: View {
-    let symbol: String
+private struct DestructiveConfirmationView: View {
     let title: String
+    let message: String
+    let buttonTitle: String
+    let confirm: () -> Void
+    let cancel: () -> Void
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: self.symbol).font(.system(size: 42)).foregroundStyle(.secondary)
-            Text(self.title).font(.headline).multilineTextAlignment(.center)
+        VStack(alignment: .leading, spacing: 12) {
+            Label(self.title, systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            Text(self.message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("キャンセル", action: self.cancel)
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button(self.buttonTitle, role: .destructive, action: self.confirm)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+            }
         }
+        .padding(14)
+        .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+private struct ResultView: View {
+    enum Kind: Equatable {
+        case success
+        case warning
+        case cancelled
+        case failure
+
+        var symbol: String {
+            switch self {
+            case .success: "checkmark.circle.fill"
+            case .warning: "exclamationmark.triangle.fill"
+            case .cancelled: "xmark.circle"
+            case .failure: "xmark.octagon.fill"
+            }
+        }
+
+        var tint: Color {
+            switch self {
+            case .success: .green
+            case .warning: .orange
+            case .cancelled: .gray
+            case .failure: .red
+            }
+        }
+
+        var requiresManualDismissal: Bool {
+            self == .warning || self == .failure
+        }
+    }
+
+    let kind: Kind
+    let title: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: self.kind.symbol)
+                .font(.system(size: 42))
+                .foregroundStyle(self.kind.tint)
+                .accessibilityHidden(true)
+            Text(self.title)
+                .font(.headline)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            if self.kind.requiresManualDismissal {
+                HStack(spacing: 10) {
+                    Button("メッセージをコピー", action: self.copyDetails)
+                    Button("閉じる", action: self.dismiss)
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func copyDetails() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(self.title, forType: .string)
     }
 }

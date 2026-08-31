@@ -47,6 +47,32 @@ final class AuthBrokerApprovalPresentationTests: XCTestCase {
         XCTAssertThrowsError(try AuthBrokerWire.frame(.approvalRequest(request)))
     }
 
+    func testOnlyIrreversibleDeletePurposesRequireExplicitConfirmation() {
+        let destructive: [AuthBrokerPurpose] = [
+            .managedKeychainDelete,
+            .otpDelete,
+            .managedKeychainDeleteAll,
+            .directSSHKeyDelete,
+            .sshMigrationDeletePrepared
+        ]
+        for purpose in destructive {
+            XCTAssertTrue(
+                purpose.requiresExplicitDestructiveConfirmation,
+                "expected explicit confirmation for \(purpose)"
+            )
+        }
+
+        let reversible: [AuthBrokerPurpose] = [
+            .managedKeychainRead,
+            .directSSHKeyCreate,
+            .sshMigrationActivate,
+            .sshMigrationRollback
+        ]
+        for purpose in reversible {
+            XCTAssertFalse(purpose.requiresExplicitDestructiveConfirmation, "unexpected confirmation for \(purpose)")
+        }
+    }
+
     private func request(
         operation: AuthBrokerOperation = .sshSession,
         purpose: AuthBrokerPurpose = .sshSession,

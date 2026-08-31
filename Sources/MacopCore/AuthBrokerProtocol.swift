@@ -240,6 +240,16 @@ public enum AuthBrokerPurpose: UInt8, Sendable, Equatable {
             false
         }
     }
+
+    public var requiresExplicitDestructiveConfirmation: Bool {
+        switch self {
+        case .managedKeychainDelete, .otpDelete, .managedKeychainDeleteAll,
+             .directSSHKeyDelete, .sshMigrationDeletePrepared:
+            true
+        default:
+            false
+        }
+    }
 }
 
 public enum AuthBrokerSSHKeyBackend: UInt8, Sendable, Equatable {
