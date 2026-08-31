@@ -309,7 +309,7 @@ credential profileはowner-only configにcanonical absolute executableとenv key
 
 `macop compatibility [--format human-readable|json]`は、command・subcommand・flagごとの`supported`、`partial`、`unsupported`、理由、代替commandを返す。JSON出力は`schema_version`を含む`macop`固有schemaとする。
 
-`macop config init|validate`は非機密の`config.json`だけを作成・検証する。`macop doctor`はOS、Keychain、CryptoTokenKit、Security.frameworkによる公開鍵解決、短命agent用SSH設定、設定permissionを診断する。`macop ssh …`はSection 9のSecure Enclave SSH wrapperを提供する。
+`macop config init|validate`は非機密の`config.json`だけを作成・検証する。`macop doctor`はOS、Keychain、CryptoTokenKit、Security.frameworkによる公開鍵解決、短命agent用SSH設定、設定permissionに加え、MacopAuth companionの存在・署名/same-Team identity・非機密socket probe・current wire versionを個別に診断する。broker失敗は`companion_unavailable`、`identity_invalid`、`protocol_mismatch`、`transport_failure`、`user_denied`のclosed categoryで表示し、socket path、request、secret、内部エラーを診断出力へ含めない。`macop ssh …`はSection 9のSecure Enclave SSH wrapperを提供する。
 
 ## 9. SSH設計
 
@@ -348,7 +348,7 @@ macop ssh delete github
 
 `macop`が扱うのはidentity label、公開鍵、公開鍵ハッシュなどの非機密metadataだけであり、secret値やprivate keyは保存しない。`public-key`は選択hashをSecurity.frameworkで正確に1件へ解決する。`run`と`test`は選択identityだけを公開する短命agentの下でApple純正`ssh`を起動し、`-F /dev/null`、`PKCS11Provider=none`、`IdentitiesOnly=no`、`IdentityFile=none`、`IdentityAgent=SSH_AUTH_SOCK`、`PreferredAuthentications=publickey`、`ForwardAgent=no`を固定指定する。ユーザーSSH設定、既定identity file、別agent、非公開鍵認証へfallbackして成功する経路はfail closedで禁止する。`create`は`p-256-ne -t bio`を標準にし、作成後にSecurity.frameworkが選択hashから公開鍵を正確に1件解決できることまで検証する。
 
-verified-session agentは`macop ssh agent shell <identity-label> -- <program> [arguments...]`と`macop ssh agent application <identity-label> <application-path>`で起動する。`ssh test/run`も同じlauncherを内部利用する。いずれも新規に起動した協調rootだけを対象とし、既存application、外部relay、Terminalタブ固有のE2E互換性は保証しない。
+verified-session agentは`macop ssh agent shell <identity-label> -- <program> [arguments...]`と`macop ssh agent application <identity-label> <application-path>`で起動する。`ssh test/run`も同じlauncherを内部利用する。shell/command sessionでは、検証済み`macop-agent`自身をlive code identity固定済みのregistry rootとする。対象commandは停止状態で生成し、そのlive code identityを固定して承認画面へ表示する。registry activation、本人承認、signer installation、agent authorizationがすべて完了した場合だけ再開し、拒否時は最初の命令を実行させずにkill/reapする。これによりpathname差し替えを防ぎ、`/bin/sh`の正規なexec置換を許容しつつ、registry rootのcode requirementは緩めない。いずれも新規に起動した協調rootだけを対象とし、既存application、外部relay、Terminalタブ固有のE2E互換性は保証しない。
 
 ### 9.3 Phase 0で確定した限界
 

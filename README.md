@@ -15,36 +15,40 @@ Build, sign, verify, and install the CLI, agent, and `MacopAuth.app` companion
 in a user-owned bin directory:
 
 ```bash
-scripts/build-install.sh
+MACOP_PROVISIONING_PROFILE="$HOME/Library/Application Support/macop/MacopAuth.provisionprofile" \
+scripts/build-install.sh --signing-identity 'Apple Development: Example (IDENTIFIER)'
 ```
+
+Production installation requires an explicit certificate-backed
+`--signing-identity` and a regular matching `MACOP_PROVISIONING_PROFILE`.
+Ad-hoc artifacts remain supported only by the owner-only temporary installer
+fixture; they cannot satisfy the same-Team live broker verification.
 
 Run the full local gate before building, or safely create the optional script-compatible
 `op -> macop` symlink:
 
 ```bash
-scripts/build-install.sh --check
-scripts/build-install.sh --with-op-symlink
-scripts/build-install.sh --configure-path
+MACOP_PROVISIONING_PROFILE="$HOME/Library/Application Support/macop/MacopAuth.provisionprofile" scripts/build-install.sh --check --signing-identity 'Apple Development: Example (IDENTIFIER)'
+MACOP_PROVISIONING_PROFILE="$HOME/Library/Application Support/macop/MacopAuth.provisionprofile" scripts/build-install.sh --with-op-symlink --signing-identity 'Apple Development: Example (IDENTIFIER)'
+MACOP_PROVISIONING_PROFILE="$HOME/Library/Application Support/macop/MacopAuth.provisionprofile" scripts/build-install.sh --configure-path --signing-identity 'Apple Development: Example (IDENTIFIER)'
 ```
 
-The default remains an ad-hoc source install. For an existing macOS
-code-signing identity, use the same identity for every update:
+Use the same certificate-backed identity and matching profile for every update:
 
 ```bash
+MACOP_PROVISIONING_PROFILE="$HOME/Library/Application Support/macop/MacopAuth.provisionprofile" \
 scripts/build-install.sh --signing-identity 'Developer ID Application: Example (TEAMID)'
 ```
 
 `MACOP_SIGNING_IDENTITY` is the equivalent environment setting. Stable signing
 keeps identifiers and designated requirements stable across updates. A
-certificate-backed build without a provisioning profile enables the native
-approval UI and verified SSH signing. Setting an absolute
-`MACOP_PROVISIONING_PROFILE` path additionally embeds the profile and enables
-the managed Data Protection Keychain capability. For that build, the auth
+matching absolute `MACOP_PROVISIONING_PROFILE` path embeds the profile and
+enables the managed Data Protection Keychain capability. For that build, the auth
 bundle's application identifier and Keychain access-group entitlements are
 generated from the selected certificate's Team ID; no Team ID, certificate
-name, or profile is stored in the repository. The installer rejects `-` as an
-explicitly requested stable identity instead of silently falling back to
-ad-hoc signing.
+name, or profile is stored in the repository. The installer rejects `-`
+instead of silently falling back to ad-hoc signing; ad-hoc builds are build/test
+fixtures only.
 
 For managed Keychain dogfooding with an Apple Development identity, Xcode can
 create or renew a matching development profile without storing its Team ID in
@@ -71,6 +75,32 @@ The install directory defaults to `~/.local/bin` and can be changed with
 installer-managed block to `~/.zprofile` or `~/.bash_profile`; use
 `--shell-profile` or `MACOP_SHELL_PROFILE` to select another file. Profile
 editing is opt-in and refuses symlinks.
+
+Each installation is published as one broker generation: the CLI, one-shot
+agent, companion app, and `macop-install-manifest.json` are staged and
+preflighted before replacement. The manifest records the build generation,
+protocol v8, executable hashes, and code identities. An atomic per-directory
+installer lock rejects concurrent updates; an interrupted update rolls every
+component back to the prior generation. `macop doctor` fails closed when an
+installed generation is missing, mixed, or does not match its manifest.
+Before committing, the installer launches the installed companion in a
+background probe, verifies its same-Team peer identity and required
+approval/SSH-signing capabilities through a protocol-v8 hello/welcome, then
+closes without reading protected state, requesting approval, or mutating trust
+data. A source build that cannot satisfy this broker boundary is rolled back.
+`macop doctor` reports the companion bundle's presence, its signature and
+same-Team identity, the non-secret socket probe, and the negotiated current
+wire version separately. Broker-facing CLI failures use one safe category:
+`companion_unavailable`, `identity_invalid`, `protocol_mismatch`,
+`transport_failure`, or `user_denied`. The output includes a recovery action
+but never prints a socket path, request data, or secret.
+An active one-shot agent session blocks publication rather than being stopped
+under its caller. It is not automatically restarted: after its command exits,
+the next `macop ssh agent` invocation creates a new session from the installed
+generation. The MacopAuth bundle contract combines the executable's
+CodeDirectory digest with `codesign --verify --deep --strict`; sealed bundle
+resources such as Info.plist and the embedded profile are verified before a
+manifest digest or identity is accepted.
 
 Ensure `$HOME/.local/bin` is on `PATH`. The source-build commands above are
 appropriate for the ordinary Keychain and `ssh` wrapper commands, but ad-hoc
@@ -136,6 +166,9 @@ scripts/uninstall.sh --remove-data
 It removes only its marked PATH block by default; pass `--keep-path` to retain
 that block. Use the same `--bin-dir`, `MACOP_BIN_DIR`, `--shell-profile`, or
 `MACOP_SHELL_PROFILE` value that was used to install.
+
+It also removes a recognized generation manifest, but refuses to run through a
+live installer lock and preserves stale transaction journals for recovery.
 
 To remove every item stored in macop's private managed-Keychain access group,
 delete them while the signed CLI and companion are still installed:
@@ -298,7 +331,7 @@ silently query the Passwords database through a public macOS API, and the
 AutoFill can populate both fields. If it does not return a username, the user
 must enter the configured account explicitly; a different username is rejected
 instead of being silently saved under the configured account.
-The CLI requires broker protocol v4, its closed operation-specific approval-purpose enum,
+The CLI requires broker protocol v8, its closed operation-specific approval-purpose enum,
 username attestation, and explicit committed/failed/indeterminate mutation outcomes;
 an older companion cannot satisfy the handshake and is never allowed to
 substitute the configured account for an unverified username.
@@ -448,6 +481,14 @@ authentication. The session socket exposes exactly the selected identity and
 is revoked with the launched root or its fixed deadline. These commands fail
 rather than authenticating with a key from the user's SSH config, a default
 identity file, another ssh-agent, or a non-public-key fallback.
+For shell and command sessions, the already verified `macop-agent` process is
+the stable registry root. The requested program is spawned in the suspended
+state and its live code identity is pinned before the approval UI is shown. It
+receives `SIGCONT` only after registry activation, approval, signer installation,
+and agent authorization all finish; rejection kills and reaps it without allowing
+its first instruction to run. This also supports shells that legitimately replace
+their own image after launch without weakening the registry root's live-code
+requirement.
 On macOS, `ssh run` resolves the `/usr/bin/git` developer-tool shim to the
 active Xcode/Command Line Tools Git image with xcrun lookup overrides removed
 and its mutable cache bypassed. Before launch and again on the suspended live
@@ -500,7 +541,8 @@ approval. The generated envelope is checked by the test suite with Apple
 OpenSSH. No private key or stable agent socket is exported.
 
 The same adapter supports Git verification without becoming a general
-`ssh-keygen` proxy. After revalidating the direct Apple Git parent, macop accepts
+`ssh-keygen` proxy. After revalidating the direct Apple Git parent or an explicitly
+registered non-Apple Git image, macop accepts
 only Git's exact `find-principals`, `verify -n git`, and `check-novalidate -n git`
 forms with bounded arguments and an exact verify-time, then replaces itself
 with `/usr/bin/ssh-keygen` so stdin, stdout, stderr, and the exit status remain
@@ -514,13 +556,22 @@ identifier, and cdhash on this Mac:
 macop ssh git-client trust /opt/homebrew/bin/git
 macop ssh git-client list
 macop ssh git-client remove /opt/homebrew/bin/git
+macop ssh git-client migrate # authenticated one-time migration from a v1 registry
+macop ssh git-client reset   # authenticated recovery after protected-state loss
 ```
 
 The owner-only registry is stored at
 `~/Library/Application Support/macop/git-clients.json`. A package upgrade,
 selector retarget, identifier change, or cdhash change fails closed; inspect the
 new binary and run `trust` again. The displayed `git --version` is informational
-and is not part of the trust decision.
+and is not part of the trust decision. The v2 registry is canonicalized as a
+whole document and MacopAuth stores only its generation and SHA-256 digest in
+its private Data Protection Keychain access group. The CLI and agent never read
+that state: they must obtain a same-Team broker verification for the exact
+document before using a registered Git client. A protocol mismatch means all
+three components should be updated together before retrying. v1 files are
+inspection-only; use `git-client migrate` to re-resolve and approve every live
+identity, or `git-client reset` after protected-state loss.
 
 `macop doctor` enumerates each CTK identity by its public hash, resolves its
 public key through Security.framework, and checks the effective isolated SSH
