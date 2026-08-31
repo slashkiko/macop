@@ -2280,7 +2280,16 @@ private struct AutoFillTextField: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSTextField {
-        let field: NSTextField = self.secure ? NSSecureTextField() : NSTextField()
+        let field: NSTextField
+        if self.secure {
+            let secureField = AutoFillObservingSecureTextField()
+            secureField.onValueChange = context.coordinator.receiveExternalChange
+            field = secureField
+        } else {
+            let textField = AutoFillObservingTextField()
+            textField.onValueChange = context.coordinator.receiveExternalChange
+            field = textField
+        }
         field.placeholderString = self.placeholder
         field.setAccessibilityLabel(self.accessibilityLabel)
         field.contentType = self.contentType
@@ -2290,26 +2299,71 @@ private struct AutoFillTextField: NSViewRepresentable {
         field.bezelStyle = .roundedBezel
         field.controlSize = .large
         field.font = .systemFont(ofSize: NSFont.systemFontSize(for: .large))
+        field.stringValue = self.text
+        context.coordinator.didPush(self.text)
         return field
     }
 
-    func updateNSView(_ field: NSTextField, context _: Context) {
-        if field.stringValue != self.text {
+    func updateNSView(_ field: NSTextField, context: Context) {
+        if context.coordinator.shouldPush(self.text) {
             field.stringValue = self.text
         }
     }
 
     final class Coordinator: NSObject, NSTextFieldDelegate {
         @Binding private var text: String
+        private var lastPushedText: String?
 
         init(text: Binding<String>) {
             self._text = text
         }
 
+        func didPush(_ value: String) {
+            self.lastPushedText = value
+        }
+
+        func shouldPush(_ value: String) -> Bool {
+            guard self.lastPushedText != value else { return false }
+            self.lastPushedText = value
+            return true
+        }
+
+        func receiveExternalChange(_ value: String) {
+            self.lastPushedText = value
+            if self.text != value {
+                self.text = value
+            }
+        }
+
         func controlTextDidChange(_ notification: Notification) {
             guard let field = notification.object as? NSTextField else { return }
+            self.lastPushedText = field.stringValue
             self.text = field.stringValue
         }
+    }
+}
+
+private final class AutoFillObservingTextField: NSTextField {
+    var onValueChange: ((String) -> Void)?
+
+    override var stringValue: String {
+        didSet { self.onValueChange?(self.stringValue) }
+    }
+
+    override var attributedStringValue: NSAttributedString {
+        didSet { self.onValueChange?(self.stringValue) }
+    }
+}
+
+private final class AutoFillObservingSecureTextField: NSSecureTextField {
+    var onValueChange: ((String) -> Void)?
+
+    override var stringValue: String {
+        didSet { self.onValueChange?(self.stringValue) }
+    }
+
+    override var attributedStringValue: NSAttributedString {
+        didSet { self.onValueChange?(self.stringValue) }
     }
 }
 
