@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 .PHONY: help setup bootstrap hooks-install
-.PHONY: format format-check lint test test-agent-helper test-invocation test-installation test-profile-helper test-no-persistence test-keychain-integration test-keychain-auth-ui test-pty test-ssh-manual build release-build install uninstall
+.PHONY: format format-check lint test test-config-durability test-agent-helper test-invocation test-installation test-install-transaction test-profile-helper test-profile-bootstrap test-no-persistence test-keychain-integration test-keychain-auth-ui test-pty test-ssh-manual build release-build install uninstall
 .PHONY: ci ci-swift ci-workflows ci-secrets
 .PHONY: pin-actions pin-actions-check
 .PHONY: workflow-lint workflow-security
@@ -38,8 +38,11 @@ format-check:
 lint:
 	XCODE_DEFAULT_TOOLCHAIN_OVERRIDE="$(TOOLCHAIN_DIR)" mise exec -- swiftlint lint --strict
 
-test:
+test: test-config-durability
 	swift run macop-selftest
+
+test-config-durability:
+	swift test --filter ConfigStoreDurabilityTests
 
 test-agent-helper: build
 	@bash scripts/test-agent-helper.sh
@@ -50,14 +53,29 @@ test-invocation: build
 test-installation: build
 	@bash scripts/test-installation.sh
 
+test-install-transaction: build
+	@bash scripts/test-install-transaction.sh
+
 test-profile-helper:
 	@bash -n scripts/create-development-profile.sh scripts/build-auth-app.sh
 	@plutil -lint Resources/ProfileBootstrap/MacopProfileBootstrap.xcodeproj/project.pbxproj >/dev/null
 	@plutil -lint Resources/ProfileBootstrap/MacopProfileBootstrap/MacopProfileBootstrap.entitlements >/dev/null
+	@$(MAKE) --no-print-directory test-profile-bootstrap
 	@scripts/create-development-profile.sh --help >/dev/null
 	@output="$$(scripts/create-development-profile.sh --signing-identity - 2>&1)"; status=$$?; \
 		test $$status -ne 0; printf '%s\n' "$$output" \
 		| grep -F 'an Apple Development identity name or SHA-1 hash is required.' >/dev/null
+
+test-profile-bootstrap:
+	@derived_data="$$(mktemp -d "$${TMPDIR:-/tmp}/macop-profile-bootstrap.XXXXXX")"; \
+		trap 'rm -rf "$$derived_data"' EXIT; \
+		xcodebuild \
+			-project Resources/ProfileBootstrap/MacopProfileBootstrap.xcodeproj \
+			-scheme MacopProfileBootstrap \
+			-configuration Debug \
+			-destination "platform=macOS,arch=$$(uname -m)" \
+			-derivedDataPath "$$derived_data" \
+			CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" build >/dev/null
 
 test-no-persistence: build
 	@python3 scripts/test-no-persistence.py
@@ -84,7 +102,9 @@ release-build:
 	$(SWIFTPM_GIT_SAFE_BARE) swift build -c release
 
 install:
-	@bash scripts/build-install.sh
+	@test -n "$${MACOP_SIGNING_IDENTITY:-}" || { echo "MACOP_SIGNING_IDENTITY (certificate identity) is required for production install" >&2; exit 2; }; \
+	 test -n "$${MACOP_PROVISIONING_PROFILE:-}" && test -f "$${MACOP_PROVISIONING_PROFILE}" || { echo "MACOP_PROVISIONING_PROFILE (matching profile) is required for production install" >&2; exit 2; }; \
+	 bash scripts/build-install.sh
 
 uninstall:
 	@bash scripts/uninstall.sh
@@ -98,7 +118,7 @@ workflow-security:
 secret-scan:
 	mise exec -- betterleaks dir .
 
-ci-swift: format-check lint build test test-agent-helper test-invocation test-installation test-profile-helper test-no-persistence
+ci-swift: format-check lint build test test-agent-helper test-invocation test-installation test-install-transaction test-profile-helper test-no-persistence
 
 ci-workflows: pin-actions-check workflow-lint workflow-security
 
