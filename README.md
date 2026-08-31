@@ -4,7 +4,7 @@ Apple-native `op` compatibility CLI for macOS. It resolves configured Keychain
 references at the process boundary and uses Secure Enclave-backed SSH identities
 without exporting private-key files.
 
-This project is an early source-build preview for macOS 14+. It is not a
+This project is an early source-build preview for macOS 15+. It is not a
 1Password backend or vault. Apple Passwords access is user-initiated through
 the system AutoFill chooser; macop cannot enumerate or silently query its
 database.
@@ -79,13 +79,13 @@ editing is opt-in and refuses symlinks.
 Each installation is published as one broker generation: the CLI, one-shot
 agent, companion app, and `macop-install-manifest.json` are staged and
 preflighted before replacement. The manifest records the build generation,
-protocol v8, executable hashes, and code identities. An atomic per-directory
+protocol v9, executable hashes, and code identities. An atomic per-directory
 installer lock rejects concurrent updates; an interrupted update rolls every
 component back to the prior generation. `macop doctor` fails closed when an
 installed generation is missing, mixed, or does not match its manifest.
 Before committing, the installer launches the installed companion in a
 background probe, verifies its same-Team peer identity and required
-approval/SSH-signing capabilities through a protocol-v8 hello/welcome, then
+approval/SSH-signing/direct-key capabilities through a protocol-v9 hello/welcome, then
 closes without reading protected state, requesting approval, or mutating trust
 data. A source build that cannot satisfy this broker boundary is rolled back.
 `macop doctor` reports the companion bundle's presence, its signature and
@@ -331,7 +331,7 @@ silently query the Passwords database through a public macOS API, and the
 AutoFill can populate both fields. If it does not return a username, the user
 must enter the configured account explicitly; a different username is rejected
 instead of being silently saved under the configured account.
-The CLI requires broker protocol v8, its closed operation-specific approval-purpose enum,
+The CLI requires broker protocol v9, its closed operation-specific approval-purpose enum,
 username attestation, and explicit committed/failed/indeterminate mutation outcomes;
 an older companion cannot satisfy the handshake and is never allowed to
 substitute the configured account for an unverified username.
@@ -473,6 +473,44 @@ for the new identity. Resolution failure returns exit 4 and leaves the identity
 visible for inspection and explicit `macop ssh delete <label>` cleanup rather
 than claiming a usable SSH setup.
 
+On macOS 15 or later, an existing CTK identity can be moved to MacopAuth's
+private direct Secure Enclave backend. The direct key allows Touch ID, Apple
+Watch, or the local Mac password at each signature. Migration is deliberately
+staged; macop never assumes that a public key was registered externally and
+never deletes the legacy key automatically:
+
+```bash
+macop ssh migration prepare github
+macop ssh migration public-key github
+# Register the printed direct public key at the remote service.
+macop ssh migration confirm-registered github
+# Prove that the registered candidate can authenticate while legacy remains default.
+macop ssh test github --migration-candidate
+macop ssh migration activate github
+# Confirm the normal path now selects the same direct key.
+macop ssh test github
+macop ssh git-signing-config github
+# After SSH and Git signing checks succeed:
+macop ssh migration retire github
+macop ssh delete github
+macop ssh migration confirm-retired github
+```
+
+`macop ssh migration status [label]` reports a human-readable `state revision`
+rather than an internal “generation n”. Before `activate`, the verified session
+continues to select the exact legacy fingerprint recorded at `prepare`. From
+`active` onward it selects only the protected direct key ID and public key.
+`ssh test <label> [destination] --migration-candidate` is accepted only in
+`externally_registered`; it temporarily exposes that entry's exact protected
+direct key to the one-shot test session without changing the selected backend.
+This proof must succeed before `activate`.
+`rollback` is available from `externally_registered`, `active`, and `retiring`.
+`delete-prepared` removes only a never-activated direct key; it uses a recoverable
+`deleting` marker and cannot delete an active or retired direct key.
+`migration orphans` lists direct keys that are not referenced by protected
+state after an interrupted prepare. `delete-orphan` deletes exactly one such
+ID and public key after a separate approval; it never performs a broad label delete.
+
 `macop ssh run` and `macop ssh test` launch the requested command under a
 one-shot verified-session agent. The nested Apple SSH process uses an empty
 config (`-F /dev/null`), `PKCS11Provider=none`, `ForwardAgent=no`,
@@ -536,7 +574,7 @@ parent to be Apple's live Git image or an explicitly pinned non-Apple Git image,
 accepts only owner-controlled regular
 input files and an owner-controlled signature directory, and refuses
 to overwrite an existing `.sig`, matches the configured public key to exactly
-one CTK identity, and signs the canonical `SSHSIG` preimage after native macop
+one backend selected by the protected migration state, and signs the canonical `SSHSIG` preimage after native macop
 approval. The generated envelope is checked by the test suite with Apple
 OpenSSH. No private key or stable agent socket is exported.
 
