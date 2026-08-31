@@ -35,7 +35,7 @@ public struct AuthBrokerPeerVerifier: Sendable {
         self.expectedTeamID = expectedTeamID
         self.allowedIdentifiers = allowedIdentifiers
         self.currentUID = currentUID
-        self.maximumAncestryDepth = maximumAncestryDepth
+        self.maximumAncestryDepth = max(0, maximumAncestryDepth)
     }
 
     public func verify(
@@ -45,7 +45,8 @@ public struct AuthBrokerPeerVerifier: Sendable {
             try LiveCodeIdentityInspector.inspect(pid: pid).identity
         }
     ) throws -> AuthBrokerVerifiedPeer {
-        guard peer.uid == self.currentUID, !self.expectedTeamID.isEmpty,
+        guard self.maximumAncestryDepth > 0,
+              peer.uid == self.currentUID, !self.expectedTeamID.isEmpty,
               let before = inspector.snapshot(of: peer.pid)
         else { throw AgentProtocolError.denied }
         let identity = try identityInspector(peer.pid)

@@ -16,6 +16,7 @@ public enum AuthBrokerCapability: UInt32, Sendable {
     case sshSigning = 4
     case passwordAutoFill = 8
     case passwordAutoFillUsername = 16
+    case gitClientTrust = 32
 }
 
 public struct AuthBrokerHello: Sendable, Equatable {
@@ -53,6 +54,50 @@ public enum AuthBrokerOperation: UInt8, Sendable {
     case managedKeychainDelete = 6
     case gitSSHSign = 7
     case managedKeychainUpdate = 8
+}
+
+public enum AuthBrokerOperationFamily: Sendable, Equatable {
+    case signing
+    case managedKeychain
+}
+
+public enum AuthBrokerPhaseTwoKind: Sendable, Equatable {
+    case none
+    case signing
+    case managedKeychainMutation
+}
+
+public extension AuthBrokerOperation {
+    var requiredCapability: AuthBrokerCapability {
+        switch self {
+        case .sshSession, .sshSign, .gitSSHSign:
+            .sshSigning
+        case .managedKeychainRead, .managedKeychainImport, .passwordAutoFill,
+             .managedKeychainDelete, .managedKeychainUpdate:
+            .managedKeychain
+        }
+    }
+
+    var family: AuthBrokerOperationFamily {
+        switch self {
+        case .sshSession, .sshSign, .gitSSHSign:
+            .signing
+        case .managedKeychainRead, .managedKeychainImport, .passwordAutoFill,
+             .managedKeychainDelete, .managedKeychainUpdate:
+            .managedKeychain
+        }
+    }
+
+    var phaseTwoKind: AuthBrokerPhaseTwoKind {
+        switch self {
+        case .sshSession, .gitSSHSign:
+            .signing
+        case .managedKeychainImport, .managedKeychainUpdate:
+            .managedKeychainMutation
+        case .sshSign, .managedKeychainRead, .passwordAutoFill, .managedKeychainDelete:
+            .none
+        }
+    }
 }
 
 /// Closed, attested presentation intent for an approval request. This is a
@@ -161,6 +206,36 @@ public enum AuthBrokerPurpose: UInt8, Sendable, Equatable {
     }
 }
 
+/// Display-only information for an approval request. The requester binding is
+/// always represented by the root fields on `AuthBrokerApprovalRequest`; the
+/// SSH target below is a separately pinned live image that the user needs to
+/// see before allowing a shell session.
+public enum AuthBrokerApprovalPresentation: Sendable, Equatable {
+    /// Retain the established requester-focused presentation.
+    case requesterOnly
+    /// A suspended shell target whose live code identity was pinned before the
+    /// authorization prompt. This must only accompany an SSH session request.
+    case sshSessionTarget(
+        application: String,
+        signingAuthority: String,
+        cdHash: String,
+        verification: String
+    )
+
+    public func isValid(for operation: AuthBrokerOperation) -> Bool {
+        switch (operation, self) {
+        case (.sshSession, .requesterOnly):
+            false
+        case (_, .requesterOnly):
+            true
+        case let (.sshSession, .sshSessionTarget(application, signingAuthority, cdHash, verification)):
+            !application.isEmpty && !signingAuthority.isEmpty && !cdHash.isEmpty && !verification.isEmpty
+        default:
+            false
+        }
+    }
+}
+
 public struct AuthBrokerApprovalRequest: Sendable, Equatable {
     public let requestID: UUID
     public let issuedAtMilliseconds: UInt64
@@ -171,6 +246,7 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
     public let rootIdentifier: String
     public let rootCodeRequirement: String
     public let rootExecutablePath: String
+    public let presentation: AuthBrokerApprovalPresentation
     public let purpose: AuthBrokerPurpose
     public let credentialLabel: String
     public let credentialFingerprint: String
@@ -189,6 +265,7 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
         rootIdentifier: String,
         rootCodeRequirement: String,
         rootExecutablePath: String,
+        presentation: AuthBrokerApprovalPresentation,
         purpose: AuthBrokerPurpose,
         credentialLabel: String,
         credentialFingerprint: String,
@@ -206,6 +283,7 @@ public struct AuthBrokerApprovalRequest: Sendable, Equatable {
         self.rootIdentifier = rootIdentifier
         self.rootCodeRequirement = rootCodeRequirement
         self.rootExecutablePath = rootExecutablePath
+        self.presentation = presentation
         self.purpose = purpose
         self.credentialLabel = credentialLabel
         self.credentialFingerprint = credentialFingerprint
@@ -220,6 +298,15 @@ public enum AuthBrokerApprovalStatus: UInt8, Sendable {
     case approved = 1
     case cancelled = 2
     case denied = 3
+
+    /// User decisions never share a presentation category with companion,
+    /// identity, protocol, or socket preparation failures.
+    public var failureCategory: AuthBrokerFailureCategory? {
+        switch self {
+        case .approved: nil
+        case .cancelled, .denied: .userDenied
+        }
+    }
 }
 
 public struct AuthBrokerApprovalResponse: Sendable, Equatable {
@@ -307,6 +394,78 @@ public struct AuthBrokerSSHSignResponse: Sendable, Equatable {
     }
 }
 
+public enum AuthBrokerGitClientTrustStatus: UInt8, Sendable, Equatable {
+    case trusted = 1
+    case mismatch = 2
+    case unavailable = 3
+    case approved = 4
+    case rejected = 5
+    case generationConflict = 6
+}
+
+public struct AuthBrokerGitClientTrustVerifyRequest: Sendable, Equatable {
+    public let requestID: UUID
+    public let canonicalDocument: Data
+    public let digest: Data
+    public init(requestID: UUID, canonicalDocument: Data, digest: Data) {
+        self.requestID = requestID; self.canonicalDocument = canonicalDocument; self.digest = digest
+    }
+}
+
+public struct AuthBrokerGitClientTrustVerifyResponse: Sendable, Equatable {
+    public let requestID: UUID
+    public let digest: Data
+    public let generation: UInt64
+    public let status: AuthBrokerGitClientTrustStatus
+    public init(requestID: UUID, digest: Data, generation: UInt64, status: AuthBrokerGitClientTrustStatus) {
+        self.requestID = requestID; self.digest = digest; self.generation = generation; self.status = status
+    }
+}
+
+public struct AuthBrokerGitClientTrustMutationRequest: Sendable, Equatable {
+    public let authorizationID: UUID
+    public let operation: GitClientTrustMutationOperation
+    public let expectedGeneration: UInt64
+    public let canonicalDocument: Data
+    public let digest: Data
+    public init(
+        authorizationID: UUID,
+        operation: GitClientTrustMutationOperation,
+        expectedGeneration: UInt64,
+        canonicalDocument: Data,
+        digest: Data
+    ) {
+        self.authorizationID = authorizationID; self.operation = operation; self.expectedGeneration = expectedGeneration
+        self.canonicalDocument = canonicalDocument; self.digest = digest
+    }
+}
+
+public struct AuthBrokerGitClientTrustMutationResponse: Sendable, Equatable {
+    public let authorizationID: UUID
+    public let digest: Data
+    public let generation: UInt64
+    public let status: AuthBrokerGitClientTrustStatus
+    public init(authorizationID: UUID, digest: Data, generation: UInt64, status: AuthBrokerGitClientTrustStatus) {
+        self.authorizationID = authorizationID; self.digest = digest; self.generation = generation; self.status = status
+    }
+}
+
+public struct AuthBrokerGitClientTrustStateRequest: Sendable, Equatable {
+    public let requestID: UUID
+    public init(requestID: UUID) {
+        self.requestID = requestID
+    }
+}
+
+public struct AuthBrokerGitClientTrustStateResponse: Sendable, Equatable {
+    public let requestID: UUID
+    public let generation: UInt64
+    public let status: AuthBrokerGitClientTrustStatus
+    public init(requestID: UUID, generation: UInt64, status: AuthBrokerGitClientTrustStatus) {
+        self.requestID = requestID; self.generation = generation; self.status = status
+    }
+}
+
 /// Closed, secret-free result of an approved signing flow. Preparation
 /// failures are intentionally split so the client can explain which
 /// fail-closed boundary stopped the operation without receiving arbitrary
@@ -328,11 +487,17 @@ public enum AuthBrokerMessage: Sendable, Equatable {
     case sshSignResponse(AuthBrokerSSHSignResponse)
     case managedKeychainImportRequest(AuthBrokerManagedKeychainImportRequest)
     case managedKeychainImportResponse(AuthBrokerManagedKeychainImportResponse)
+    case gitClientTrustVerifyRequest(AuthBrokerGitClientTrustVerifyRequest)
+    case gitClientTrustVerifyResponse(AuthBrokerGitClientTrustVerifyResponse)
+    case gitClientTrustMutationRequest(AuthBrokerGitClientTrustMutationRequest)
+    case gitClientTrustMutationResponse(AuthBrokerGitClientTrustMutationResponse)
+    case gitClientTrustStateRequest(AuthBrokerGitClientTrustStateRequest)
+    case gitClientTrustStateResponse(AuthBrokerGitClientTrustStateResponse)
 }
 
 // swiftlint:disable:next type_body_length
 public enum AuthBrokerWire {
-    public static let currentVersion: UInt16 = 5
+    public static let currentVersion: UInt16 = 8
     public static let maximumFrameLength = 256 * 1024
     public static let maximumCommandLength = 4 * 1024
     public static let maximumMetadataLength = 512
@@ -390,6 +555,9 @@ public enum AuthBrokerWire {
             guard request.purpose.isValid(for: request.operation) else {
                 throw AuthBrokerProtocolError.malformed
             }
+            guard request.presentation.isValid(for: request.operation) else {
+                throw AuthBrokerProtocolError.malformed
+            }
             value.append(3)
             value += try self.text(request.requestID.uuidString, maximum: 36)
             value += self.u64(request.issuedAtMilliseconds) + self.u64(request.expiresAtMilliseconds)
@@ -400,6 +568,7 @@ public enum AuthBrokerWire {
             value += try self.text(request.rootIdentifier, maximum: self.maximumMetadataLength)
             value += try self.text(request.rootCodeRequirement, maximum: self.maximumCommandLength)
             value += try self.text(request.rootExecutablePath, maximum: self.maximumCommandLength)
+            try self.appendPresentation(request.presentation, to: &value)
             value += try self.text(request.credentialLabel, maximum: self.maximumMetadataLength)
             value += try self.text(request.credentialFingerprint, maximum: self.maximumMetadataLength)
             value += try self.text(request.host, maximum: self.maximumMetadataLength)
@@ -439,6 +608,39 @@ public enum AuthBrokerWire {
             value += try self.text(response.authorizationID.uuidString, maximum: 36)
             value.append(response.outcome.rawValue)
             value += self.u32(UInt32(bitPattern: response.status))
+        case let .gitClientTrustVerifyRequest(request):
+            guard self.validTrustDocument(request.canonicalDocument, digest: request.digest)
+            else { throw AuthBrokerProtocolError.malformed }
+            value.append(9)
+            value += try self.text(request.requestID.uuidString, maximum: 36) + self
+                .bytes(request.canonicalDocument) + self.bytes(request.digest)
+        case let .gitClientTrustVerifyResponse(response):
+            guard response.digest.count == 32 else { throw AuthBrokerProtocolError.malformed }
+            value.append(10)
+            value += try self.text(response.requestID.uuidString, maximum: 36) + self.bytes(response.digest) + self
+                .u64(response.generation)
+            value.append(response.status.rawValue)
+        case let .gitClientTrustMutationRequest(request):
+            guard self.validTrustDocument(request.canonicalDocument, digest: request.digest)
+            else { throw AuthBrokerProtocolError.malformed }
+            value.append(11)
+            value += try self.text(request.authorizationID.uuidString, maximum: 36)
+            value.append(request.operation.rawValue)
+            value += self.u64(request.expectedGeneration) + self.bytes(request.canonicalDocument) + self
+                .bytes(request.digest)
+        case let .gitClientTrustMutationResponse(response):
+            guard response.digest.count == 32 else { throw AuthBrokerProtocolError.malformed }
+            value.append(12)
+            value += try self.text(response.authorizationID.uuidString, maximum: 36) + self
+                .bytes(response.digest) + self.u64(response.generation)
+            value.append(response.status.rawValue)
+        case let .gitClientTrustStateRequest(request):
+            value.append(13)
+            value += try self.text(request.requestID.uuidString, maximum: 36)
+        case let .gitClientTrustStateResponse(response):
+            value.append(14)
+            value += try self.text(response.requestID.uuidString, maximum: 36) + self.u64(response.generation)
+            value.append(response.status.rawValue)
         }
         return value
     }
@@ -497,6 +699,7 @@ public enum AuthBrokerWire {
             let rootIdentifier = try cursor.text(maximum: self.maximumMetadataLength)
             let rootCodeRequirement = try cursor.text(maximum: self.maximumCommandLength)
             let rootExecutablePath = try cursor.text(maximum: self.maximumCommandLength)
+            let presentation = try self.presentation(from: &cursor, operation: operation)
             let credentialLabel = try cursor.text(maximum: self.maximumMetadataLength)
             let credentialFingerprint = try cursor.text(maximum: self.maximumMetadataLength)
             let host = try cursor.text(maximum: self.maximumMetadataLength)
@@ -505,6 +708,7 @@ public enum AuthBrokerWire {
             let keychainSynchronizable = try cursor.byte()
             guard cursor.isAtEnd, rootPID > 0, rootStartTime > 0,
                   !rootIdentifier.isEmpty, !rootCodeRequirement.isEmpty, !rootExecutablePath.isEmpty,
+                  presentation.isValid(for: operation),
                   keychainSynchronizable <= 1
             else { throw AuthBrokerProtocolError.malformed }
             return .approvalRequest(AuthBrokerApprovalRequest(
@@ -517,6 +721,7 @@ public enum AuthBrokerWire {
                 rootIdentifier: rootIdentifier,
                 rootCodeRequirement: rootCodeRequirement,
                 rootExecutablePath: rootExecutablePath,
+                presentation: presentation,
                 purpose: purpose,
                 credentialLabel: credentialLabel,
                 credentialFingerprint: credentialFingerprint,
@@ -597,6 +802,72 @@ public enum AuthBrokerWire {
                 outcome: outcome,
                 status: status
             ))
+        case 9:
+            guard let requestID = try UUID(uuidString: cursor.text(maximum: 36))
+            else { throw AuthBrokerProtocolError.malformed }
+            let document = try cursor.bytes(); let digest = try cursor.bytes()
+            guard cursor.isAtEnd,
+                  self.validTrustDocument(document, digest: digest) else { throw AuthBrokerProtocolError.malformed }
+            return .gitClientTrustVerifyRequest(AuthBrokerGitClientTrustVerifyRequest(
+                requestID: requestID,
+                canonicalDocument: document,
+                digest: digest
+            ))
+        case 10:
+            guard let requestID = try UUID(uuidString: cursor.text(maximum: 36))
+            else { throw AuthBrokerProtocolError.malformed }
+            let digest = try cursor.bytes(); let generation = try cursor.u64()
+            guard let status = try AuthBrokerGitClientTrustStatus(rawValue: cursor.byte()), cursor.isAtEnd,
+                  digest.count == 32 else { throw AuthBrokerProtocolError.malformed }
+            return .gitClientTrustVerifyResponse(AuthBrokerGitClientTrustVerifyResponse(
+                requestID: requestID,
+                digest: digest,
+                generation: generation,
+                status: status
+            ))
+        case 11:
+            guard let authorizationID = try UUID(uuidString: cursor.text(maximum: 36)),
+                  let operation = try GitClientTrustMutationOperation(rawValue: cursor.byte())
+            else { throw AuthBrokerProtocolError.malformed }
+            let expectedGeneration = try cursor.u64(); let document = try cursor.bytes(); let digest = try cursor
+                .bytes()
+            guard cursor.isAtEnd,
+                  self.validTrustDocument(document, digest: digest) else { throw AuthBrokerProtocolError.malformed }
+            return .gitClientTrustMutationRequest(AuthBrokerGitClientTrustMutationRequest(
+                authorizationID: authorizationID,
+                operation: operation,
+                expectedGeneration: expectedGeneration,
+                canonicalDocument: document,
+                digest: digest
+            ))
+        case 12:
+            guard let authorizationID = try UUID(uuidString: cursor.text(maximum: 36))
+            else { throw AuthBrokerProtocolError.malformed }
+            let digest = try cursor.bytes(); let generation = try cursor.u64()
+            guard let status = try AuthBrokerGitClientTrustStatus(rawValue: cursor.byte()), cursor.isAtEnd,
+                  digest.count == 32 else { throw AuthBrokerProtocolError.malformed }
+            return .gitClientTrustMutationResponse(AuthBrokerGitClientTrustMutationResponse(
+                authorizationID: authorizationID,
+                digest: digest,
+                generation: generation,
+                status: status
+            ))
+        case 13:
+            guard let requestID = try UUID(uuidString: cursor.text(maximum: 36)), cursor.isAtEnd else {
+                throw AuthBrokerProtocolError.malformed
+            }
+            return .gitClientTrustStateRequest(AuthBrokerGitClientTrustStateRequest(requestID: requestID))
+        case 14:
+            guard let requestID = try UUID(uuidString: cursor.text(maximum: 36)) else {
+                throw AuthBrokerProtocolError.malformed
+            }
+            let generation = try cursor.u64()
+            guard let status = try AuthBrokerGitClientTrustStatus(rawValue: cursor.byte()), cursor.isAtEnd else {
+                throw AuthBrokerProtocolError.malformed
+            }
+            return .gitClientTrustStateResponse(AuthBrokerGitClientTrustStateResponse(
+                requestID: requestID, generation: generation, status: status
+            ))
         default:
             throw AuthBrokerProtocolError.unsupportedMessage
         }
@@ -625,6 +896,58 @@ public enum AuthBrokerWire {
             !response.signature.isEmpty
         case .requesterInvalid, .signerUnavailable, .identityMismatch, .signatureFailed:
             response.signature.isEmpty
+        }
+    }
+
+    private static func validTrustDocument(_ document: Data, digest: Data) -> Bool {
+        guard digest.count == 32, document.count <= self.maximumFrameLength else { return false }
+        guard let decoded = try? GitClientTrustDocument.decodeCanonical(document),
+              let canonical = try? decoded.canonicalBytes(),
+              let calculated = try? decoded.digest()
+        else { return false }
+        return constantTimeEqual(document, canonical) && constantTimeEqual(digest, calculated)
+    }
+
+    private static func appendPresentation(
+        _ presentation: AuthBrokerApprovalPresentation,
+        to value: inout Data
+    ) throws {
+        switch presentation {
+        case .requesterOnly:
+            value.append(0)
+        case let .sshSessionTarget(application, signingAuthority, cdHash, verification):
+            value.append(1)
+            value += try self.text(application, maximum: self.maximumCommandLength)
+            value += try self.text(signingAuthority, maximum: self.maximumMetadataLength)
+            value += try self.text(cdHash, maximum: self.maximumMetadataLength)
+            value += try self.text(verification, maximum: self.maximumMetadataLength)
+        }
+    }
+
+    private static func presentation(
+        from cursor: inout AuthBrokerCursor,
+        operation: AuthBrokerOperation
+    ) throws -> AuthBrokerApprovalPresentation {
+        switch try cursor.byte() {
+        case 0:
+            return .requesterOnly
+        case 1:
+            let application = try cursor.text(maximum: self.maximumCommandLength)
+            let signingAuthority = try cursor.text(maximum: self.maximumMetadataLength)
+            let cdHash = try cursor.text(maximum: self.maximumMetadataLength)
+            let verification = try cursor.text(maximum: self.maximumMetadataLength)
+            let presentation = AuthBrokerApprovalPresentation.sshSessionTarget(
+                application: application,
+                signingAuthority: signingAuthority,
+                cdHash: cdHash,
+                verification: verification
+            )
+            guard presentation.isValid(for: operation) else {
+                throw AuthBrokerProtocolError.malformed
+            }
+            return presentation
+        default:
+            throw AuthBrokerProtocolError.malformed
         }
     }
 

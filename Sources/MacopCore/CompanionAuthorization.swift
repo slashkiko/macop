@@ -23,15 +23,29 @@ public struct CompanionAuthenticationSessionPrompt: SessionAuthorizationResultPr
                     rootStartTime: presentation.rootStartTime,
                     rootIdentifier: presentation.rootIdentifier,
                     rootCodeRequirement: presentation.rootCodeRequirement,
-                    rootExecutablePath: presentation.application,
+                    rootExecutablePath: presentation.rootExecutablePath,
+                    presentation: .sshSessionTarget(
+                        application: presentation.application,
+                        signingAuthority: presentation.signingAuthority,
+                        cdHash: presentation.cdHash,
+                        verification: presentation.verification
+                    ),
                     purpose: .sshSession,
                     credentialLabel: presentation.identityLabel,
                     credentialFingerprint: presentation.fingerprint,
                     host: ""
                 )
                 guard case let .approvalResponse(response) = try connection.send(.approvalRequest(request)),
-                      response.requestID == request.requestID,
-                      response.status == .approved,
+                      response.requestID == request.requestID
+                else {
+                    completion(Self.rejected(.protocolMismatch))
+                    return
+                }
+                if let category = response.status.failureCategory {
+                    completion(Self.rejected(category))
+                    return
+                }
+                guard response.status == .approved,
                       response.resultStatus == 0,
                       !response.resultData.isEmpty,
                       constantTimeEqual(
@@ -39,7 +53,7 @@ public struct CompanionAuthenticationSessionPrompt: SessionAuthorizationResultPr
                           Data(presentation.fingerprint.utf8)
                       )
                 else {
-                    completion(SessionAuthorizationResult(approved: false, authenticationContext: nil))
+                    completion(Self.rejected(.protocolMismatch))
                     return
                 }
                 let signer = CompanionAgentSigner(
@@ -53,10 +67,20 @@ public struct CompanionAuthenticationSessionPrompt: SessionAuthorizationResultPr
                     authenticationContext: nil,
                     signer: signer
                 ))
+            } catch let failure as AuthBrokerFailure {
+                completion(Self.rejected(failure.category))
             } catch {
-                completion(SessionAuthorizationResult(approved: false, authenticationContext: nil))
+                completion(Self.rejected(.protocolMismatch))
             }
         }
+    }
+
+    private static func rejected(_ category: AuthBrokerFailureCategory) -> SessionAuthorizationResult {
+        SessionAuthorizationResult(
+            approved: false,
+            authenticationContext: nil,
+            brokerFailure: AuthBrokerFailure(category)
+        )
     }
 }
 

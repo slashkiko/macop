@@ -5,6 +5,13 @@ import MacopCore
 import MacopPTY
 import Security
 
+if case let .blocked(reason) = InstallGenerationGuard.invocationDecision(argv: CommandLine.arguments) {
+    FileHandle.standardError.write(Data(
+        "macop-agent: \(reason.diagnostic).\n".utf8
+    ))
+    exit(ExitCode.providerUnavailable.rawValue)
+}
+
 // The executable owns production launch, prompt, and signal coordination.
 // swiftlint:disable file_length
 
@@ -75,11 +82,11 @@ private func rootDirectory() -> URL {
     return URL(fileURLWithPath: "/tmp/macop-agent-\(getuid())-\(suffix)", isDirectory: true)
 }
 
-private func environment(for reservation: VerifiedSessionReservation) -> [String: String] {
+@Sendable private func environment(for reservation: VerifiedSessionReservation) -> [String: String] {
     ProcessInfo.processInfo.environment.merging(VerifiedSessionLauncher.environment(for: reservation)) { _, new in new }
 }
 
-private func hasInteractiveTerminal() -> Bool {
+@Sendable private func hasInteractiveTerminal() -> Bool {
     isatty(STDIN_FILENO) == 1 && isatty(STDOUT_FILENO) == 1
 }
 
@@ -251,13 +258,13 @@ private final class SignalCoordinator: @unchecked Sendable {
     }
 #endif
 
-private struct LaunchCodeIdentity {
+private struct LaunchCodeIdentity: Sendable {
     let bundleID: String
     let requirement: String
     let snapshot: LiveCodeIdentity
 }
 
-private func identity(for pid: Int32, expectedPath: String, mode: String) throws -> LaunchCodeIdentity {
+@Sendable private func identity(for pid: Int32, expectedPath: String, mode: String) throws -> LaunchCodeIdentity {
     let inspection = try mode == "git"
         ? LiveCodeIdentityInspector.inspectExpectedAppleGit(pid: pid, expectedPath: expectedPath)
         : LiveCodeIdentityInspector.inspect(pid: pid, expectedPath: expectedPath)
@@ -268,7 +275,9 @@ private func identity(for pid: Int32, expectedPath: String, mode: String) throws
     )
 }
 
-private func expectedExecutable(mode: String, target: [String], environment: [String: String]) throws -> String {
+@Sendable private func expectedExecutable(
+    mode: String, target: [String], environment: [String: String]
+) throws -> String {
     guard let target = target.first else { throw AgentProtocolError.denied }
     if mode == "application" {
         let app = URL(fileURLWithPath: target).resolvingSymlinksInPath()
@@ -289,34 +298,87 @@ private func expectedExecutable(mode: String, target: [String], environment: [St
     throw AgentProtocolError.denied
 }
 
-private struct PreparedRootLaunch {
+private struct PreparedRootLaunch: @unchecked Sendable {
     let owned: OwnedProcess
     let code: LaunchCodeIdentity
     let suspended: SuspendedProcessController?
 }
 
-private func prepareRootLaunch(
+private struct DeferredShellLaunch: Sendable {
+    let rootPID: Int32
+    let rootStartTime: UInt64
+    let rootCode: LaunchCodeIdentity
+    let targetCode: LaunchCodeIdentity
+    let owned: OwnedProcess
+    let suspended: SuspendedProcessController
+}
+
+@Sendable private func prepareDeferredShellLaunch(
+    target: [String],
+    environment: [String: String],
+    inspect: @Sendable (Int32, String, String) throws -> LaunchCodeIdentity
+) throws -> DeferredShellLaunch {
+    let targetPath = try expectedExecutable(mode: "shell", target: target, environment: environment)
+    guard let executable = Bundle.main.executableURL else { throw AgentProtocolError.denied }
+    let rootPath = LiveCodeIdentityInspector.canonicalPath(executable.path)
+    let rootPID = Int32(ProcessInfo.processInfo.processIdentifier)
+    guard let root = SystemRequesterInspector().snapshot(of: rootPID) else { throw AgentProtocolError.denied }
+    let rootCode = try inspect(rootPID, rootPath, "shell")
+    let isolated = !hasInteractiveTerminal()
+    let pid = try spawnSuspended(target, environment: environment, isolatedProcessGroup: isolated)
+    let suspended = SuspendedProcessController(pid: pid)
+    do {
+        let owned = try capture(pid, mode: "shell")
+        let targetCode = try inspect(pid, targetPath, "shell")
+        return DeferredShellLaunch(
+            rootPID: rootPID,
+            rootStartTime: root.startTime,
+            rootCode: rootCode,
+            targetCode: targetCode,
+            owned: owned,
+            suspended: suspended
+        )
+    } catch {
+        if !suspended.cancelBeforeResume() {
+            abandon(pid, mode: "shell", isolated: isolated)
+        }
+        throw error
+    }
+}
+
+@Sendable private func waitForDeferredShellTarget(
+    prepared: DeferredShellLaunch,
+    signals: SignalCoordinator
+) throws -> Int32 {
+    guard !signals.isCancellationRequested() else { throw AgentProtocolError.denied }
+    try prepared.suspended.resume()
+    signals.beginRootWait()
+    defer { signals.endRootWait() }
+    do {
+        return try waitForShellExit(prepared.owned.pid) { signals.isCancellationRequested() }
+    } catch {
+        signals.cancelLaunch(prepared.owned)
+        throw error
+    }
+}
+
+@Sendable private func prepareRootLaunch(
     mode: String,
     target: [String],
     environment: [String: String],
-    inspect: (Int32, String, String) throws -> LaunchCodeIdentity
+    inspect: @Sendable (Int32, String, String) throws -> LaunchCodeIdentity
 ) throws -> PreparedRootLaunch {
     let expectedPath = try expectedExecutable(mode: mode, target: target, environment: environment)
-    let shellLike = mode == "shell" || mode == "git"
-    let lifecycleMode = shellLike ? "shell" : mode
+    let startsSuspended = mode == "git"
+    let lifecycleMode = startsSuspended ? "shell" : mode
     let owned: OwnedProcess
     var suspended: SuspendedProcessController?
-    if shellLike {
+    if startsSuspended {
         let isolatedProcessGroup = !hasInteractiveTerminal()
-        let pid: Int32
-        if mode == "git" {
-            pid = try spawnSuspended(
-                target, environment: environment, isolatedProcessGroup: isolatedProcessGroup
-            )
-            suspended = SuspendedProcessController(pid: pid)
-        } else {
-            pid = try spawn(target, environment: environment, isolatedProcessGroup: isolatedProcessGroup)
-        }
+        let pid = try spawnSuspended(
+            target, environment: environment, isolatedProcessGroup: isolatedProcessGroup
+        )
+        suspended = SuspendedProcessController(pid: pid)
         do {
             owned = try capture(pid, mode: lifecycleMode)
         } catch {
@@ -348,9 +410,9 @@ private func prepareRootLaunch(
 }
 
 #if DEBUG
-    private func runGitSuspendedLaunchFixture() -> Bool {
+    private func runSuspendedLaunchFixture(mode: String) -> Bool {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("macop-git-suspended-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("macop-\(mode)-suspended-\(UUID().uuidString)", isDirectory: true)
         let rejectedSideEffect = root.appendingPathComponent("rejected-ran")
         let resumedSideEffect = root.appendingPathComponent("resumed-ran")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -358,7 +420,7 @@ private func prepareRootLaunch(
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             do {
                 _ = try prepareRootLaunch(
-                    mode: "git", target: ["/usr/bin/touch", rejectedSideEffect.path],
+                    mode: mode, target: ["/usr/bin/touch", rejectedSideEffect.path],
                     environment: ProcessInfo.processInfo.environment,
                     inspect: { _, _, _ in throw AgentProtocolError.denied }
                 )
@@ -366,13 +428,13 @@ private func prepareRootLaunch(
             } catch AgentProtocolError.denied {}
             guard !FileManager.default.fileExists(atPath: rejectedSideEffect.path) else { return false }
             let prepared = try prepareRootLaunch(
-                mode: "git", target: ["/usr/bin/touch", resumedSideEffect.path],
+                mode: mode, target: ["/usr/bin/touch", resumedSideEffect.path],
                 environment: ProcessInfo.processInfo.environment,
                 inspect: { _, expectedPath, _ in
                     LaunchCodeIdentity(
-                        bundleID: "fixture.git", requirement: "identifier fixture.git",
+                        bundleID: "fixture.\(mode)", requirement: "identifier fixture.\(mode)",
                         snapshot: LiveCodeIdentity(
-                            canonicalPath: expectedPath, identifier: "fixture.git", teamID: nil,
+                            canonicalPath: expectedPath, identifier: "fixture.\(mode)", teamID: nil,
                             signingAuthority: nil, cdHash: "00112233", hasTrustedPublisher: false
                         )
                     )
@@ -382,6 +444,35 @@ private func prepareRootLaunch(
             try suspended.resume()
             guard try waitForShellExit(prepared.owned.pid) == 0 else { return false }
             return FileManager.default.fileExists(atPath: resumedSideEffect.path)
+        } catch {
+            return false
+        }
+    }
+
+    private func runDeferredShellLaunchFixture() -> Bool {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("macop-shell-deferred-\(UUID().uuidString)", isDirectory: true)
+        let sideEffect = root.appendingPathComponent("approved-ran")
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let target = ["/usr/bin/touch", sideEffect.path]
+            let launch = try prepareDeferredShellLaunch(
+                target: target,
+                environment: ProcessInfo.processInfo.environment,
+                inspect: identity
+            )
+            guard launch.rootPID == Int32(ProcessInfo.processInfo.processIdentifier),
+                  launch.targetCode.snapshot.canonicalPath == "/usr/bin/touch",
+                  !FileManager.default.fileExists(atPath: sideEffect.path)
+            else { return false }
+            let signals = SignalCoordinator()
+            signals.installOwned(launch.owned)
+            guard try waitForDeferredShellTarget(
+                prepared: launch,
+                signals: signals
+            ) == 0 else { return false }
+            return FileManager.default.fileExists(atPath: sideEffect.path)
         } catch {
             return false
         }
@@ -396,7 +487,34 @@ private func run(mode: String, label: String, target: [String], signals: SignalC
         selectIdentity: { try SSHCommand.verifiedSessionIdentity(label: $0) },
         launch: { reservation in
             let launchEnvironment = environment(for: reservation)
-            let shellLike = mode == "shell" || mode == "git"
+            if mode == "shell" {
+                let prepared = try prepareDeferredShellLaunch(
+                    target: target,
+                    environment: launchEnvironment,
+                    inspect: identity
+                )
+                signals.installOwned(prepared.owned)
+                return VerifiedSessionRuntimeLaunch(
+                    request: VerifiedSessionLaunchRequest(
+                        rootPID: prepared.rootPID,
+                        rootStartTime: prepared.rootStartTime,
+                        bundleID: prepared.rootCode.bundleID,
+                        codeRequirement: prepared.rootCode.requirement,
+                        codeIdentity: prepared.rootCode.snapshot,
+                        presentedApplication: prepared.targetCode.snapshot.canonicalPath,
+                        presentationVerification: "live image pinned before approval; command starts only after approval",
+                        presentationIdentity: prepared.targetCode.snapshot
+                    ),
+                    waitForExit: {
+                        try waitForDeferredShellTarget(prepared: prepared, signals: signals)
+                    },
+                    cancel: {
+                        if !prepared.suspended.cancelBeforeResume() {
+                            signals.cancelLaunch(prepared.owned)
+                        }
+                    }
+                )
+            }
             let prepared = try prepareRootLaunch(
                 mode: mode, target: target, environment: launchEnvironment, inspect: identity
             )
@@ -411,7 +529,7 @@ private func run(mode: String, label: String, target: [String], signals: SignalC
                     // VerifiedSessionRuntime calls this only after activation,
                     // approval, signer installation, and registry authorization.
                     try prepared.suspended?.resume()
-                    if shellLike {
+                    if mode == "git" {
                         signals.beginRootWait()
                         defer { signals.endRootWait() }
                         return try waitForShellExit(prepared.owned.pid) { signals.isCancellationRequested() }
@@ -451,7 +569,11 @@ private func run(mode: String, label: String, target: [String], signals: SignalC
 
 #if DEBUG
     if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_GIT_SUSPENDED_FIXTURE"] == "1" {
-        exit(runGitSuspendedLaunchFixture() ? ExitCode.success.rawValue : ExitCode.denied.rawValue)
+        exit(runSuspendedLaunchFixture(mode: "git") ? ExitCode.success.rawValue : ExitCode.denied.rawValue)
+    }
+
+    if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_SHELL_DEFERRED_FIXTURE"] == "1" {
+        exit(runDeferredShellLaunchFixture() ? ExitCode.success.rawValue : ExitCode.denied.rawValue)
     }
 
     if ProcessInfo.processInfo.environment["MACOP_AGENT_RUN_LIFECYCLE_FIXTURES"] == "1" {
@@ -494,6 +616,14 @@ do {
     if let error = error as? CLIError {
         let result = withDebug(ErrorRenderer.render(
             error: error,
+            format: ProcessInfo.processInfo.environment["MACOP_AGENT_FORMAT"] == "json" ? .json : .humanReadable
+        ))
+        FileHandle.standardError.write(Data(result.stderr.utf8))
+        exit(result.exitCode)
+    }
+    if let failure = error as? AuthBrokerFailure {
+        let result = withDebug(ErrorRenderer.render(
+            error: failure.cliError,
             format: ProcessInfo.processInfo.environment["MACOP_AGENT_FORMAT"] == "json" ? .json : .humanReadable
         ))
         FileHandle.standardError.write(Data(result.stderr.utf8))

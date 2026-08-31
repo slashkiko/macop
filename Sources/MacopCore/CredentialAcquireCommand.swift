@@ -84,6 +84,9 @@ enum CredentialAcquireCommand {
     }
 
     private static func keychainError(_ failure: KeychainFailure) -> CLIError {
+        if let brokerFailure = failure.brokerFailure {
+            return brokerFailure.cliError
+        }
         if failure.isAmbiguous {
             return .invalidArguments(
                 message: "Keychain selector is ambiguous; configure a unique item before reading it."

@@ -122,7 +122,9 @@ public enum SSHCommand {
         options: GlobalOptions,
         env: [String: String],
         executor: CommandExecutor,
-        biometricChecker: any BiometricAvailabilityChecking = SystemBiometricAvailabilityChecker()
+        biometricChecker: any BiometricAvailabilityChecking = SystemBiometricAvailabilityChecker(),
+        gitClientRegistry: GitClientTrustRegistry = GitClientTrustRegistry(),
+        gitClientVersionProbe: any GitClientVersionProbing = SystemGitClientVersionProbe()
     ) throws -> CommandResult {
         let context = SSHContext(env: env, executor: executor)
         guard let subcommand = args.first
@@ -152,7 +154,8 @@ public enum SSHCommand {
                 Array(args.dropFirst()), options: options, context: context
             )
         case "git-client": return try GitClientTrustCommand.run(
-                args: Array(args.dropFirst()), options: options
+                args: Array(args.dropFirst()), options: options,
+                versionProbe: gitClientVersionProbe, registry: gitClientRegistry
             )
         case "connect": return try self.execute(
                 self.connectInvocation(Array(args.dropFirst()), options: options, context: context), context: context

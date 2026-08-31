@@ -44,6 +44,8 @@ public enum GitSSHVerificationCommand {
             return try CommandResult(exitCode: executor.execute(arguments: arguments))
         } catch let error as CLIError {
             return ErrorRenderer.render(error: error, format: .humanReadable)
+        } catch let failure as AuthBrokerFailure {
+            return ErrorRenderer.render(error: failure.cliError, format: .humanReadable)
         } catch {
             return ErrorRenderer.render(
                 error: .runtimeError(message: "Git SSH verification failed."),

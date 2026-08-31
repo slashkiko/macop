@@ -8,7 +8,19 @@ import SwiftUI
 
 @main
 struct MacopAuthApplication: App {
-    @StateObject private var coordinator = AuthApprovalCoordinator(socketPath: Self.socketPath())
+    @StateObject private var coordinator: AuthApprovalCoordinator
+
+    init() {
+        // The companion has no installer verification command.  It therefore
+        // never starts a socket/UI while its sibling generation is pending.
+        if case let .blocked(reason) = InstallGenerationGuard.invocationDecision(argv: CommandLine.arguments) {
+            fputs("MacopAuth: \(reason.diagnostic).\n", stderr)
+            exit(ExitCode.providerUnavailable.rawValue)
+        }
+        _coordinator = StateObject(wrappedValue: AuthApprovalCoordinator(
+            socketPath: Self.socketPath(), probe: Self.isProbe()
+        ))
+    }
 
     var body: some Scene {
         WindowGroup("Macop") {
@@ -23,6 +35,10 @@ struct MacopAuthApplication: App {
         let arguments = Array(CommandLine.arguments.dropFirst())
         guard let index = arguments.firstIndex(of: "--socket"), index + 1 < arguments.count else { return nil }
         return arguments[index + 1]
+    }
+
+    private static func isProbe() -> Bool {
+        CommandLine.arguments.dropFirst().contains("--probe")
     }
 }
 
@@ -65,11 +81,13 @@ private final class AuthApprovalCoordinator: ObservableObject {
 
     @Published private(set) var state: State = .starting
     private let socketPath: String?
+    private let probe: Bool
     private var started = false
     private var continuation: CheckedContinuation<ApprovalOutcome, Never>?
 
-    init(socketPath: String?) {
+    init(socketPath: String?, probe: Bool = false) {
         self.socketPath = socketPath
+        self.probe = probe
     }
 
     func start() {
@@ -82,7 +100,7 @@ private final class AuthApprovalCoordinator: ObservableObject {
         Task.detached { [weak self] in
             guard let self else { return }
             do {
-                try await AuthBrokerAppServer.run(socketPath: socketPath, coordinator: self)
+                try await AuthBrokerAppServer.run(socketPath: socketPath, coordinator: self, probe: self.probe)
             } catch {
                 await self.fail("承認要求を安全に検証できませんでした。")
                 await self.terminateSoon()
@@ -109,6 +127,46 @@ private final class AuthApprovalCoordinator: ObservableObject {
             NSApplication.shared.windows.first?.makeKeyAndOrderFront(nil)
             NSRunningApplication.current.activate(options: [.activateAllWindows])
         }
+    }
+
+    /// A trust-set change is not represented by caller controlled text.  The
+    /// sheet renders the exact canonical entries that MacopAuth will bind to
+    /// protected state before invoking LocalAuthentication.
+    func requestGitClientTrustMutation(
+        _ document: GitClientTrustDocument,
+        operation: GitClientTrustMutationOperation,
+        peer: AuthBrokerVerifiedPeer
+    ) async -> Bool {
+        let entries = document.clients.enumerated().map { index, entry in
+            "\(index + 1). 選択したパス: \(entry.selectorPath)\n"
+                + "   実際の Git: \(entry.resolvedPath)\n"
+                + "   バージョン: \(entry.version)\n"
+                + "   署名: \(entry.signatureKind)\n"
+                + "   識別子: \(entry.identifier)\n"
+                + "   コードハッシュ: \(entry.cdHash)"
+        }.joined(separator: "\n\n")
+        let presentation = GitClientTrustMutationPresentation(
+            operation: operation,
+            trustedClientCount: document.clients.count
+        )
+        let alert = NSAlert()
+        alert.messageText = presentation.title
+        let requester = peer.requestingApplication ?? peer.peerIdentity
+        alert.informativeText = "要求元: \(requester.identifier)\n\(requester.canonicalPath)\n\n"
+            + "\(presentation.changeDescription)\n"
+            + "\(presentation.resultDescription)\n"
+            + "\(presentation.listIntroduction)"
+            + (entries.isEmpty ? "" : "\n\n\(entries)")
+        alert.addButton(withTitle: presentation.confirmationTitle)
+        alert.addButton(withTitle: "キャンセル")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        let context = LAContext()
+        do {
+            return try await context.evaluatePolicy(
+                .deviceOwnerAuthentication,
+                localizedReason: presentation.authenticationReason
+            )
+        } catch { return false }
     }
 
     func authenticate(_ pending: PendingApproval) {
@@ -320,6 +378,9 @@ private enum AuthBrokerRuntimeCapabilities {
     static let value: UInt32 = {
         var capabilities = AuthBrokerCapability.approvalUI.rawValue
             | AuthBrokerCapability.sshSigning.rawValue
+        if AuthBrokerRuntimeCapabilities.gitClientTrustAccessGroup != nil {
+            capabilities |= AuthBrokerCapability.gitClientTrust.rawValue
+        }
         if AuthBrokerRuntimeCapabilities.hasManagedKeychainEntitlements() {
             capabilities |= AuthBrokerCapability.managedKeychain.rawValue
                 | AuthBrokerCapability.passwordAutoFill.rawValue
@@ -329,10 +390,14 @@ private enum AuthBrokerRuntimeCapabilities {
     }()
 
     private static func hasManagedKeychainEntitlements() -> Bool {
+        self.gitClientTrustAccessGroup != nil
+    }
+
+    static let gitClientTrustAccessGroup: String? = {
         var code: SecCode?
-        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return false }
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return nil }
         var staticCode: SecStaticCode?
-        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return false }
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return nil }
         var raw: CFDictionary?
         guard SecCodeCopySigningInformation(
             staticCode,
@@ -343,14 +408,76 @@ private enum AuthBrokerRuntimeCapabilities {
             let entitlements = information[kSecCodeInfoEntitlementsDict] as? [String: Any],
             let applicationIdentifier = entitlements["com.apple.application-identifier"] as? String,
             let accessGroups = entitlements["keychain-access-groups"] as? [String]
-        else { return false }
-        return !applicationIdentifier.isEmpty && accessGroups.contains(applicationIdentifier)
+        else { return nil }
+        let expectedSuffix = ".io.github.slashkiko.macop.auth"
+        guard applicationIdentifier.hasSuffix(expectedSuffix),
+              let teamID = applicationIdentifier.split(separator: ".").first,
+              applicationIdentifier == "\(teamID)\(expectedSuffix)",
+              accessGroups.contains(applicationIdentifier) else { return nil }
+        return applicationIdentifier
+    }()
+}
+
+/// This item is deliberately owned by the MacopAuth app's private access
+/// group.  macop and macop-agent have no Keychain entitlement and can only ask
+/// this process for an equality verdict over the exact document they supplied.
+private final class MacopAuthGitClientTrustStateStore: GitClientTrustStateStoring, @unchecked Sendable {
+    private struct Stored: Codable { let generation: UInt64; let digest: Data }
+    private let queries: GitClientTrustKeychainQueryBuilder
+
+    init(accessGroup: String) {
+        self.queries = GitClientTrustKeychainQueryBuilder(accessGroup: accessGroup)
+    }
+
+    func load() throws -> GitClientTrustProtectedState? {
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(self.queries.read() as CFDictionary, &result)
+        if status == errSecItemNotFound {
+            return nil
+        }
+        guard status == errSecSuccess, let data = result as? Data,
+              let stored = try? JSONDecoder().decode(Stored.self, from: data), stored.digest.count == 32
+        else { throw AgentProtocolError.denied }
+        return GitClientTrustProtectedState(generation: stored.generation, documentDigest: stored.digest)
+    }
+
+    func compareAndSwap(expectedGeneration: UInt64?, next: GitClientTrustProtectedState) throws -> Bool {
+        guard next.documentDigest.count == 32,
+              let data = try? JSONEncoder().encode(Stored(generation: next.generation, digest: next.documentDigest))
+        else { throw AgentProtocolError.denied }
+        if let expectedGeneration {
+            let query = self.queries.update(generation: self.generationData(expectedGeneration))
+            let status = SecItemUpdate(query as CFDictionary, [
+                kSecValueData: data, kSecAttrGeneric: self.generationData(next.generation)
+            ] as CFDictionary)
+            if status == errSecItemNotFound {
+                return false
+            }
+            guard status == errSecSuccess else { throw AgentProtocolError.denied }
+            return true
+        }
+        let attributes = self.queries.add().merging([
+            kSecAttrGeneric: self.generationData(next.generation),
+            kSecValueData: data,
+            kSecAttrAccessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecUseDataProtectionKeychain: true
+        ]) { _, new in new }
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            return false
+        }
+        guard status == errSecSuccess else { throw AgentProtocolError.denied }
+        return true
+    }
+
+    private func generationData(_ value: UInt64) -> Data {
+        withUnsafeBytes(of: value.bigEndian) { Data($0) }
     }
 }
 
 // swiftlint:disable:next type_body_length
 private enum AuthBrokerAppServer {
-    static func run(socketPath: String, coordinator: AuthApprovalCoordinator) async throws {
+    static func run(socketPath: String, coordinator: AuthApprovalCoordinator, probe: Bool = false) async throws {
         try self.validateSocketParent(socketPath)
         let executable = try RunningExecutable.path()
         let serverIdentity = try LiveCodeIdentityInspector.inspect(pid: getpid(), expectedPath: executable).identity
@@ -378,31 +505,73 @@ private enum AuthBrokerAppServer {
             capabilities: capabilities,
             nonce: AuthBrokerSocketIO.randomNonce()
         )), to: client, timeout: 5)
+        if probe {
+            await coordinator.terminateSoon(after: .milliseconds(100))
+            return
+        }
 
         let now = UInt64(Date().timeIntervalSince1970 * 1000)
-        guard case let .approvalRequest(request) = try AuthBrokerSocketIO.readMessage(
+        let firstMessage = try AuthBrokerSocketIO.readMessage(
             from: client,
             timeout: 10,
             nowMilliseconds: now
-        ) else { throw AgentProtocolError.denied }
-        guard request.operation != .sshSign,
-              request.purpose.isValid(for: request.operation)
-        else { throw AgentProtocolError.denied }
-        let requiredCapability = switch request.operation {
-        case .sshSession, .sshSign, .gitSSHSign:
-            AuthBrokerCapability.sshSigning.rawValue
-        case .managedKeychainRead, .managedKeychainImport, .managedKeychainUpdate,
-             .passwordAutoFill, .managedKeychainDelete:
-            AuthBrokerCapability.managedKeychain.rawValue
+        )
+        // Trust verification is deliberately the first post-handshake request:
+        // a peer cannot use this connection for a different operation first.
+        switch firstMessage {
+        case let .gitClientTrustStateRequest(request):
+            guard let accessGroup = AuthBrokerRuntimeCapabilities.gitClientTrustAccessGroup else {
+                throw AgentProtocolError.denied
+            }
+            try self.serveGitClientTrustState(client: client, request: request, accessGroup: accessGroup)
+            await coordinator.terminateSoon(after: .milliseconds(250))
+            return
+        case let .gitClientTrustVerifyRequest(request):
+            guard let accessGroup = AuthBrokerRuntimeCapabilities.gitClientTrustAccessGroup else {
+                throw AgentProtocolError.denied
+            }
+            try self.serveGitClientTrustVerify(client: client, request: request, accessGroup: accessGroup)
+            await coordinator.terminateSoon(after: .milliseconds(250))
+            return
+        case let .gitClientTrustMutationRequest(request):
+            guard let accessGroup = AuthBrokerRuntimeCapabilities.gitClientTrustAccessGroup else {
+                throw AgentProtocolError.denied
+            }
+            try await self.serveGitClientTrustMutation(
+                client: client, request: request, peer: peer, accessGroup: accessGroup,
+                coordinator: coordinator
+            )
+            await coordinator.terminateSoon(after: .seconds(2))
+            return
+        case let .approvalRequest(request):
+            try await self.serveApprovalRequest(
+                client: client,
+                request: request,
+                peer: peer,
+                capabilities: capabilities,
+                coordinator: coordinator
+            )
+        default:
+            throw AgentProtocolError.denied
         }
+    }
+
+    private static func serveApprovalRequest(
+        client: Int32,
+        request: AuthBrokerApprovalRequest,
+        peer: AuthBrokerVerifiedPeer,
+        capabilities: UInt32,
+        coordinator: AuthApprovalCoordinator
+    ) async throws {
+        guard request.operation != .sshSign,
+              request.purpose.isValid(for: request.operation),
+              request.presentation.isValid(for: request.operation)
+        else { throw AgentProtocolError.denied }
+        let requiredCapability = request.operation.requiredCapability.rawValue
         guard capabilities & requiredCapability == requiredCapability else {
             throw AgentProtocolError.denied
         }
-        let isKeychainRequest = request.operation == .managedKeychainRead
-            || request.operation == .managedKeychainImport
-            || request.operation == .managedKeychainUpdate
-            || request.operation == .passwordAutoFill
-            || request.operation == .managedKeychainDelete
+        let isKeychainRequest = request.operation.family == .managedKeychain
         if isKeychainRequest {
             let isDeleteAll = request.operation == .managedKeychainDelete
                 && request.keychainService.isEmpty
@@ -420,7 +589,7 @@ private enum AuthBrokerAppServer {
         var resultStatus = outcome.status == .approved ? errSecSuccess : errSecAuthFailed
         var resultData = Data()
         var resultMessage = ""
-        let isSigningRequest = request.operation == .sshSession || request.operation == .gitSSHSign
+        let isSigningRequest = request.operation.phaseTwoKind == .signing
         if outcome.status == .approved, let context = outcome.context, isSigningRequest {
             do {
                 try self.validateRoot(request)
@@ -657,6 +826,145 @@ private enum AuthBrokerAppServer {
         )
     }
 
+    private static func serveGitClientTrustVerify(
+        client: Int32,
+        request: AuthBrokerGitClientTrustVerifyRequest,
+        accessGroup: String
+    ) throws {
+        let document = try GitClientTrustDocument.decodeCanonical(request.canonicalDocument)
+        let digest = try document.digest()
+        guard constantTimeEqual(digest, request.digest) else { throw AgentProtocolError.denied }
+        let state = try MacopAuthGitClientTrustStateStore(accessGroup: accessGroup).load()
+        let trusted = state.map {
+            $0.generation == document.generation && constantTimeEqual($0.documentDigest, digest)
+        } ?? false
+        try AuthBrokerSocketIO.writeMessage(.gitClientTrustVerifyResponse(
+            AuthBrokerGitClientTrustVerifyResponse(
+                requestID: request.requestID, digest: request.digest, generation: document.generation,
+                status: trusted ? .trusted : (state == nil ? .unavailable : .mismatch)
+            )
+        ), to: client, timeout: 5)
+    }
+
+    private static func serveGitClientTrustState(
+        client: Int32,
+        request: AuthBrokerGitClientTrustStateRequest,
+        accessGroup: String
+    ) throws {
+        let state = try MacopAuthGitClientTrustStateStore(accessGroup: accessGroup).load()
+        try AuthBrokerSocketIO.writeMessage(.gitClientTrustStateResponse(
+            AuthBrokerGitClientTrustStateResponse(
+                requestID: request.requestID, generation: state?.generation ?? 0,
+                status: state == nil ? .unavailable : .trusted
+            )
+        ), to: client, timeout: 5)
+    }
+
+    private static func serveGitClientTrustMutation(
+        client: Int32,
+        request: AuthBrokerGitClientTrustMutationRequest,
+        peer: AuthBrokerVerifiedPeer,
+        accessGroup: String,
+        coordinator: AuthApprovalCoordinator
+    ) async throws {
+        let document = try GitClientTrustDocument.decodeCanonical(request.canonicalDocument)
+        let digest = try document.digest()
+        guard constantTimeEqual(digest, request.digest), document.generation == request.expectedGeneration + 1 else {
+            throw AgentProtocolError.denied
+        }
+        let store = MacopAuthGitClientTrustStateStore(accessGroup: accessGroup)
+        let state = try store.load()
+        // The protected state is advanced before the CLI atomically publishes
+        // the file.  If power loss occurs in that gap, retrying the exact same
+        // command is safe and completes publication without silently accepting
+        // a different set.
+        // swiftformat:disable wrapMultilineStatementBraces
+        if let state, state.generation == document.generation,
+           constantTimeEqual(state.documentDigest, digest) {
+            try self.writeTrustMutationResponse(
+                client: client,
+                request: request,
+                generation: document.generation,
+                status: .approved
+            )
+            return
+        }
+        // swiftformat:enable wrapMultilineStatementBraces
+        let expected: UInt64? = if state == nil && (request.expectedGeneration == 0 || request.operation == .reset) {
+            nil
+        } else {
+            request.expectedGeneration
+        }
+        guard state?.generation == expected || (state == nil && expected == nil) else {
+            try self.writeTrustMutationResponse(
+                client: client,
+                request: request,
+                generation: document.generation,
+                status: .generationConflict
+            )
+            return
+        }
+        guard await coordinator.requestGitClientTrustMutation(
+            document,
+            operation: request.operation,
+            peer: peer
+        ) else {
+            try self.writeTrustMutationResponse(
+                client: client,
+                request: request,
+                generation: document.generation,
+                status: .rejected
+            )
+            return
+        }
+        // Recheck immediately before CAS; an independent MacopAuth process may
+        // have advanced the set while the native sheet was visible.
+        try self.validateTrustMutationPeer(peer)
+        guard try store.compareAndSwap(
+            expectedGeneration: expected,
+            next: GitClientTrustProtectedState(generation: document.generation, documentDigest: digest)
+        ) else {
+            try self.writeTrustMutationResponse(
+                client: client,
+                request: request,
+                generation: document.generation,
+                status: .generationConflict
+            )
+            return
+        }
+        try self.writeTrustMutationResponse(
+            client: client,
+            request: request,
+            generation: document.generation,
+            status: .approved
+        )
+    }
+
+    private static func validateTrustMutationPeer(_ peer: AuthBrokerVerifiedPeer) throws {
+        let inspector = SystemRequesterInspector()
+        guard inspector.snapshot(of: peer.peer.pid) == peer.peerSnapshot else { throw AgentProtocolError.denied }
+        let identity = try LiveCodeIdentityInspector.inspect(pid: peer.peer.pid).identity
+        guard identity == peer.peerIdentity,
+              let teamID = peer.peerIdentity.teamID,
+              AuthBrokerPeerVerifier(expectedTeamID: teamID).acceptsPeerIdentity(identity)
+        else {
+            throw AgentProtocolError.denied
+        }
+    }
+
+    private static func writeTrustMutationResponse(
+        client: Int32,
+        request: AuthBrokerGitClientTrustMutationRequest,
+        generation: UInt64,
+        status: AuthBrokerGitClientTrustStatus
+    ) throws {
+        try AuthBrokerSocketIO.writeMessage(.gitClientTrustMutationResponse(
+            AuthBrokerGitClientTrustMutationResponse(
+                authorizationID: request.authorizationID, digest: request.digest, generation: generation, status: status
+            )
+        ), to: client, timeout: 10)
+    }
+
     private static func approvedCompletion(
         operation: AuthBrokerOperation,
         resultStatus: OSStatus
@@ -761,18 +1069,19 @@ private enum AuthBrokerAppServer {
         coordinator: AuthApprovalCoordinator
     ) async {
         var completedSignature = false
+        func completeNoSignatureIfNeeded() async {
+            guard !completedSignature else { return }
+            let presentation = SSHSigningEffectPresentation(
+                operation: request.operation,
+                outcome: .noSignatureRequested,
+                delivery: .notAttempted
+            )
+            await coordinator.complete(presentation.message, isSuccess: false)
+        }
         while true {
             let now = UInt64(Date().timeIntervalSince1970 * 1000)
             if now >= request.expiresAtMilliseconds {
-                if !completedSignature {
-                    let presentation = SSHSigningEffectPresentation(
-                        operation: request.operation,
-                        outcome: .noSignatureRequested,
-                        delivery: .notAttempted
-                    )
-                    await coordinator.complete(presentation.message, isSuccess: false)
-                }
-                return
+                break
             }
             let remaining = TimeInterval(request.expiresAtMilliseconds - now) / 1000
             let message: AuthBrokerMessage
@@ -783,28 +1092,12 @@ private enum AuthBrokerAppServer {
                     nowMilliseconds: now
                 )
             } catch {
-                if !completedSignature {
-                    let presentation = SSHSigningEffectPresentation(
-                        operation: request.operation,
-                        outcome: .noSignatureRequested,
-                        delivery: .notAttempted
-                    )
-                    await coordinator.complete(presentation.message, isSuccess: false)
-                }
-                return
+                break
             }
             guard case let .sshSignRequest(signRequest) = message,
                   signRequest.authorizationID == request.requestID
             else {
-                if !completedSignature {
-                    let presentation = SSHSigningEffectPresentation(
-                        operation: request.operation,
-                        outcome: .noSignatureRequested,
-                        delivery: .notAttempted
-                    )
-                    await coordinator.complete(presentation.message, isSuccess: false)
-                }
-                return
+                break
             }
             await coordinator.beginProcessing()
             let presentation = AuthEffectPipeline.signing(
@@ -827,6 +1120,7 @@ private enum AuthBrokerAppServer {
             guard presentation.isSuccess else { return }
             completedSignature = true
         }
+        await completeNoSignatureIfNeeded()
     }
 
     private static func completeSigningFailure(
@@ -1093,6 +1387,13 @@ private struct AutoFillTextField: NSViewRepresentable {
 }
 
 private struct ApprovalRequestView: View {
+    private struct SSHSessionTargetPresentation {
+        let application: String
+        let signingAuthority: String
+        let cdHash: String
+        let verification: String
+    }
+
     let pending: AuthApprovalCoordinator.PendingApproval
     let usePassword: () -> Void
     let cancel: () -> Void
@@ -1125,6 +1426,12 @@ private struct ApprovalRequestView: View {
                         self.row("アカウント", self.pending.request.keychainAccount)
                     }
                 } else {
+                    if let target = self.sshSessionTargetPresentation {
+                        self.row("実行対象", target.application)
+                        self.row("署名", target.signingAuthority)
+                        self.row("コードハッシュ", target.cdHash)
+                        self.row("検証", target.verification)
+                    }
                     self.row("接続先", self.pending.request.host.isEmpty ? "SSHセッション" : self.pending.request.host)
                     self.row("使用する鍵", self.pending.request.credentialLabel)
                     self.row("フィンガープリント", self.pending.request.credentialFingerprint)
@@ -1157,10 +1464,19 @@ private struct ApprovalRequestView: View {
     }
 
     private var isManagedKeychainRequest: Bool {
-        self.pending.request.operation == .managedKeychainRead
-            || self.pending.request.operation == .managedKeychainImport
-            || self.pending.request.operation == .managedKeychainUpdate
-            || self.pending.request.operation == .managedKeychainDelete
+        self.pending.request.operation.family == .managedKeychain
+    }
+
+    private var sshSessionTargetPresentation: SSHSessionTargetPresentation? {
+        guard case let .sshSessionTarget(application, signingAuthority, cdHash, verification) =
+            self.pending.request.presentation
+        else { return nil }
+        return SSHSessionTargetPresentation(
+            application: application,
+            signingAuthority: signingAuthority,
+            cdHash: cdHash,
+            verification: verification
+        )
     }
 
     private var isDeleteAllRequest: Bool {

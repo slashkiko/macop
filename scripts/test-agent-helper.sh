@@ -68,6 +68,7 @@ test "$(grep -Ec '^macop: debug exit_code=2 command=ssh$' "$stderr_file")" -eq 1
 MACOP_AGENT_RUN_LIFECYCLE_FIXTURES=1 "$fixture_root/macop-agent"
 /usr/bin/script -q /dev/null env MACOP_AGENT_RUN_LIFECYCLE_FIXTURES=1 "$fixture_root/macop-agent"
 MACOP_AGENT_RUN_GIT_SUSPENDED_FIXTURE=1 "$fixture_root/macop-agent"
+MACOP_AGENT_RUN_SHELL_DEFERRED_FIXTURE=1 "$fixture_root/macop-agent"
 
 assert_signal_cleanup() {
   local signal_name="$1"

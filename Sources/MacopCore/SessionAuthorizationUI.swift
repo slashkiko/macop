@@ -13,6 +13,7 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
     public let rootStartTime: UInt64
     public let rootIdentifier: String
     public let rootCodeRequirement: String
+    public let rootExecutablePath: String
     public let sessionID: UUID
     public let expiresAt: Date
 
@@ -28,7 +29,8 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
         rootIdentifier: String,
         rootCodeRequirement: String,
         sessionID: UUID,
-        expiresAt: Date
+        expiresAt: Date,
+        rootExecutablePath: String? = nil
     ) {
         self.identityLabel = identityLabel
         self.application = application
@@ -40,6 +42,7 @@ public struct SessionAuthorizationPresentation: Sendable, Equatable {
         self.rootStartTime = rootStartTime
         self.rootIdentifier = rootIdentifier
         self.rootCodeRequirement = rootCodeRequirement
+        self.rootExecutablePath = rootExecutablePath ?? application
         self.sessionID = sessionID
         self.expiresAt = expiresAt
     }
@@ -58,14 +61,20 @@ public final class SessionAuthorizationResult: @unchecked Sendable {
     public let approved: Bool
     public let authenticationContext: LAContext?
     public let signer: (any AgentKeySigning)?
+    /// A safe broker category is retained for the agent's public boundary;
+    /// `approved == false` alone is reserved for an ordinary user refusal.
+    public let brokerFailure: AuthBrokerFailure?
+
     public init(
         approved: Bool,
         authenticationContext: LAContext?,
-        signer: (any AgentKeySigning)? = nil
+        signer: (any AgentKeySigning)? = nil,
+        brokerFailure: AuthBrokerFailure? = nil
     ) {
         self.approved = approved
         self.authenticationContext = authenticationContext
         self.signer = signer
+        self.brokerFailure = brokerFailure
     }
 }
 

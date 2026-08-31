@@ -10,16 +10,31 @@ public enum AuthBrokerRequester {
     public static func gitSSHSigningApprovalRequest(
         credentialLabel: String,
         credentialFingerprint: String,
-        rootPID: Int32
+        rootPID: Int32,
+        requesterEnvironment: GitClientRequesterValidationEnvironment? = nil
     ) throws -> AuthBrokerApprovalRequest {
         guard rootPID > 1 else { throw AgentProtocolError.denied }
-        let requesterInspector = SystemRequesterInspector()
-        guard let before = requesterInspector.snapshot(of: rootPID) else {
-            throw AgentProtocolError.denied
-        }
-        let inspection = try GitClientRequesterTrust.validate(pid: rootPID)
-        guard requesterInspector.snapshot(of: rootPID) == before else {
-            throw AgentProtocolError.denied
+        let before: ProcessSnapshot
+        let inspection: LiveCodeInspection
+        if let requesterEnvironment {
+            guard let captured = requesterEnvironment.snapshot(rootPID) else {
+                throw AgentProtocolError.denied
+            }
+            inspection = try GitClientRequesterTrust.validate(pid: rootPID, environment: requesterEnvironment)
+            guard requesterEnvironment.snapshot(rootPID) == captured else {
+                throw AgentProtocolError.denied
+            }
+            before = captured
+        } else {
+            let requesterInspector = SystemRequesterInspector()
+            guard let captured = requesterInspector.snapshot(of: rootPID) else {
+                throw AgentProtocolError.denied
+            }
+            inspection = try GitClientRequesterTrust.validate(pid: rootPID)
+            guard requesterInspector.snapshot(of: rootPID) == captured else {
+                throw AgentProtocolError.denied
+            }
+            before = captured
         }
         let now = UInt64(Date().timeIntervalSince1970 * 1000)
         return AuthBrokerApprovalRequest(
@@ -32,6 +47,7 @@ public enum AuthBrokerRequester {
             rootIdentifier: inspection.identity.identifier,
             rootCodeRequirement: inspection.codeRequirement,
             rootExecutablePath: inspection.identity.canonicalPath,
+            presentation: .requesterOnly,
             purpose: .gitSSHSign,
             credentialLabel: credentialLabel,
             credentialFingerprint: credentialFingerprint,
@@ -69,6 +85,7 @@ public enum AuthBrokerRequester {
             rootIdentifier: inspection.identity.identifier,
             rootCodeRequirement: inspection.codeRequirement,
             rootExecutablePath: inspection.identity.canonicalPath,
+            presentation: .requesterOnly,
             purpose: purpose,
             credentialLabel: credentialLabel,
             credentialFingerprint: credentialFingerprint,

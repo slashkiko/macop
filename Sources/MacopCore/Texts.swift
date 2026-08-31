@@ -37,6 +37,8 @@ public enum HelpText {
       ssh git-client trust <absolute-selector-path>
       ssh git-client list
       ssh git-client remove <absolute-selector-path>
+      ssh git-client migrate
+      ssh git-client reset
       config
       doctor
 
@@ -86,7 +88,7 @@ public enum CompletionText {
                 ssh)
                   subcommand_index=$(__macop_zsh_next_positional_index $(( command_index + 1 )))
                   if [[ ${words[$subcommand_index]} == git-client ]]; then
-                    _values 'git client command' trust list remove
+                    _values 'git client command' trust list remove migrate reset
                   else
                     _values 'ssh command' create list public-key delete test run agent shell-init git-signing-config git-client connect host-config
                   fi ;;
@@ -132,7 +134,7 @@ public enum CompletionText {
                 ssh)
                   subcommand_index="$(__macop_bash_next_positional_index "$(( command_index + 1 ))")"
                   if [[ "${COMP_WORDS[subcommand_index]}" == "git-client" ]]; then
-                    COMPREPLY=( $(compgen -W "trust list remove ${flags}" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "trust list remove migrate reset ${flags}" -- "$cur") )
                   else
                     COMPREPLY=( $(compgen -W "${ssh_commands} ${flags}" -- "$cur") )
                   fi ;;
@@ -213,9 +215,9 @@ public enum CompletionText {
             complete -c op -n '__macop_command_position ssh; and not __macop_git_client_position' \
               -a "$macop_ssh_commands"
             complete -c macop -n '__macop_command_position ssh; and __macop_git_client_position' \
-              -a 'trust list remove'
+              -a 'trust list remove migrate reset'
             complete -c op -n '__macop_command_position ssh; and __macop_git_client_position' \
-              -a 'trust list remove'
+              -a 'trust list remove migrate reset'
             """
         default:
             "macop: unsupported shell for completion: \(shell)\n"

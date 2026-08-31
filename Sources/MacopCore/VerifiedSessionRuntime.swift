@@ -123,20 +123,25 @@ public final class VerifiedSessionRuntime: @unchecked Sendable {
         // The launch boundary independently checked the canonical executable
         // path and retained this one live signing snapshot for the UI.
         let launchedIdentity = launched.request.codeIdentity
+        let presentationIdentity = launched.request.presentationIdentity ?? launchedIdentity
         let result = try self.prompt(SessionAuthorizationPresentation(
             identityLabel: label,
-            application: launchedIdentity.canonicalPath,
-            verification: launchedIdentity.provenanceSummary,
-            signingAuthority: launchedIdentity.signatureSummary,
-            cdHash: Self.abbreviatedCDHash(launchedIdentity.cdHash),
+            application: launched.request.presentedApplication,
+            verification: launched.request.presentationVerification ?? presentationIdentity.provenanceSummary,
+            signingAuthority: presentationIdentity.signatureSummary,
+            cdHash: Self.abbreviatedCDHash(presentationIdentity.cdHash),
             fingerprint: session.keyFingerprint,
             rootPID: session.rootPID,
             rootStartTime: session.rootStartTime,
             rootIdentifier: session.bundleID,
             rootCodeRequirement: session.codeRequirement,
             sessionID: session.id,
-            expiresAt: session.expiresAt
+            expiresAt: session.expiresAt,
+            rootExecutablePath: launchedIdentity.canonicalPath
         ))
+        if let failure = result.brokerFailure {
+            throw failure
+        }
         guard !self.dependencies.isCancellationRequested(), result.approved else { throw AgentProtocolError.denied }
         let signer: any AgentKeySigning
         if let remote = result.signer {

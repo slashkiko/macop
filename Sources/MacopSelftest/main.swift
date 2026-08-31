@@ -205,6 +205,26 @@ private final class GitClientErrorCollector: @unchecked Sendable {
     }
 }
 
+private final class GitClientRequesterSnapshotFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private let stable: ProcessSnapshot
+    private let changed: ProcessSnapshot?
+    private let mutationCall: Int
+    private var calls = 0
+
+    init(stable: ProcessSnapshot, changed: ProcessSnapshot? = nil, mutationCall: Int = .max) {
+        self.stable = stable
+        self.changed = changed
+        self.mutationCall = mutationCall
+    }
+
+    func snapshot(_: Int32) -> ProcessSnapshot? {
+        self.lock.lock(); defer { self.lock.unlock() }
+        self.calls += 1
+        return self.calls >= self.mutationCall ? self.changed : self.stable
+    }
+}
+
 private func expectThrows(_ message: String, _ action: () throws -> Void) throws {
     do {
         try action()
@@ -227,8 +247,10 @@ private func gitClientTrustRegistrySelftests() throws {
         cdHash: "5c44aabbccdd",
         hasTrustedPublisher: false
     )
+    let authority = InMemoryGitClientTrustAuthority()
     let registry = GitClientTrustRegistry(
-        fileURL: file, inspector: GitClientTrustFixtureInspector(identity: identity)
+        fileURL: file, inspector: GitClientTrustFixtureInspector(identity: identity),
+        verifier: authority, mutator: authority
     )
     let trusted = try registry.trust(selectorPath: "/opt/homebrew/bin/git", version: "git version 2.50.1\nignored")
     try expect(
@@ -244,9 +266,11 @@ private func gitClientTrustRegistrySelftests() throws {
         identifier: "com.example.git", teamID: "EXAMPLE1234", signingAuthority: "Apple Development",
         cdHash: "aabbccdd", hasTrustedPublisher: true
     )
+    let certificateAuthority = InMemoryGitClientTrustAuthority()
     let certificateRegistry = GitClientTrustRegistry(
         fileURL: root.appendingPathComponent("certificate/git-clients.json"),
-        inspector: GitClientTrustFixtureInspector(identity: certificateIdentity)
+        inspector: GitClientTrustFixtureInspector(identity: certificateIdentity),
+        verifier: certificateAuthority, mutator: certificateAuthority
     )
     let certificateEntry = try certificateRegistry.trust(
         selectorPath: "/Applications/ExampleGit.app/Contents/MacOS/git", version: "git version certificate"
@@ -275,7 +299,7 @@ private func gitClientTrustRegistrySelftests() throws {
     let jsonObject = try JSONSerialization.jsonObject(with: Data(json.stdout.utf8)) as? [String: Any]
     let jsonClients = jsonObject?["clients"] as? [[String: Any]]
     try expect(
-        json.exitCode == 0 && jsonObject?["schema_version"] as? Int == 1
+        json.exitCode == 0 && jsonObject?["schema_version"] as? Int == 2
             && jsonClients?.first?["selector_path"] as? String == "/opt/homebrew/bin/git",
         "ssh git-client list JSON must expose only public pinned metadata"
     )
@@ -291,6 +315,44 @@ private func gitClientTrustRegistrySelftests() throws {
     let pinned = try registry.list()[0]
     let live = LiveCodeInspection(identity: identity, codeRequirement: pinned.codeRequirement)
     let snapshot = ProcessSnapshot(pid: 42, parentPID: 1, startTime: 7)
+    var candidateResolveCount = 0
+    let staleDuplicate = try JSONDecoder().decode(GitClientTrustEntry.self, from: Data("""
+    {
+      "selector_path": "/opt/homebrew/bin/git-stale",
+      "resolved_path": "/opt/homebrew/Cellar/git/2.50.1/bin/git",
+      "identifier": "com.example.git",
+      "cdhash": "0011223344556677",
+      "code_requirement": "identifier \\"com.example.git\\" and cdhash H\\"0011223344556677\\"",
+      "team_id": "",
+      "publisher_verified": false,
+      "signature_kind": "fixture",
+      "version": "fixture"
+    }
+    """.utf8))
+    let duplicateCandidate = try GitClientRequesterTrust.registeredCandidate(
+        entries: [staleDuplicate, pinned], livePath: identity.canonicalPath
+    ) { selector in
+        candidateResolveCount += 1
+        if selector == staleDuplicate.selectorPath {
+            throw AgentProtocolError.denied
+        }
+        return identity
+    }
+    try expect(
+        duplicateCandidate?.entry.selectorPath == pinned.selectorPath && candidateResolveCount == 2,
+        "a stale duplicate selector must not block a later valid pin for the same image"
+    )
+    var unrelatedResolveCount = 0
+    let unrelatedCandidate = try GitClientRequesterTrust.registeredCandidate(
+        entries: [pinned], livePath: "/opt/homebrew/Cellar/git/2.51.0/bin/git"
+    ) { _ in
+        unrelatedResolveCount += 1
+        return identity
+    }
+    try expect(
+        unrelatedCandidate == nil && unrelatedResolveCount == 0,
+        "an unregistered path must not resolve unrelated trusted selectors"
+    )
     let unregistered = try GitClientRequesterTrust.registeredCandidate(
         entries: [], livePath: identity.canonicalPath, resolve: { _ in identity }
     )
@@ -321,21 +383,9 @@ private func gitClientTrustRegistrySelftests() throws {
         resolve: { _ in retargeted }
     )
     try expect(
-        updateCandidate?.entry.selectorPath == pinned.selectorPath,
-        "a retargeted registered selector must produce selector-specific re-trust handling, not generic unregistered"
+        updateCandidate == nil,
+        "a retargeted selector without a persisted path match must be unregistered"
     )
-    do {
-        _ = try GitClientRequesterTrust.validateRegisteredProcess(
-            entry: pinned, current: retargeted, before: snapshot, after: snapshot,
-            liveInspection: { live }
-        )
-        throw SelftestFailure(message: "retargeted Git must not validate")
-    } catch let CLIError.denied(message) {
-        try expect(
-            message.contains("macop ssh git-client trust /opt/homebrew/bin/git"),
-            "retargeted Git denial must name the exact selector-specific re-trust command"
-        )
-    }
     let changedIdentifier = LiveCodeIdentity(
         canonicalPath: identity.canonicalPath, identifier: "different-git", teamID: nil,
         signingAuthority: nil, cdHash: identity.cdHash, hasTrustedPublisher: false
@@ -368,11 +418,14 @@ private func gitClientTrustRegistrySelftests() throws {
     try expectThrows("non-owner-only Git registry mode must be rejected") { _ = try registry.list() }
 
     let concurrentFile = root.appendingPathComponent("concurrent/git-clients.json")
+    let concurrentAuthority = InMemoryGitClientTrustAuthority()
     let concurrentA = GitClientTrustRegistry(
-        fileURL: concurrentFile, inspector: GitClientTrustFixtureInspector(identity: identity)
+        fileURL: concurrentFile, inspector: GitClientTrustFixtureInspector(identity: identity),
+        verifier: concurrentAuthority, mutator: concurrentAuthority
     )
     let concurrentB = GitClientTrustRegistry(
-        fileURL: concurrentFile, inspector: GitClientTrustFixtureInspector(identity: identity)
+        fileURL: concurrentFile, inspector: GitClientTrustFixtureInspector(identity: identity),
+        verifier: concurrentAuthority, mutator: concurrentAuthority
     )
     let concurrentFailures = LockedCounter()
     let concurrentErrors = GitClientErrorCollector()
@@ -400,8 +453,10 @@ private func gitClientTrustRegistrySelftests() throws {
     }
 
     let singleCommitFile = root.appendingPathComponent("single-commit/git-clients.json")
+    let singleCommitAuthority = InMemoryGitClientTrustAuthority()
     let singleCommitRegistry = GitClientTrustRegistry(
-        fileURL: singleCommitFile, inspector: GitClientTrustFixtureInspector(identity: identity)
+        fileURL: singleCommitFile, inspector: GitClientTrustFixtureInspector(identity: identity),
+        verifier: singleCommitAuthority, mutator: singleCommitAuthority
     )
     var registryExistedDuringProbe = false
     _ = try singleCommitRegistry.trust(selectorPath: "/opt/homebrew/bin/git") { _ in
@@ -411,6 +466,132 @@ private func gitClientTrustRegistrySelftests() throws {
     try expect(
         !registryExistedDuringProbe && fileManager.fileExists(atPath: singleCommitFile.path),
         "Git trust must inspect and probe version before its single atomic registry commit"
+    )
+
+    let requesterSnapshot = ProcessSnapshot(pid: 74, parentPID: 1, startTime: 12)
+    let requesterEnvironment = GitClientRequesterValidationEnvironment(
+        snapshot: { _ in requesterSnapshot },
+        executablePath: { _ in certificateIdentity.canonicalPath },
+        inspectAppleGit: { _, _ in throw AgentProtocolError.denied },
+        inspectSelector: { _ in certificateIdentity },
+        inspectLiveCode: { _, _ in
+            LiveCodeInspection(identity: certificateIdentity, codeRequirement: certificateEntry.codeRequirement)
+        },
+        loadRegistry: { [certificateEntry] }
+    )
+    let nonAppleRequest = try AuthBrokerRequester.gitSSHSigningApprovalRequest(
+        credentialLabel: "fixture-non-apple-git", credentialFingerprint: "SHA256:fixture",
+        rootPID: requesterSnapshot.pid, requesterEnvironment: requesterEnvironment
+    )
+    var nonAppleFrame = try AuthBrokerWire.frame(.approvalRequest(nonAppleRequest))
+    let decodedNonAppleFrame = try AuthBrokerWire.takeFrame(from: &nonAppleFrame)
+    try expect(
+        decodedNonAppleFrame == .approvalRequest(nonAppleRequest)
+            && nonAppleRequest.rootPID == requesterSnapshot.pid
+            && nonAppleRequest.rootStartTime == requesterSnapshot.startTime
+            && nonAppleRequest.rootIdentifier == certificateIdentity.identifier
+            && nonAppleRequest.rootExecutablePath == certificateIdentity.canonicalPath
+            && nonAppleRequest.rootCodeRequirement == certificateEntry.codeRequirement,
+        "registered signed non-Apple Git must load its pin, revalidate the live image, and bind it into approval"
+    )
+    let rejectedRegistryEnvironment = GitClientRequesterValidationEnvironment(
+        snapshot: { _ in requesterSnapshot }, executablePath: { _ in certificateIdentity.canonicalPath },
+        inspectAppleGit: { _, _ in throw AgentProtocolError.denied }, inspectSelector: { _ in certificateIdentity },
+        inspectLiveCode: { _, _ in
+            LiveCodeInspection(identity: certificateIdentity, codeRequirement: certificateEntry.codeRequirement)
+        },
+        loadRegistry: { [] }
+    )
+    try expectThrows("unregistered non-Apple Git must be rejected before approval") {
+        _ = try GitClientRequesterTrust.validate(pid: requesterSnapshot.pid, environment: rejectedRegistryEnvironment)
+    }
+    let bypassIdentity = LiveCodeIdentity(
+        canonicalPath: certificateIdentity.canonicalPath, identifier: certificateIdentity.identifier,
+        teamID: certificateIdentity.teamID, signingAuthority: certificateIdentity.signingAuthority,
+        cdHash: "00112233", hasTrustedPublisher: true
+    )
+    let bypassEnvironment = GitClientRequesterValidationEnvironment(
+        snapshot: { _ in requesterSnapshot }, executablePath: { _ in certificateIdentity.canonicalPath },
+        inspectAppleGit: { _, _ in throw AgentProtocolError.denied }, inspectSelector: { _ in bypassIdentity },
+        inspectLiveCode: { _, _ in
+            LiveCodeInspection(identity: certificateIdentity, codeRequirement: certificateEntry.codeRequirement)
+        },
+        loadRegistry: { [certificateEntry] }
+    )
+    try expectThrows("changed selector identity must not bypass the persisted non-Apple Git pin") {
+        _ = try GitClientRequesterTrust.validate(pid: requesterSnapshot.pid, environment: bypassEnvironment)
+    }
+    let changedRequesterSnapshot = ProcessSnapshot(pid: requesterSnapshot.pid, parentPID: 1, startTime: 13)
+    let changingSnapshots = GitClientRequesterSnapshotFixture(
+        stable: requesterSnapshot, changed: changedRequesterSnapshot, mutationCall: 4
+    )
+    let changingRequesterEnvironment = GitClientRequesterValidationEnvironment(
+        snapshot: { changingSnapshots.snapshot($0) }, executablePath: { _ in certificateIdentity.canonicalPath },
+        inspectAppleGit: { _, _ in throw AgentProtocolError.denied }, inspectSelector: { _ in certificateIdentity },
+        inspectLiveCode: { _, _ in
+            LiveCodeInspection(identity: certificateIdentity, codeRequirement: certificateEntry.codeRequirement)
+        },
+        loadRegistry: { [certificateEntry] }
+    )
+    try expectThrows("Git approval attribution must reject a root PID reuse after live pin validation") {
+        _ = try AuthBrokerRequester.gitSSHSigningApprovalRequest(
+            credentialLabel: "fixture", credentialFingerprint: "SHA256:fixture", rootPID: requesterSnapshot.pid,
+            requesterEnvironment: changingRequesterEnvironment
+        )
+    }
+
+    let dispatchFile = root.appendingPathComponent("dispatch/git-clients.json")
+    let dispatchAuthority = InMemoryGitClientTrustAuthority()
+    let dispatchRegistry = GitClientTrustRegistry(
+        fileURL: dispatchFile, inspector: GitClientTrustFixtureInspector(identity: identity),
+        verifier: dispatchAuthority, mutator: dispatchAuthority
+    )
+    let dispatchExecutor = RecordingSSHExecutor()
+    let dispatchTrust = try SSHCommand.run(
+        args: ["git-client", "trust", "/opt/homebrew/bin/git"], options: GlobalOptions(), env: [:],
+        executor: dispatchExecutor, gitClientRegistry: dispatchRegistry,
+        gitClientVersionProbe: GitClientVersionFixtureExecutor()
+    )
+    let dispatchList = try SSHCommand.run(
+        args: ["git-client", "list"], options: GlobalOptions(), env: [:], executor: dispatchExecutor,
+        gitClientRegistry: dispatchRegistry, gitClientVersionProbe: GitClientVersionFixtureExecutor()
+    )
+    let dispatchRemove = try SSHCommand.run(
+        args: ["git-client", "remove", "/opt/homebrew/bin/git"], options: GlobalOptions(), env: [:],
+        executor: dispatchExecutor, gitClientRegistry: dispatchRegistry,
+        gitClientVersionProbe: GitClientVersionFixtureExecutor()
+    )
+    let dispatchRegistryIsEmpty = try dispatchRegistry.list().isEmpty
+    try expect(
+        dispatchTrust.stdout.contains("trusted: /opt/homebrew/bin/git")
+            && dispatchList.stdout.contains("/opt/homebrew/bin/git")
+            && dispatchRemove.stdout.contains("removed: /opt/homebrew/bin/git")
+            && dispatchRegistryIsEmpty,
+        "SSH git-client dispatcher must route trust/list/remove through the injected deterministic registry"
+    )
+    try expectThrows("unknown git-client action must not route to an SSH operation") {
+        _ = try SSHCommand.run(
+            args: ["git-client", "unknown"], options: GlobalOptions(), env: [:], executor: dispatchExecutor,
+            gitClientRegistry: dispatchRegistry, gitClientVersionProbe: GitClientVersionFixtureExecutor()
+        )
+    }
+    try expectThrows("top-level remove must not be mistaken for git-client remove") {
+        _ = try SSHCommand.run(
+            args: ["remove", "/opt/homebrew/bin/git"], options: GlobalOptions(), env: [:], executor: dispatchExecutor,
+            gitClientRegistry: dispatchRegistry, gitClientVersionProbe: GitClientVersionFixtureExecutor()
+        )
+    }
+    let gitClientAdvertisingTexts = [
+        HelpText.main, CompletionText.render(shell: "zsh"), CompletionText.render(shell: "bash"),
+        CompletionText.render(shell: "fish")
+    ]
+    let gitClientActions = ["trust", "list", "remove", "migrate", "reset"]
+    try expect(
+        gitClientActions.allSatisfy { HelpText.main.contains("ssh git-client \($0)") }
+            && gitClientAdvertisingTexts.dropFirst().allSatisfy { text in
+                gitClientActions.allSatisfy(text.contains)
+            },
+        "Git-client help and completions must agree"
     )
 
     let symlinkRoot = root.appendingPathComponent("symlink-root")
@@ -426,7 +607,8 @@ private func gitClientTrustRegistrySelftests() throws {
     try fileManager.createSymbolicLink(at: symlinkRoot, withDestinationURL: symlinkTarget)
     let symlinkRegistry = GitClientTrustRegistry(
         fileURL: symlinkRoot.appendingPathComponent("git-clients.json"),
-        inspector: GitClientTrustFixtureInspector(identity: identity)
+        inspector: GitClientTrustFixtureInspector(identity: identity),
+        verifier: authority, mutator: authority
     )
     try expectThrows("symlink Git registry directory must be rejected") { _ = try symlinkRegistry.list() }
 
@@ -681,13 +863,14 @@ private final class RuntimeState: @unchecked Sendable {
 }
 
 private struct RuntimePrompt: SessionAuthorizationResultPrompting {
-    let approved: Bool; let state: RuntimeState
+    let approved: Bool; let state: RuntimeState; let brokerFailure: AuthBrokerFailure?
     typealias Completion = @Sendable (SessionAuthorizationResult) -> Void
     func authorizeResult(_ presentation: SessionAuthorizationPresentation, completion: @escaping Completion) {
         self.state.record(presentation)
         completion(SessionAuthorizationResult(
             approved: self.approved,
-            authenticationContext: self.approved ? LAContext() : nil
+            authenticationContext: self.approved ? LAContext() : nil,
+            brokerFailure: self.brokerFailure
         ))
     }
 }
@@ -700,11 +883,15 @@ private struct RuntimeAgent: VerifiedSessionRunning {
     }
 }
 
-// swiftlint:disable large_tuple opening_brace statement_position
+// swiftlint:disable large_tuple
 private func runtimeSelftests() throws {
-    func runRuntime(approved: Bool, signer: AgentTestSigner,
-                    exit: Int32, cancelAfterLaunch: Bool = false) throws -> (Int32?, RuntimeState, SessionRegistry)
-    {
+    func runRuntime(
+        approved: Bool,
+        signer: AgentTestSigner,
+        exit: Int32,
+        cancelAfterLaunch: Bool = false,
+        brokerFailure: AuthBrokerFailure? = nil
+    ) throws -> (Int32?, RuntimeState, SessionRegistry, AuthBrokerFailure?) {
         let root = URL(fileURLWithPath: "/tmp/macop-runtime-\(UUID().uuidString)", isDirectory: true)
         let registry = try SessionRegistry(root: root)
         let state = RuntimeState()
@@ -743,17 +930,26 @@ private func runtimeSelftests() throws {
                     bundleID: request.bundleID, codeRequirement: request.codeRequirement, inspector: inspector
                 )
             },
-            prompt: RuntimePrompt(approved: approved, state: state),
+            prompt: RuntimePrompt(approved: approved, state: state, brokerFailure: brokerFailure),
             makeSigner: { _, _ in signer },
             makeAgent: { _, _, _ in RuntimeAgent() },
             isCancellationRequested: { state.snapshot().1 }
         )
         let result: Int32?
-        do { result = try VerifiedSessionRuntime(registry: registry, dependencies: dependencies).run(label: "test") }
-        catch { result = nil }
-        return (result, state, registry)
+        let failure: AuthBrokerFailure?
+        do {
+            result = try VerifiedSessionRuntime(registry: registry, dependencies: dependencies).run(label: "test")
+            failure = nil
+        } catch let brokerFailure as AuthBrokerFailure {
+            result = nil
+            failure = brokerFailure
+        } catch {
+            result = nil
+            failure = nil
+        }
+        return (result, state, registry, failure)
     }
-    let (success, state, _) = try runRuntime(approved: true, signer: AgentTestSigner(), exit: 143)
+    let (success, state, _, _) = try runRuntime(approved: true, signer: AgentTestSigner(), exit: 143)
     try expect(success == 143, "runtime must preserve conventional signal exit status")
     let presentation = state.snapshot().0
     try expect(presentation?.identityLabel == "test" && presentation?.application == "/tmp/test-agent"
@@ -885,11 +1081,23 @@ private func runtimeSelftests() throws {
         )
     }
     let mismatched = AgentTestSigner(publicKeyBlob: agentTestKey, fingerprint: "SHA256:other")
-    let (failed, mismatchState, _) = try runRuntime(approved: true, signer: mismatched, exit: 0)
+    let (failed, mismatchState, _, _) = try runRuntime(approved: true, signer: mismatched, exit: 0)
     try expect(failed == nil && mismatchState.snapshot().1, "fingerprint mismatch must deny and cancel launched root")
-    let (denied, deniedState, _) = try runRuntime(approved: false, signer: AgentTestSigner(), exit: 0)
+    let (denied, deniedState, _, _) = try runRuntime(approved: false, signer: AgentTestSigner(), exit: 0)
     try expect(denied == nil && deniedState.snapshot().1, "prompt denial must cancel launched root")
-    let (cancelled, cancellationState, cancellationRegistry) = try runRuntime(
+    let (brokerRejected, brokerRejectedState, _, brokerFailure) = try runRuntime(
+        approved: false,
+        signer: AgentTestSigner(),
+        exit: 0,
+        brokerFailure: AuthBrokerFailure(.transportFailure)
+    )
+    try expect(
+        brokerRejected == nil
+            && brokerRejectedState.snapshot().1
+            && brokerFailure == AuthBrokerFailure(.transportFailure),
+        "verified-session runtime must preserve broker infrastructure failure for the public agent boundary"
+    )
+    let (cancelled, cancellationState, cancellationRegistry, _) = try runRuntime(
         approved: true, signer: AgentTestSigner(), exit: 0, cancelAfterLaunch: true
     )
     try expect(cancelled == nil && cancellationState.snapshot().1,
@@ -926,6 +1134,12 @@ private func authBrokerSelftests() throws {
         rootIdentifier: "test.agent",
         rootCodeRequirement: "anchor test",
         rootExecutablePath: "/tmp/test-agent",
+        presentation: .sshSessionTarget(
+            application: "/bin/zsh",
+            signingAuthority: "fixture signer",
+            cdHash: "00112233",
+            verification: "live fixture pinned"
+        ),
         purpose: .sshSession,
         credentialLabel: "github",
         credentialFingerprint: "SHA256:test",
@@ -1028,6 +1242,17 @@ private func authBrokerSelftests() throws {
         )
     }
     do {
+        let _: Int = try GitSSHSigningAuthorizationBoundary.connect {
+            throw AuthBrokerFailure(.transportFailure)
+        }
+        throw SelftestFailure(message: "typed Git signing broker failure must not return")
+    } catch let failure as GitSSHSigningFailure {
+        try expect(
+            failure == .brokerFailure(.transportFailure),
+            "typed companion preparation failures must retain their broker category before signing"
+        )
+    }
+    do {
         let _: Int = try GitSSHSigningAuthorizationBoundary.prepare {
             throw SelftestFailure(message: "fixture approval request construction failure")
         }
@@ -1049,10 +1274,7 @@ private func authBrokerSelftests() throws {
             "authorization response loss must remain distinct from signature-result uncertainty"
         )
     }
-    for (status, expectedFailure) in [
-        (AuthBrokerApprovalStatus.cancelled, GitSSHSigningFailure.authorizationCancelled),
-        (.denied, .authorizationDenied)
-    ] {
+    for status in [AuthBrokerApprovalStatus.cancelled, .denied] {
         do {
             _ = try GitSSHSigningAuthorizationClassifier.approvedPublicKey(
                 from: .approvalResponse(AuthBrokerApprovalResponse(
@@ -1066,8 +1288,8 @@ private func authBrokerSelftests() throws {
             throw SelftestFailure(message: "Git signing cancellation and denial must not approve")
         } catch let failure as GitSSHSigningFailure {
             try expect(
-                failure == expectedFailure,
-                "genuine Git signing cancellation and denial must retain their closed status"
+                failure == .brokerFailure(.userDenied),
+                "genuine Git signing cancellation and denial must retain the user-denied broker category"
             )
         }
     }
@@ -1168,8 +1390,8 @@ private func authBrokerSelftests() throws {
             throw SelftestFailure(message: "invalid Git signing authorization response must not approve")
         } catch let failure as GitSSHSigningFailure {
             try expect(
-                failure == .invalidAuthorizationResponse,
-                "invalid authorization responses must remain pre-signature and fail closed"
+                failure == .brokerFailure(.protocolMismatch),
+                "invalid authorization responses must remain pre-signature protocol failures"
             )
         }
     }
@@ -1267,6 +1489,7 @@ private func authBrokerSelftests() throws {
             rootIdentifier: "test.agent",
             rootCodeRequirement: "anchor test",
             rootExecutablePath: "/tmp/test-agent",
+            presentation: .requesterOnly,
             purpose: purpose,
             credentialLabel: "fixture",
             credentialFingerprint: "",
@@ -1309,6 +1532,7 @@ private func authBrokerSelftests() throws {
         rootIdentifier: "test.agent",
         rootCodeRequirement: "anchor test",
         rootExecutablePath: "/tmp/test-agent",
+        presentation: .requesterOnly,
         purpose: .otpImport,
         credentialLabel: ManagedKeychainPresentationLabel.otpSeed,
         credentialFingerprint: "",
@@ -1345,6 +1569,7 @@ private func authBrokerSelftests() throws {
         rootIdentifier: "test.agent",
         rootCodeRequirement: "anchor test",
         rootExecutablePath: "/tmp/test-agent",
+        presentation: .requesterOnly,
         purpose: .passwordAutoFillRead,
         credentialLabel: "me",
         credentialFingerprint: "",
@@ -1513,8 +1738,8 @@ private func authBrokerSelftests() throws {
         )
         throw SelftestFailure(message: "valid AutoFill cancellation must remain denied")
     } catch let error as CLIError {
-        if case .denied = error {} else {
-            throw SelftestFailure(message: "valid AutoFill cancellation must remain a denial")
+        if case .brokerFailure(.userDenied) = error {} else {
+            throw SelftestFailure(message: "valid AutoFill cancellation must remain a user-denied category")
         }
     }
     do {
@@ -1833,6 +2058,7 @@ private func authBrokerSelftests() throws {
         rootIdentifier: "test.agent",
         rootCodeRequirement: "anchor test",
         rootExecutablePath: "/tmp/test-agent",
+        presentation: .requesterOnly,
         purpose: .managedKeychainDelete,
         credentialLabel: "me",
         credentialFingerprint: "",
@@ -1863,6 +2089,7 @@ private func authBrokerSelftests() throws {
             rootIdentifier: "test.agent",
             rootCodeRequirement: "anchor test",
             rootExecutablePath: "/tmp/test-agent",
+            presentation: .requesterOnly,
             purpose: .otpRead,
             credentialLabel: "key",
             credentialFingerprint: "SHA256:test",
@@ -1922,11 +2149,24 @@ private func authBrokerSelftests() throws {
             && verified.requestingApplication?.identifier == "com.apple.Terminal",
         "broker must attribute a trusted peer to a live ancestor app"
     )
+    for depth in [0, -1] {
+        try expectThrows("non-positive broker ancestry depth must fail closed") {
+            _ = try AuthBrokerPeerVerifier(
+                expectedTeamID: "TEAM123456", currentUID: 501, maximumAncestryDepth: depth
+            ).verify(
+                peer: RequesterPeer(pid: 50, uid: 501), inspector: snapshots,
+                identityInspector: { pid in
+                    guard let identity = identities[pid] else { throw AgentProtocolError.denied }
+                    return identity
+                }
+            )
+        }
+    }
     let wrongTeam = AuthBrokerPeerVerifier(expectedTeamID: "OTHERTEAM", currentUID: 501)
     try expect(!wrongTeam.acceptsPeerIdentity(peerIdentity), "broker must reject a different signing team")
 }
 
-// swiftlint:enable large_tuple opening_brace statement_position
+// swiftlint:enable large_tuple
 
 private func agentSelftests() throws {
     var selfCode: SecCode?
@@ -2561,6 +2801,10 @@ private func agentSelftests() throws {
                "a differently signed descendant must be accepted by ancestry")
     try expect(!verifier.verify(peer: RequesterPeer(pid: 101, uid: Int32(getuid())), session: session),
                "an external process must be rejected")
+    try expect(!RequesterVerifier(
+        inspector: chain, currentUID: Int32(getuid()), maxDepth: -1
+    ).verify(peer: RequesterPeer(pid: 100, uid: Int32(getuid())), session: session),
+    "negative requester ancestry depth must fail closed")
     try expect(!RequesterVerifier(inspector: SnapshotInspector(
         snapshots: [42: ProcessSnapshot(pid: 42, parentPID: 1, startTime: 7)], valid: false
     ), currentUID: Int32(getuid())).verify(peer: RequesterPeer(pid: 42, uid: Int32(getuid())), session: session),
@@ -3524,7 +3768,9 @@ func run() throws {
         "ssh create --touch-id",
         "ssh list", "ssh public-key", "ssh test", "ssh run", "ssh delete", "ssh agent", "ssh agent shell",
         "ssh agent application", "ssh shell-init", "ssh git-signing-config", "ssh git-client",
-        "ssh git-client trust", "ssh git-client list", "ssh git-client remove", "ssh connect", "ssh host-config",
+        "ssh git-client trust", "ssh git-client list", "ssh git-client remove", "ssh git-client migrate",
+        "ssh git-client reset",
+        "ssh connect", "ssh host-config",
         "reference ?attribute=otp", "reference ?ssh-format=openssh", "--help", "--version",
         "--format",
         "--config", "--no-color", "--debug", "--encoding=utf-8", "--account", "--session", "--cache",
@@ -5794,10 +6040,10 @@ func run() throws {
     )
     let gitFishCompletion = app.run(argv: ["macop", "completion", "fish"], env: [:])
     try expect(
-        zshCompletion.stdout.contains("'git client command' trust list remove")
-            && bashCompletion.stdout.contains("trust list remove")
+        zshCompletion.stdout.contains("'git client command' trust list remove migrate reset")
+            && bashCompletion.stdout.contains("trust list remove migrate reset")
             && gitFishCompletion.stdout.contains("__macop_git_client_position")
-            && gitFishCompletion.stdout.contains("'trust list remove'"),
+            && gitFishCompletion.stdout.contains("'trust list remove migrate reset'"),
         "all completions must expose the explicit Git client trust lifecycle"
     )
     if let fishExecutable = safeExecutableOnPATH(

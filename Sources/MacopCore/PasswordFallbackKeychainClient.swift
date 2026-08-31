@@ -62,6 +62,11 @@ final class PasswordFallbackKeychainClient: KeychainClient, @unchecked Sendable 
                     autoFillFailure: failure
                 ))
             } catch let error as CLIError {
+                if case let .brokerFailure(category) = error {
+                    return .failure(KeychainFailure(
+                        brokerFailure: AuthBrokerFailure(category)
+                    ))
+                }
                 return .failure(KeychainFailure(self.status(for: error)))
             } catch {
                 return .failure(KeychainFailure(errSecInternalComponent))
@@ -75,6 +80,8 @@ final class PasswordFallbackKeychainClient: KeychainClient, @unchecked Sendable 
             errSecUserCanceled
         case .providerUnavailable:
             errSecNotAvailable
+        case .brokerFailure:
+            errSecInternalComponent
         case .notFound:
             errSecItemNotFound
         default:

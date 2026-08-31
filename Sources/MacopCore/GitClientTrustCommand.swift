@@ -1,7 +1,7 @@
 import Foundation
 
 private struct GitClientTrustResponse: Encodable {
-    let schemaVersion = 1
+    let schemaVersion = 2
     let action: String?
     let clients: [GitClientTrustEntry]
 
@@ -21,7 +21,9 @@ public enum GitClientTrustCommand {
     ) throws -> CommandResult {
         guard let action = args.first else {
             throw CLIError
-                .invalidArguments(message: "Usage: macop ssh git-client <trust|list|remove> [absolute-selector-path]")
+                .invalidArguments(
+                    message: "Usage: macop ssh git-client <trust|list|remove|migrate|reset> [absolute-selector-path]"
+                )
         }
         switch action {
         case "list":
@@ -43,6 +45,19 @@ public enum GitClientTrustCommand {
             }
             let entry = try registry.remove(selectorPath: args[1])
             return try self.render([entry], action: "removed", options: options)
+        case "migrate":
+            guard args.count == 1
+            else { throw CLIError.invalidArguments(message: "ssh git-client migrate does not accept arguments.") }
+            return try self.render(
+                registry.migrateLegacy { versionProbe.version(executablePath: $0) },
+                action: "migrated",
+                options: options
+            )
+        case "reset":
+            guard args.count == 1
+            else { throw CLIError.invalidArguments(message: "ssh git-client reset does not accept arguments.") }
+            try registry.reset()
+            return try self.render([], action: "reset", options: options)
         default:
             throw CLIError.invalidArguments(message: "Unknown ssh git-client action: \(action)")
         }

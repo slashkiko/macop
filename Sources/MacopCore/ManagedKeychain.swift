@@ -333,18 +333,21 @@ public struct CompanionManagedKeychainClient: KeychainClient {
             )
             guard case let .approvalResponse(response) = try connection.send(.approvalRequest(request)),
                   response.requestID == request.requestID
-            else { return .failure(KeychainFailure(errSecDecode)) }
+            else { return .failure(KeychainFailure(brokerFailure: AuthBrokerFailure(.protocolMismatch))) }
+            if let failureCategory = response.status.failureCategory {
+                return .failure(KeychainFailure(brokerFailure: AuthBrokerFailure(failureCategory)))
+            }
             guard response.status == .approved else {
-                return .failure(KeychainFailure(
-                    response.status == .cancelled ? errSecUserCanceled : errSecAuthFailed
-                ))
+                return .failure(KeychainFailure(brokerFailure: AuthBrokerFailure(.protocolMismatch)))
             }
             guard response.resultStatus == errSecSuccess else {
                 return .failure(KeychainFailure(response.resultStatus))
             }
             return .success(response.resultData)
+        } catch let failure as AuthBrokerFailure {
+            return .failure(KeychainFailure(brokerFailure: failure))
         } catch {
-            return .failure(KeychainFailure(errSecInteractionNotAllowed))
+            return .failure(KeychainFailure(brokerFailure: AuthBrokerFailure(.transportFailure)))
         }
     }
 }
@@ -486,9 +489,9 @@ public struct CompanionManagedKeychainDeleter: ManagedKeychainDeleting {
         }
         guard case let .approvalResponse(response) = responseMessage,
               response.requestID == request.requestID
-        else { throw ManagedKeychainDeletionFailure.indeterminate }
-        guard response.status == .approved else {
-            throw CLIError.denied(message: "Managed Keychain deletion was denied or cancelled.")
+        else { throw AuthBrokerFailure(.protocolMismatch).cliError }
+        if let failureCategory = response.status.failureCategory {
+            throw AuthBrokerFailure(failureCategory).cliError
         }
         switch response.resultStatus {
         case errSecSuccess:
@@ -496,7 +499,7 @@ public struct CompanionManagedKeychainDeleter: ManagedKeychainDeleting {
         case errSecItemNotFound:
             throw CLIError.notFound(message: "Managed Keychain item was not found.")
         case errSecUserCanceled, errSecAuthFailed, errSecInteractionNotAllowed:
-            throw CLIError.denied(message: "Managed Keychain deletion was denied or cancelled.")
+            throw AuthBrokerFailure(.userDenied).cliError
         default:
             throw CLIError.runtimeError(
                 message: "Managed Keychain deletion failed (OSStatus \(response.resultStatus))."
@@ -625,7 +628,7 @@ public enum PasswordAutoFillResponseClassifier {
                   response.resultData.isEmpty,
                   response.verifiedUsername.isEmpty
             else { throw PasswordAutoFillFailure.invalidResponse }
-            throw CLIError.denied(message: "Password AutoFill was denied or cancelled.")
+            throw AuthBrokerFailure(.userDenied).cliError
         case .approved:
             guard !response.resultData.isEmpty,
                   response.resultData.count <= ManagedKeychainStore.maximumSecretLength,
@@ -824,9 +827,10 @@ public struct CompanionManagedKeychainImporter: ManagedKeychainImporting {
             keychainSynchronizable: synchronizable
         )
         guard case let .approvalResponse(approval) = try connection.send(.approvalRequest(request)),
-              approval.requestID == request.requestID else { throw CLIError.denied(message: "Import was denied.") }
-        guard approval.status == .approved else {
-            throw CLIError.denied(message: "Import was denied or cancelled.")
+              approval.requestID == request.requestID
+        else { throw AuthBrokerFailure(.protocolMismatch).cliError }
+        if let failureCategory = approval.status.failureCategory {
+            throw AuthBrokerFailure(failureCategory).cliError
         }
         let message = AuthBrokerManagedKeychainImportRequest(
             authorizationID: request.requestID,
@@ -863,7 +867,7 @@ public struct CompanionManagedKeychainImporter: ManagedKeychainImporting {
         case errSecItemNotFound:
             throw CLIError.notFound(message: "Managed Keychain item was not found; update does not create it.")
         case errSecUserCanceled, errSecAuthFailed, errSecInteractionNotAllowed:
-            throw CLIError.denied(message: "Managed Keychain import was denied or cancelled.")
+            throw AuthBrokerFailure(.userDenied).cliError
         default:
             throw CLIError.runtimeError(message: "Managed Keychain import failed (OSStatus \(response.status)).")
         }

@@ -374,7 +374,7 @@ public struct RequesterVerifier: Sendable {
         currentUID: Int32 = Int32(getuid()),
         maxDepth: Int = 128
     ) {
-        self.inspector = inspector; self.currentUID = currentUID; self.maxDepth = maxDepth
+        self.inspector = inspector; self.currentUID = currentUID; self.maxDepth = max(0, maxDepth)
     }
 
     public func verify(peer: RequesterPeer, session: VerifiedSession, now: Date = .now) -> Bool {

@@ -81,6 +81,9 @@ public enum CredentialFieldResolver {
     }
 
     private static func map(_ failure: KeychainFailure) -> CLIError {
+        if let brokerFailure = failure.brokerFailure {
+            return brokerFailure.cliError
+        }
         if failure.isAmbiguous {
             return .invalidArguments(message: "OTP seed selector is ambiguous.")
         }

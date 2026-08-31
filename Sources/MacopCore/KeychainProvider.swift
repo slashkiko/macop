@@ -12,15 +12,24 @@ public struct KeychainFailure: Error, Sendable {
     public let status: OSStatus
     public let isAmbiguous: Bool
     public let autoFillFailure: PasswordAutoFillFailure?
+    /// Present only when the request did not reach a Keychain provider.  This
+    /// keeps broker setup failures typed until the final CLI provider boundary.
+    public let brokerFailure: AuthBrokerFailure?
 
     public init(
         _ status: OSStatus,
         isAmbiguous: Bool = false,
-        autoFillFailure: PasswordAutoFillFailure? = nil
+        autoFillFailure: PasswordAutoFillFailure? = nil,
+        brokerFailure: AuthBrokerFailure? = nil
     ) {
         self.status = status
         self.isAmbiguous = isAmbiguous
         self.autoFillFailure = autoFillFailure
+        self.brokerFailure = brokerFailure
+    }
+
+    public init(brokerFailure: AuthBrokerFailure) {
+        self.init(errSecInternalComponent, brokerFailure: brokerFailure)
     }
 
     public static let ambiguousItem = KeychainFailure(errSecDuplicateItem, isAmbiguous: true)
@@ -223,6 +232,9 @@ public enum KeychainProvider {
         case let .failure(failure):
             if let autoFillFailure = failure.autoFillFailure {
                 throw autoFillFailure.cliError
+            }
+            if let brokerFailure = failure.brokerFailure {
+                throw brokerFailure.cliError
             }
             if failure.isAmbiguous {
                 throw CLIError.invalidArguments(

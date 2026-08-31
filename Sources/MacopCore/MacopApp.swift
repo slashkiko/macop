@@ -1,5 +1,7 @@
 import Foundation
 
+// swiftlint:disable file_length
+
 private func agentHelperEnvironment(_ environment: [String: String], options: GlobalOptions) -> [String: String] {
     var value = environment
     value["MACOP_AGENT_FORMAT"] = options.format == .json ? "json" : "human"
@@ -77,6 +79,11 @@ public struct MacopApp {
     }
 
     public func run(argv: [String], env: [String: String], input: Data = Data()) -> CommandResult {
+        if case let .blocked(reason) = InstallGenerationGuard.invocationDecision(argv: argv, environment: env) {
+            return ErrorRenderer.render(error: .providerUnavailable(
+                provider: "installation", reason: reason.diagnostic
+            ), format: extractFormatHint(argv: argv, env: env))
+        }
         do {
             let parsed = try ArgumentParser.parse(argv: argv, env: env)
             let result = try self.execute(parsed, env: env, input: input)
@@ -91,6 +98,20 @@ public struct MacopApp {
                 ErrorRenderer.render(error: error, format: format),
                 enabled: rawDebugEnabled(argv: argv, env: env),
                 context: self.debugContext(error)
+            )
+        } catch let failure as AuthBrokerFailure {
+            let format = extractFormatHint(argv: argv, env: env)
+            return self.withSafeDebug(
+                ErrorRenderer.render(error: failure.cliError, format: format),
+                enabled: rawDebugEnabled(argv: argv, env: env),
+                context: "broker_category=\(failure.category.rawValue)"
+            )
+        } catch let failure as GitClientTrustFailure {
+            let format = extractFormatHint(argv: argv, env: env)
+            return self.withSafeDebug(
+                ErrorRenderer.render(error: failure.cliError, format: format),
+                enabled: rawDebugEnabled(argv: argv, env: env),
+                context: "git_client_trust=\(failure)"
             )
         } catch {
             return self.withSafeDebug(
@@ -393,6 +414,8 @@ private extension MacopApp {
             "command=\(command.split(separator: " ").first ?? "unknown")"
         case let .unsupportedProvider(provider, _), let .providerUnavailable(provider, _):
             "provider=\(provider)"
+        case let .brokerFailure(category):
+            "broker_category=\(category.rawValue)"
         default:
             nil
         }

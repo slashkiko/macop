@@ -1,13 +1,24 @@
 import Foundation
 import MacopCore
 
+let environment = ProcessInfo.processInfo.environment
+/// This must remain ahead of app construction, adapter dispatch, argument
+/// parsing, interactive input and streaming setup.
+let invocationDecision = InstallGenerationGuard.invocationDecision(
+    argv: CommandLine.arguments,
+    environment: environment
+)
+if case let .blocked(reason) = invocationDecision {
+    FileHandle.standardError.write(Data("macop: \(reason.diagnostic).\n".utf8))
+    exit(ExitCode.providerUnavailable.rawValue)
+}
+
 private func write(_ text: String, to handle: FileHandle) {
     guard let data = text.data(using: .utf8) else { return }
     try? handle.write(contentsOf: data)
 }
 
 let app = MacopApp()
-let environment = ProcessInfo.processInfo.environment
 if GitSSHSigningCommand.isAdapterInvocation(CommandLine.arguments) {
     let result = if GitSSHVerificationCommand.isVerificationInvocation(CommandLine.arguments) {
         GitSSHVerificationCommand.run(argv: CommandLine.arguments)

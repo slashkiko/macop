@@ -1,3 +1,4 @@
+// swiftlint:disable file_length
 import Darwin
 import Foundation
 
@@ -25,14 +26,16 @@ public struct GitClientTrustEntry: Codable, Equatable, Sendable {
     }
 }
 
-struct GitClientTrustDocument: Codable {
+/// Kept only to inspect and migrate an old on-disk file.  It is never returned
+/// by `list()` and is never passed to requester validation.
+private struct LegacyGitClientTrustDocument: Codable {
     let schemaVersion: Int
-    var clients: [GitClientTrustEntry]
-
-    enum CodingKeys: String, CodingKey {
-        case schemaVersion = "schema_version"
-        case clients
-    }
+    let clients: [GitClientTrustEntry]
+    static let entryKeys: Set<String> = [
+        "selector_path", "resolved_path", "identifier", "cdhash", "code_requirement", "team_id",
+        "publisher_verified", "signature_kind", "version"
+    ]
+    enum CodingKeys: String, CodingKey { case schemaVersion = "schema_version", clients }
 }
 
 public protocol GitClientTrustInspecting: Sendable {
@@ -56,6 +59,45 @@ public protocol GitClientTrustRegistryProviding: Sendable {
     func list() throws -> [GitClientTrustEntry]
 }
 
+public protocol GitClientTrustDocumentVerifying: Sendable {
+    func verify(document: GitClientTrustDocument, canonicalDocument: Data, digest: Data) throws
+}
+
+public protocol GitClientTrustDocumentMutating: Sendable {
+    func authorizeMutation(
+        operation: GitClientTrustMutationOperation,
+        expectedGeneration: UInt64,
+        nextDocument: GitClientTrustDocument,
+        canonicalDocument: Data,
+        digest: Data
+    ) throws
+}
+
+public protocol GitClientTrustProtectedStateQuerying: Sendable {
+    /// `nil` is an authenticated key-loss/no-state verdict, never an inferred
+    /// filesystem generation.
+    func protectedGeneration() throws -> UInt64?
+}
+
+public enum GitClientTrustMutationOperation: UInt8, Sendable, Equatable {
+    case enroll = 1
+    case remove = 2
+    case migrate = 3
+    case reset = 4
+}
+
+/// Production callers must obtain the authenticated verdict from MacopAuth;
+/// tests can inject a deterministic verifier without exposing protected state.
+public struct RejectingGitClientTrustDocumentVerifier: GitClientTrustDocumentVerifying {
+    public init() {}
+    public func verify(document: GitClientTrustDocument, canonicalDocument: Data, digest: Data) throws {
+        throw CLIError.providerUnavailable(
+            provider: "MacopAuth",
+            reason: "Git client trust state could not be verified."
+        )
+    }
+}
+
 public struct GitClientTrustRegistry: GitClientTrustRegistryProviding, Sendable {
     public static var defaultURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -64,33 +106,40 @@ public struct GitClientTrustRegistry: GitClientTrustRegistryProviding, Sendable 
 
     public let fileURL: URL
     private let inspector: any GitClientTrustInspecting
+    private let verifier: any GitClientTrustDocumentVerifying
+    private let mutator: any GitClientTrustDocumentMutating
 
     public init(
         fileURL: URL = Self.defaultURL,
-        inspector: any GitClientTrustInspecting = SystemGitClientTrustInspector()
+        inspector: any GitClientTrustInspecting = SystemGitClientTrustInspector(),
+        verifier: any GitClientTrustDocumentVerifying = AuthBrokerGitClientTrustVerifier(),
+        mutator: any GitClientTrustDocumentMutating = AuthBrokerGitClientTrustVerifier()
     ) {
         self.fileURL = fileURL
         self.inspector = inspector
+        self.verifier = verifier
+        self.mutator = mutator
     }
 
     public func list() throws -> [GitClientTrustEntry] {
-        guard self.entryExists() else { return [] }
-        let data = try GitClientRegistryFilesystem.read(fileURL: self.fileURL)
-        guard !StrictJSONDuplicateKeyScanner.containsDuplicateObjectKey(in: data),
-              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              Set(root.keys) == ["schema_version", "clients"],
-              root["schema_version"] as? Int == 1,
-              let rawClients = root["clients"] as? [[String: Any]],
-              rawClients.allSatisfy({ Set($0.keys) == [
-                  "selector_path", "resolved_path", "identifier", "cdhash", "code_requirement",
-                  "team_id", "publisher_verified", "signature_kind", "version"
-              ] })
-        else { throw CLIError.invalidArguments(message: "Git client trust registry is malformed.") }
-        let document = try JSONDecoder().decode(GitClientTrustDocument.self, from: data)
-        guard document.schemaVersion == 1,
-              Set(document.clients.map(\ .selectorPath)).count == document.clients.count
-        else { throw CLIError.invalidArguments(message: "Git client trust registry is malformed or duplicated.") }
-        try document.clients.forEach(Self.validateStoredEntry)
+        guard let data = try GitClientRegistryFilesystem.readIfPresent(fileURL: self.fileURL) else {
+            guard try self.protectedGeneration() == nil else {
+                throw CLIError.denied(
+                    message: "Git client trust registry is missing while protected trust state still exists. "
+                        + "Restore the registry or run the authenticated reset."
+                )
+            }
+            return []
+        }
+        let document: GitClientTrustDocument
+        do { document = try GitClientTrustDocument.decodeCanonical(data) } catch {
+            throw CLIError
+                .invalidArguments(
+                    message: "Git client trust registry is malformed, legacy, or non-canonical. Run the authenticated migration."
+                )
+        }
+        let canonical = try document.canonicalBytes()
+        try self.verifier.verify(document: document, canonicalDocument: canonical, digest: document.digest())
         return document.clients.sorted { $0.selectorPath < $1.selectorPath }
     }
 
@@ -132,22 +181,27 @@ public struct GitClientTrustRegistry: GitClientTrustRegistryProviding, Sendable 
             version: Self.boundedVersion(version)
         )
         try Self.validateStoredEntry(entry)
-        try GitClientRegistryFilesystem.withExclusiveLock(directoryURL: self.fileURL.deletingLastPathComponent()) {
-            let current = try self.inspector.inspectSelector(selector)
-            guard current.canonicalPath == identity.canonicalPath, current.identifier == identity.identifier,
-                  current.cdHash == identity.cdHash
-            else { throw CLIError.denied(message: "Git client changed while it was being trusted; retry after review.")
+        let registryPath = try GitClientRegistryFilesystem.validatedPath(for: self.fileURL)
+        try GitClientRegistryFilesystem
+            .withExclusiveLock(registryPath: registryPath) { directory in
+                let current = try self.inspector.inspectSelector(selector)
+                guard current.canonicalPath == identity.canonicalPath, current.identifier == identity.identifier,
+                      current.cdHash == identity.cdHash
+                else {
+                    throw CLIError.denied(message: "Git client changed while it was being trusted; retry after review.")
+                }
+                let currentDocument = try self.loadDocumentForMutation(in: directory)
+                var clients = currentDocument.clients
+                clients.removeAll { $0.selectorPath == selector }
+                clients.append(entry)
+                try directory.writeRegistry(
+                    self.authorizeMutation(
+                        operation: .enroll,
+                        currentGeneration: currentDocument.generation,
+                        clients: clients
+                    )
+                )
             }
-            var clients = try self.list()
-            clients.removeAll { $0.selectorPath == selector }
-            clients.append(entry)
-            try GitClientRegistryFilesystem.write(
-                GitClientTrustDocument(
-                    schemaVersion: 1, clients: clients.sorted { $0.selectorPath < $1.selectorPath }
-                ),
-                fileURL: self.fileURL
-            )
-        }
         return entry
     }
 
@@ -155,29 +209,123 @@ public struct GitClientTrustRegistry: GitClientTrustRegistryProviding, Sendable 
     public func remove(selectorPath: String) throws -> GitClientTrustEntry {
         let selector = try GitClientPathPolicy.validateSelector(selectorPath)
         var removed: GitClientTrustEntry?
-        try GitClientRegistryFilesystem.withExclusiveLock(directoryURL: self.fileURL.deletingLastPathComponent()) {
-            var clients = try self.list()
-            guard let index = clients.firstIndex(where: { $0.selectorPath == selector }) else {
-                throw CLIError.notFound(message: "Git client selector is not trusted: \(selector)")
+        let registryPath = try GitClientRegistryFilesystem.validatedPath(for: self.fileURL)
+        try GitClientRegistryFilesystem
+            .withExclusiveLock(registryPath: registryPath) { directory in
+                let current = try self.loadDocumentForMutation(in: directory)
+                var clients = current.clients
+                guard let index = clients.firstIndex(where: { $0.selectorPath == selector }) else {
+                    throw CLIError.notFound(message: "Git client selector is not trusted: \(selector)")
+                }
+                removed = clients.remove(at: index)
+                try directory.writeRegistry(
+                    self.authorizeMutation(operation: .remove, currentGeneration: current.generation, clients: clients)
+                )
             }
-            removed = clients.remove(at: index)
-            try GitClientRegistryFilesystem.write(
-                GitClientTrustDocument(schemaVersion: 1, clients: clients), fileURL: self.fileURL
-            )
-        }
         guard let removed else { throw CLIError.runtimeError(message: "Git client removal did not complete.") }
         return removed
     }
 
-    private func entryExists() -> Bool {
-        var details = stat()
-        if lstat(self.fileURL.path, &details) == 0 {
-            return true
-        }
-        return errno != ENOENT
+    /// v1 was never a trusted input.  Migration re-inspects every selector and
+    /// requires MacopAuth to approve the newly pinned complete v2 set.
+    public func migrateLegacy(versionProbe: (String) -> String) throws -> [GitClientTrustEntry] {
+        let registryPath = try GitClientRegistryFilesystem.validatedPath(for: self.fileURL)
+        return try GitClientRegistryFilesystem
+            .withExclusiveLock(registryPath: registryPath) { directory in
+                let legacy = try self.loadLegacyInspectionDocument(in: directory)
+                var clients: [GitClientTrustEntry] = []
+                for old in legacy.clients {
+                    let selector = try GitClientPathPolicy.validateSelector(old.selectorPath)
+                    let identity = try self.inspector.inspectSelector(selector)
+                    guard let cdHash = identity.cdHash, Self.safeHex(cdHash),
+                          Self.safeIdentifier(identity.identifier)
+                    else {
+                        throw CLIError
+                            .denied(message: "Legacy Git client no longer has a pinnable live identity: \(selector)")
+                    }
+                    let entry = try GitClientTrustEntry(
+                        selectorPath: selector, resolvedPath: identity.canonicalPath, identifier: identity.identifier,
+                        cdHash: cdHash, codeRequirement: LiveCodeIdentityInspector.finalRequirementText(for: identity),
+                        teamID: identity.teamID ?? "", publisherVerified: identity.hasTrustedPublisher,
+                        signatureKind: Self.safeDisplay(identity.signatureSummary, limit: 512) ? identity
+                            .signatureSummary : "exact image pinned; signature metadata unavailable",
+                        version: Self.boundedVersion(versionProbe(identity.canonicalPath))
+                    )
+                    try Self.validateStoredEntry(entry); clients.append(entry)
+                }
+                guard Set(clients.map(\ .selectorPath)).count == clients.count else {
+                    throw CLIError.invalidArguments(message: "Legacy Git client registry contains duplicate selectors.")
+                }
+                let next = try self.authorizeMutation(
+                    operation: .migrate, currentGeneration: self.protectedGenerationForRecovery(), clients: clients
+                )
+                try directory.writeRegistry(next)
+                return next.clients.sorted { $0.selectorPath < $1.selectorPath }
+            }
     }
 
-    private static func validateStoredEntry(_ entry: GitClientTrustEntry) throws {
+    public func reset() throws {
+        let registryPath = try GitClientRegistryFilesystem.validatedPath(for: self.fileURL)
+        try GitClientRegistryFilesystem
+            .withExclusiveLock(registryPath: registryPath) { directory in
+                // A missing or malformed file cannot establish the expected
+                // generation.  Ask MacopAuth's protected state instead, so reset
+                // remains recoverable after uninstall or interrupted publication.
+                let generation = try self.protectedGenerationForRecovery()
+                let next = try self.authorizeMutation(operation: .reset, currentGeneration: generation, clients: [])
+                try directory.writeRegistry(next)
+            }
+    }
+
+    private func loadDocumentForMutation(
+        in directory: GitClientRegistryFilesystem.LockedDirectory
+    ) throws -> GitClientTrustDocument {
+        guard let data = try directory.readRegistryIfPresent() else {
+            return GitClientTrustDocument(generation: 0, clients: [])
+        }
+        let document: GitClientTrustDocument
+        do { document = try GitClientTrustDocument.decodeCanonical(data) } catch {
+            throw CLIError
+                .invalidArguments(message: "Git client trust registry requires an authenticated v1 migration or reset.")
+        }
+        // Do not accept this document for requester validation here.  A retry
+        // after state-advance/file-publication interruption must be able to
+        // reconstruct the same next document; MacopAuth binds and authorizes
+        // that exact next value below.
+        return document
+    }
+
+    private func loadLegacyInspectionDocument(
+        in directory: GitClientRegistryFilesystem.LockedDirectory
+    ) throws -> LegacyGitClientTrustDocument {
+        let data = try directory.readRegistry()
+        guard !StrictJSONDuplicateKeyScanner.containsDuplicateObjectKey(in: data),
+              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(root.keys) == ["schema_version", "clients"], root["schema_version"] as? Int == 1,
+              let rows = root["clients"] as? [[String: Any]],
+              rows.allSatisfy({ Set($0.keys) == LegacyGitClientTrustDocument.entryKeys })
+        else { throw CLIError.invalidArguments(message: "Git client registry is not a valid v1 inspection document.") }
+        return try JSONDecoder().decode(LegacyGitClientTrustDocument.self, from: data)
+    }
+
+    private func authorizeMutation(
+        operation: GitClientTrustMutationOperation,
+        currentGeneration: UInt64,
+        clients: [GitClientTrustEntry]
+    ) throws -> GitClientTrustDocument {
+        guard currentGeneration < UInt64.max else {
+            throw CLIError.denied(message: "Git client trust generation is exhausted; use authenticated recovery.")
+        }
+        let next = GitClientTrustDocument(generation: currentGeneration + 1, clients: clients)
+        let canonical = try next.canonicalBytes()
+        try self.mutator.authorizeMutation(
+            operation: operation, expectedGeneration: currentGeneration, nextDocument: next,
+            canonicalDocument: canonical, digest: next.digest()
+        )
+        return next
+    }
+
+    static func validateStoredEntry(_ entry: GitClientTrustEntry) throws {
         guard try GitClientPathPolicy.validateSelector(entry.selectorPath) == entry.selectorPath,
               try GitClientPathPolicy.validateSelector(entry.resolvedPath) == entry.resolvedPath,
               self.safeIdentifier(entry.identifier), self.safeHex(entry.cdHash),
@@ -228,22 +376,97 @@ public struct GitClientTrustRegistry: GitClientTrustRegistryProviding, Sendable 
     }
 }
 
+private extension GitClientTrustRegistry {
+    func protectedGenerationForRecovery() throws -> UInt64 {
+        try self.protectedGeneration() ?? 0
+    }
+
+    func protectedGeneration() throws -> UInt64? {
+        guard let authority = self.mutator as? any GitClientTrustProtectedStateQuerying else {
+            throw CLIError.providerUnavailable(
+                provider: "MacopAuth",
+                reason: "Git client protected state recovery is unavailable."
+            )
+        }
+        return try authority.protectedGeneration()
+    }
+}
+
+/// All system observations needed to validate the Git process that invoked the
+/// SSH signing adapter. Keeping them together makes the process identity
+/// boundary deterministic in tests without weakening the production path.
+public struct GitClientRequesterValidationEnvironment: Sendable {
+    public let snapshot: @Sendable (Int32) -> ProcessSnapshot?
+    public let executablePath: @Sendable (Int32) throws -> String
+    public let inspectAppleGit: @Sendable (Int32, String) throws -> LiveCodeInspection
+    public let inspectSelector: @Sendable (String) throws -> LiveCodeIdentity
+    public let inspectLiveCode: @Sendable (Int32, String) throws -> LiveCodeInspection
+    public let loadRegistry: @Sendable () throws -> [GitClientTrustEntry]
+
+    public init(
+        snapshot: @escaping @Sendable (Int32) -> ProcessSnapshot?,
+        executablePath: @escaping @Sendable (Int32) throws -> String,
+        inspectAppleGit: @escaping @Sendable (Int32, String) throws -> LiveCodeInspection,
+        inspectSelector: @escaping @Sendable (String) throws -> LiveCodeIdentity,
+        inspectLiveCode: @escaping @Sendable (Int32, String) throws -> LiveCodeInspection,
+        loadRegistry: @escaping @Sendable () throws -> [GitClientTrustEntry]
+    ) {
+        self.snapshot = snapshot
+        self.executablePath = executablePath
+        self.inspectAppleGit = inspectAppleGit
+        self.inspectSelector = inspectSelector
+        self.inspectLiveCode = inspectLiveCode
+        self.loadRegistry = loadRegistry
+    }
+
+    public static func system(
+        registry: any GitClientTrustRegistryProviding = GitClientTrustRegistry()
+    ) -> Self {
+        Self(
+            snapshot: { SystemRequesterInspector().snapshot(of: $0) },
+            executablePath: { try GitClientRequesterTrust.executablePath(pid: $0) },
+            inspectAppleGit: { try LiveCodeIdentityInspector.inspectExpectedAppleGit(pid: $0, expectedPath: $1) },
+            inspectSelector: { try SystemGitClientTrustInspector().inspectSelector($0) },
+            inspectLiveCode: { try LiveCodeIdentityInspector.inspect(pid: $0, expectedPath: $1) },
+            loadRegistry: { try registry.list() }
+        )
+    }
+}
+
 public enum GitClientRequesterTrust {
     public static func registeredCandidate(
         entries: [GitClientTrustEntry],
         livePath: String,
         resolve: (String) throws -> LiveCodeIdentity
     ) throws -> (entry: GitClientTrustEntry, current: LiveCodeIdentity)? {
-        for entry in entries {
-            let current = try? resolve(entry.selectorPath)
-            if entry.resolvedPath == livePath || current?.canonicalPath == livePath {
-                guard let current else {
-                    throw CLIError.denied(
-                        message: "The trusted Git selector is unavailable. Re-run `macop ssh git-client trust \(entry.selectorPath)` after review."
-                    )
+        var staleCandidate: (entry: GitClientTrustEntry, current: LiveCodeIdentity)?
+        let candidates = entries.filter { $0.resolvedPath == livePath }
+        guard !candidates.isEmpty else { return nil }
+        var staleSelector: GitClientTrustEntry?
+        for entry in candidates {
+            guard let current = try? resolve(entry.selectorPath), current.canonicalPath == livePath else {
+                if staleSelector == nil {
+                    staleSelector = entry
                 }
-                return (entry, current)
+                continue
             }
+            guard current.identifier == entry.identifier, current.cdHash == entry.cdHash else {
+                staleCandidate = staleCandidate ?? (entry, current)
+                if staleSelector == nil {
+                    staleSelector = entry
+                }
+                continue
+            }
+            return (entry, current)
+        }
+        if let staleCandidate {
+            return staleCandidate
+        }
+        if let staleSelector {
+            throw CLIError.denied(
+                message: "The trusted Git selector is unavailable or retargeted. "
+                    + "Re-run `macop ssh git-client trust \(staleSelector.selectorPath)` after review."
+            )
         }
         return nil
     }
@@ -288,17 +511,24 @@ public enum GitClientRequesterTrust {
         pid: Int32,
         registry: any GitClientTrustRegistryProviding = GitClientTrustRegistry()
     ) throws -> LiveCodeInspection {
-        guard pid > 1, let before = SystemRequesterInspector().snapshot(of: pid) else {
+        try self.validate(pid: pid, environment: .system(registry: registry))
+    }
+
+    public static func validate(
+        pid: Int32,
+        environment: GitClientRequesterValidationEnvironment
+    ) throws -> LiveCodeInspection {
+        guard pid > 1, let before = environment.snapshot(pid) else {
             throw CLIError.denied(message: "The Git SSH adapter parent could not be inspected.")
         }
-        let path = try self.executablePath(pid: pid)
-        if let apple = try? LiveCodeIdentityInspector.inspectExpectedAppleGit(pid: pid, expectedPath: path) {
-            guard SystemRequesterInspector().snapshot(of: pid) == before else { throw AgentProtocolError.denied }
+        let path = try environment.executablePath(pid)
+        if let apple = try? environment.inspectAppleGit(pid, path) {
+            guard environment.snapshot(pid) == before else { throw AgentProtocolError.denied }
             return apple
         }
-        let entries = try registry.list()
+        let entries = try environment.loadRegistry()
         let matched = try self.registeredCandidate(entries: entries, livePath: path) {
-            try SystemGitClientTrustInspector().inspectSelector($0)
+            try environment.inspectSelector($0)
         }
         guard let (entry, current) = matched else {
             throw CLIError.denied(
@@ -307,12 +537,12 @@ public enum GitClientRequesterTrust {
         }
         return try self.validateRegisteredProcess(
             entry: entry, current: current, before: before,
-            after: SystemRequesterInspector().snapshot(of: pid),
-            liveInspection: { try LiveCodeIdentityInspector.inspect(pid: pid, expectedPath: entry.resolvedPath) }
+            after: environment.snapshot(pid),
+            liveInspection: { try environment.inspectLiveCode(pid, entry.resolvedPath) }
         )
     }
 
-    private static func executablePath(pid: Int32) throws -> String {
+    fileprivate static func executablePath(pid: Int32) throws -> String {
         var buffer = [CChar](repeating: 0, count: 4096)
         let count = proc_pidpath(pid, &buffer, UInt32(buffer.count))
         guard count > 0 else { throw AgentProtocolError.denied }

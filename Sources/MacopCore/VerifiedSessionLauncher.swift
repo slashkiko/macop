@@ -14,19 +14,28 @@ public struct VerifiedSessionLaunchRequest: Sendable {
     public let bundleID: String
     public let codeRequirement: String
     public let codeIdentity: LiveCodeIdentity
+    public let presentedApplication: String
+    public let presentationVerification: String?
+    public let presentationIdentity: LiveCodeIdentity?
 
     public init(
         rootPID: Int32,
         rootStartTime: UInt64,
         bundleID: String,
         codeRequirement: String,
-        codeIdentity: LiveCodeIdentity
+        codeIdentity: LiveCodeIdentity,
+        presentedApplication: String? = nil,
+        presentationVerification: String? = nil,
+        presentationIdentity: LiveCodeIdentity? = nil
     ) {
         self.rootPID = rootPID
         self.rootStartTime = rootStartTime
         self.bundleID = bundleID
         self.codeRequirement = codeRequirement
         self.codeIdentity = codeIdentity
+        self.presentedApplication = presentedApplication ?? codeIdentity.canonicalPath
+        self.presentationVerification = presentationVerification
+        self.presentationIdentity = presentationIdentity
     }
 }
 

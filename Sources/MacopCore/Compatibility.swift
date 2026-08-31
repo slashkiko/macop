@@ -103,6 +103,8 @@ private let compatibilitySSHEntries: [CompatibilityEntry] = [
     .init(command: "ssh git-client trust", kind: "subcommand", status: "supported"),
     .init(command: "ssh git-client list", kind: "subcommand", status: "supported"),
     .init(command: "ssh git-client remove", kind: "subcommand", status: "supported"),
+    .init(command: "ssh git-client migrate", kind: "subcommand", status: "supported"),
+    .init(command: "ssh git-client reset", kind: "subcommand", status: "supported"),
     .init(
         command: "ssh connect",
         kind: "extension",

@@ -2,6 +2,7 @@ import Foundation
 import Security
 
 public enum GitSSHSigningFailure: Error, Sendable, Equatable {
+    case brokerFailure(AuthBrokerFailureCategory)
     case brokerUnavailable
     case authorizationRequestInvalid
     case authorizationCancelled
@@ -17,6 +18,8 @@ public enum GitSSHSigningFailure: Error, Sendable, Equatable {
 
     var cliError: CLIError {
         switch self {
+        case let .brokerFailure(category):
+            .brokerFailure(category)
         case .brokerUnavailable:
             .providerUnavailable(
                 provider: "MacopAuth",
@@ -79,45 +82,42 @@ public enum GitSSHSigningAuthorizationClassifier {
             guard response.requestID == requestID,
                   response.message.isEmpty,
                   response.verifiedUsername.isEmpty
-            else { throw GitSSHSigningFailure.invalidAuthorizationResponse }
+            else { throw GitSSHSigningFailure.brokerFailure(.protocolMismatch) }
             switch response.status {
             case .approved:
                 guard response.resultStatus == errSecSuccess,
                       !response.resultData.isEmpty,
                       constantTimeEqual(response.resultData, expectedPublicKey)
-                else { throw GitSSHSigningFailure.invalidAuthorizationResponse }
+                else { throw GitSSHSigningFailure.brokerFailure(.protocolMismatch) }
                 return response.resultData
             case .cancelled:
                 guard response.resultStatus == errSecAuthFailed, response.resultData.isEmpty else {
-                    throw GitSSHSigningFailure.invalidAuthorizationResponse
+                    throw GitSSHSigningFailure.brokerFailure(.protocolMismatch)
                 }
-                throw GitSSHSigningFailure.authorizationCancelled
+                throw GitSSHSigningFailure.brokerFailure(.userDenied)
             case .denied:
                 guard response.resultStatus == errSecAuthFailed, response.resultData.isEmpty else {
-                    throw GitSSHSigningFailure.invalidAuthorizationResponse
+                    throw GitSSHSigningFailure.brokerFailure(.protocolMismatch)
                 }
-                throw GitSSHSigningFailure.authorizationDenied
+                throw GitSSHSigningFailure.brokerFailure(.userDenied)
             }
         case .sshSignResponse:
-            do {
-                _ = try GitSSHSigningResponseClassifier.signature(
-                    from: message,
-                    authorizationID: requestID,
-                    stage: .authorization
-                )
-            } catch let failure as GitSSHSigningFailure {
-                switch failure {
-                case .requesterInvalid, .signerUnavailable, .identityMismatch:
-                    throw failure
-                default:
-                    throw GitSSHSigningFailure.invalidAuthorizationResponse
-                }
-            } catch {
-                throw GitSSHSigningFailure.invalidAuthorizationResponse
+            guard case let .sshSignResponse(response) = message,
+                  response.authorizationID == requestID,
+                  response.signature.isEmpty
+            else { throw GitSSHSigningFailure.brokerFailure(.protocolMismatch) }
+            switch response.outcome {
+            case .requesterInvalid:
+                throw GitSSHSigningFailure.requesterInvalid
+            case .signerUnavailable:
+                throw GitSSHSigningFailure.signerUnavailable
+            case .identityMismatch:
+                throw GitSSHSigningFailure.identityMismatch
+            case .signed, .signatureFailed:
+                throw GitSSHSigningFailure.brokerFailure(.protocolMismatch)
             }
-            throw GitSSHSigningFailure.invalidAuthorizationResponse
         default:
-            throw GitSSHSigningFailure.invalidAuthorizationResponse
+            throw GitSSHSigningFailure.brokerFailure(.protocolMismatch)
         }
     }
 }
@@ -126,6 +126,8 @@ public enum GitSSHSigningAuthorizationBoundary {
     public static func connect<Connection>(_ operation: () throws -> Connection) throws -> Connection {
         do {
             return try operation()
+        } catch let failure as AuthBrokerFailure {
+            throw GitSSHSigningFailure.brokerFailure(failure.category)
         } catch {
             throw GitSSHSigningFailure.brokerUnavailable
         }
@@ -142,6 +144,8 @@ public enum GitSSHSigningAuthorizationBoundary {
     public static func receive<Response>(_ operation: () throws -> Response) throws -> Response {
         do {
             return try operation()
+        } catch let failure as AuthBrokerFailure {
+            throw GitSSHSigningFailure.brokerFailure(failure.category)
         } catch {
             throw GitSSHSigningFailure.authorizationResponseUnavailable
         }
