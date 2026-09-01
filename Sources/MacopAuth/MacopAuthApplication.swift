@@ -1,4 +1,6 @@
 // swiftlint:disable file_length
+// Keep this entry point out of main.swift so SwiftPM can compile the neighboring
+// AutoFill adapter source while using the explicit @main application type.
 import AppKit
 import Darwin
 import LocalAuthentication
@@ -2110,8 +2112,7 @@ private struct PasswordAutoFillRequestView: View {
     let pending: AuthApprovalCoordinator.PendingApproval
     let submit: (String, String, Bool, Bool) -> Void
     let cancel: () -> Void
-    @State private var password = ""
-    @State private var username = ""
+    @State private var credentials = PasswordAutoFillCredentialState()
     @State private var saveToKeychain = false
 
     var body: some View {
@@ -2147,38 +2148,24 @@ private struct PasswordAutoFillRequestView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             }
-            VStack(alignment: .leading, spacing: 12) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(MacopAuthL10n.text("autofill.username", fallback: "ユーザー名"))
-                        .font(.caption).foregroundStyle(.secondary)
-                    AutoFillTextField(
-                        text: self.$username,
-                        placeholder: self.pending.request.keychainAccount,
-                        accessibilityLabel: MacopAuthL10n.text("autofill.username", fallback: "ユーザー名"),
-                        contentType: .username,
-                        secure: false
-                    )
-                }
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(MacopAuthL10n.text("autofill.password", fallback: "パスワード"))
-                        .font(.caption).foregroundStyle(.secondary)
-                    AutoFillTextField(
-                        text: self.$password,
-                        placeholder: MacopAuthL10n.text("autofill.title", fallback: "Passwordsから選択"),
-                        accessibilityLabel: MacopAuthL10n.text("autofill.password", fallback: "パスワード"),
-                        contentType: .password,
-                        secure: true
-                    )
-                }
-            }
-            if !self.username.isEmpty, self.username != self.pending.request.keychainAccount {
+            PasswordAutoFillCredentialFields(
+                credentials: self.$credentials,
+                presentation: PasswordAutoFillFieldPresentation(
+                    usernameLabel: MacopAuthL10n.text("autofill.username", fallback: "ユーザー名"),
+                    usernamePlaceholder: self.pending.request.keychainAccount,
+                    passwordLabel: MacopAuthL10n.text("autofill.password", fallback: "パスワード"),
+                    passwordPlaceholder: MacopAuthL10n.text("autofill.title", fallback: "Passwordsから選択")
+                )
+            )
+            .frame(maxWidth: .infinity)
+            if self.hasUsernameMismatch {
                 Text(MacopAuthL10n.text(
                     "autofill.username_mismatch",
                     fallback: "選択したユーザー名が設定済みアカウントと一致しません。"
                 ))
                 .font(.caption)
                 .foregroundStyle(.red)
-            } else if self.username.isEmpty, !self.password.isEmpty {
+            } else if self.credentials.username.isEmpty, !self.credentials.password.isEmpty {
                 Text(MacopAuthL10n.text(
                     "autofill.username_missing",
                     fallback: "Passwordsがユーザー名を返さなかった場合は、設定済みアカウントを入力して確認してください。"
@@ -2217,26 +2204,42 @@ private struct PasswordAutoFillRequestView: View {
                             "auth.action.mac_password",
                             fallback: "Macのログインパスワード"
                         )) {
-                            self.submit(self.username, self.password, self.saveToKeychain, true)
-                            self.username = ""
-                            self.password = ""
+                            self.submit(
+                                self.credentials.username,
+                                self.credentials.password,
+                                self.saveToKeychain,
+                                true
+                            )
+                            self.credentials.reset()
                         }
                         Button(MacopAuthL10n.text(
                             "auth.action.touch_or_watch",
                             fallback: "Touch IDまたはApple Watch"
                         )) {
-                            self.submit(self.username, self.password, self.saveToKeychain, false)
-                            self.username = ""
-                            self.password = ""
+                            self.submit(
+                                self.credentials.username,
+                                self.credentials.password,
+                                self.saveToKeychain,
+                                false
+                            )
+                            self.credentials.reset()
                         }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
                     }
                     .fixedSize(horizontal: true, vertical: false)
-                    .disabled(self.password.isEmpty || self.username != self.pending.request.keychainAccount)
+                    .disabled(
+                        self.credentials.password.isEmpty
+                            || self.credentials.username != self.pending.request.keychainAccount
+                    )
                 }
             }
         }
+    }
+
+    private var hasUsernameMismatch: Bool {
+        !self.credentials.username.isEmpty
+            && self.credentials.username != self.pending.request.keychainAccount
     }
 
     private func row(_ key: String, fallback: String, _ value: String) -> some View {
@@ -2265,105 +2268,6 @@ private struct PasswordAutoFillRequestView: View {
             return NSWorkspace.shared.icon(forFile: String(path[..<range.lowerBound]) + ".app")
         }
         return NSWorkspace.shared.icon(forFile: path)
-    }
-}
-
-private struct AutoFillTextField: NSViewRepresentable {
-    @Binding var text: String
-    let placeholder: String
-    let accessibilityLabel: String
-    let contentType: NSTextContentType
-    let secure: Bool
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(text: self.$text)
-    }
-
-    func makeNSView(context: Context) -> NSTextField {
-        let field: NSTextField
-        if self.secure {
-            let secureField = AutoFillObservingSecureTextField()
-            secureField.onValueChange = context.coordinator.receiveExternalChange
-            field = secureField
-        } else {
-            let textField = AutoFillObservingTextField()
-            textField.onValueChange = context.coordinator.receiveExternalChange
-            field = textField
-        }
-        field.placeholderString = self.placeholder
-        field.setAccessibilityLabel(self.accessibilityLabel)
-        field.contentType = self.contentType
-        field.delegate = context.coordinator
-        field.isEditable = true
-        field.isSelectable = true
-        field.bezelStyle = .roundedBezel
-        field.controlSize = .large
-        field.font = .systemFont(ofSize: NSFont.systemFontSize(for: .large))
-        field.stringValue = self.text
-        context.coordinator.didPush(self.text)
-        return field
-    }
-
-    func updateNSView(_ field: NSTextField, context: Context) {
-        if context.coordinator.shouldPush(self.text) {
-            field.stringValue = self.text
-        }
-    }
-
-    final class Coordinator: NSObject, NSTextFieldDelegate {
-        @Binding private var text: String
-        private var lastPushedText: String?
-
-        init(text: Binding<String>) {
-            self._text = text
-        }
-
-        func didPush(_ value: String) {
-            self.lastPushedText = value
-        }
-
-        func shouldPush(_ value: String) -> Bool {
-            guard self.lastPushedText != value else { return false }
-            self.lastPushedText = value
-            return true
-        }
-
-        func receiveExternalChange(_ value: String) {
-            self.lastPushedText = value
-            if self.text != value {
-                self.text = value
-            }
-        }
-
-        func controlTextDidChange(_ notification: Notification) {
-            guard let field = notification.object as? NSTextField else { return }
-            self.lastPushedText = field.stringValue
-            self.text = field.stringValue
-        }
-    }
-}
-
-private final class AutoFillObservingTextField: NSTextField {
-    var onValueChange: ((String) -> Void)?
-
-    override var stringValue: String {
-        didSet { self.onValueChange?(self.stringValue) }
-    }
-
-    override var attributedStringValue: NSAttributedString {
-        didSet { self.onValueChange?(self.stringValue) }
-    }
-}
-
-private final class AutoFillObservingSecureTextField: NSSecureTextField {
-    var onValueChange: ((String) -> Void)?
-
-    override var stringValue: String {
-        didSet { self.onValueChange?(self.stringValue) }
-    }
-
-    override var attributedStringValue: NSAttributedString {
-        didSet { self.onValueChange?(self.stringValue) }
     }
 }
 
