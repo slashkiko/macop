@@ -792,3 +792,12 @@ Action pin updates are automated by `.github/workflows/update-action-pins.yml` (
 - `.pinact.yml` + `make pin-actions` enforce a minimum release age of 7 days when updating action pins.
 - `renovate.json` sets `minimumReleaseAge: 7 days` for GitHub Actions, Swift dependencies, and mise-managed tools.
 - Renovate runs weekly via `.github/workflows/renovate.yml`.
+
+## License
+
+macop is source-available, not open source. You may use macop for personal or
+commercial purposes and redistribute exact, unmodified source or builds. You
+may not modify macop or distribute a modified or derivative version. Normal use
+of documented configuration does not count as modification.
+
+See [LICENSE](LICENSE) for the complete terms.

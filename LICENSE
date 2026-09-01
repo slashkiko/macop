@@ -1,0 +1,85 @@
+Macop Unmodified Use License 1.0
+
+Copyright (c) 2026 slashkiko
+All rights reserved except as expressly granted below.
+
+This is a source-available license. It is not an open-source license.
+
+1. Definitions
+
+"Software" means the macop source code, executable code, documentation, and
+assets made available through this repository, including its Git history,
+except for material that states separate license terms.
+
+"Unmodified Source" means an exact copy of the Software's source form, with no
+change to its contents.
+
+"Unmodified Build" means executable code produced from Unmodified Source solely
+by following the build instructions supplied with the Software. Normal compiler
+output, code signing, notarization, installation, and documented configuration
+do not make a build modified, provided they do not change the Software's source
+or behavior.
+
+2. Permission
+
+Subject to this License, the copyright holder grants you a worldwide,
+royalty-free, non-exclusive license to:
+
+a. copy and use Unmodified Source for any lawful purpose, including commercial
+   use;
+
+b. compile, install, and run Unmodified Builds for any lawful purpose, including
+   commercial use; and
+
+c. redistribute Unmodified Source and Unmodified Builds, with or without a fee,
+   if you include this License and all copyright and attribution notices.
+
+3. Restrictions
+
+You may not:
+
+a. modify, adapt, translate, or create a derivative work of the Software;
+
+b. distribute, sublicense, publish, host, or otherwise provide a modified or
+   derivative version of the Software;
+
+c. remove or alter this License or any copyright or attribution notice; or
+
+d. use the names, logos, or marks of macop or its copyright holder to imply
+   sponsorship, endorsement, or affiliation.
+
+Using documented command-line options, configuration files, environment
+variables, installation paths, credentials, or user data is permitted and does
+not constitute modification. Combining an Unmodified Build with other software
+without changing the Software is also permitted.
+
+4. No Additional Rights
+
+This License is the complete permission grant for the Software. A description,
+plan, comment, commit message, or other statement elsewhere in the repository
+does not grant additional rights or change this License. No patent or trademark
+license is granted except as expressly stated here.
+
+5. Termination
+
+Your rights under this License terminate automatically if you breach its terms.
+After termination, you must stop using and distributing the Software and remove
+copies under your control, except where retention is required by law.
+
+6. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, TITLE, AND NON-INFRINGEMENT. YOU BEAR ALL RISK ARISING FROM USE OR
+DISTRIBUTION OF THE SOFTWARE.
+
+7. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER WILL NOT BE LIABLE
+FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR RELATED TO THE
+SOFTWARE OR ITS USE OR DISTRIBUTION.
+
+8. Severability
+
+If any provision of this License is unenforceable, the remaining provisions
+remain in effect.
