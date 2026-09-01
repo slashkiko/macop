@@ -21,7 +21,7 @@ if [[ "$signing_identity" != "-" ]]; then
     || fail "MACOP_SIGNING_IDENTITY must name a certificate-backed identity or be unset."
 fi
 
-for command in awk codesign cp date head install mktemp mv openssl plutil rm rmdir security sed tr; do
+for command in awk codesign cp date head iconutil install mktemp mv openssl plutil rm rmdir security sed tr; do
   command -v "$command" >/dev/null 2>&1 || fail "required command is unavailable: $command"
 done
 [[ -x /usr/libexec/PlistBuddy ]] || fail "required command is unavailable: /usr/libexec/PlistBuddy"
@@ -69,8 +69,14 @@ destination="$build_dir/MacopAuth.app"
 info_plist="$repo_root/Resources/MacopAuth/Info.plist"
 entitlements_template="$repo_root/Resources/MacopAuth/MacopAuth.entitlements.in"
 localization_root="$repo_root/Resources/MacopAuth"
+iconset="$repo_root/Resources/MacopAuth/MacopAuth.iconset"
 [[ -x "$source_executable" ]] || fail "missing build artifact: $source_executable"
 plutil -lint "$info_plist" >/dev/null
+[[ -d "$iconset" && ! -L "$iconset" ]] || fail "missing or unsafe icon set: $iconset"
+for slot in 16x16 16x16@2x 32x32 32x32@2x 128x128 128x128@2x 256x256 256x256@2x 512x512 512x512@2x; do
+  slot_file="$iconset/icon_$slot.png"
+  [[ -f "$slot_file" && ! -L "$slot_file" ]] || fail "missing or unsafe icon slot: $slot_file"
+done
 plutil -lint "$entitlements_template" >/dev/null
 for language in ja en; do
   strings_file="$localization_root/$language.lproj/Localizable.strings"
@@ -105,6 +111,11 @@ trap cleanup EXIT
 install -d -m 755 "$staged/Contents/MacOS"
 install -m 644 "$info_plist" "$staged/Contents/Info.plist"
 install -m 755 "$source_executable" "$staged/Contents/MacOS/MacopAuth"
+install -d -m 755 "$staged/Contents/Resources"
+# Every slot is rendered from design/icon at its own size, so the .icns is
+# assembled here rather than checked in as a binary.
+iconutil --convert icns --output "$staged/Contents/Resources/MacopAuth.icns" "$iconset"
+chmod 644 "$staged/Contents/Resources/MacopAuth.icns"
 for language in ja en; do
   install -d -m 755 "$staged/Contents/Resources/$language.lproj"
   install -m 644 \

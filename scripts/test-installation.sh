@@ -115,6 +115,9 @@ for language in ja en; do
   test -f "$strings_file"
   plutil -lint "$strings_file" >/dev/null
 done
+test -f "$bin_dir/MacopAuth.app/Contents/Resources/MacopAuth.icns"
+test "$(plutil -extract 'CFBundleIconFile' raw "$bin_dir/MacopAuth.app/Contents/Info.plist")" = "MacopAuth"
+test "$(plutil -extract 'LSUIElement' raw "$bin_dir/MacopAuth.app/Contents/Info.plist")" = "false"
 test "$(plutil -extract 'CFBundleLocalizations.0' raw "$bin_dir/MacopAuth.app/Contents/Info.plist")" = "ja"
 test "$(plutil -extract 'CFBundleLocalizations.1' raw "$bin_dir/MacopAuth.app/Contents/Info.plist")" = "en"
 test -f "$bin_dir/macop-install-manifest.json"

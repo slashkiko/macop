@@ -14,3 +14,7 @@ Package.resolved
 *.xcodeproj
 !Resources/ProfileBootstrap/MacopProfileBootstrap.xcodeproj/
 !Resources/ProfileBootstrap/MacopProfileBootstrap.xcodeproj/project.pbxproj
+
+# design/icon working files
+design/icon/__pycache__/
+design/icon/.jobs.json
