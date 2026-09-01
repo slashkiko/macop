@@ -124,6 +124,8 @@ only one exact secret-data query. Use a stable signing identity and an explicit
 item ACL decision for repeatable local authorization; use `macop doctor` to
 inspect prerequisites without printing secrets.
 
+## `op` compatibility
+
 For daily interactive use, an alias is the least surprising option:
 
 ```zsh
@@ -776,10 +778,12 @@ CI is split into path-scoped workflows:
   - Triggered only when workflow/governance files change
   - Runs `pin-actions-check`, `workflow-lint`, `workflow-security`
 - `.github/workflows/secret-scan.yml`
-  - Triggered only when configured source/config files change
+  - Triggered for every pull request and every push to `main`
   - Runs `betterleaks`
 
-All workflows use `jdx/mise-action` and SHA-pinned actions. Swift workflows use `actions/cache` for `.build` and `.swiftpm`.
+Workflows that run mise-managed tools use `jdx/mise-action`. All third-party
+actions are SHA-pinned. Swift workflows use `actions/cache` for `.build` and
+`.swiftpm`; the scheduled Renovate workflow runs its pinned action directly.
 
 Action pin updates are automated by `.github/workflows/update-action-pins.yml` (weekly + manual dispatch), which runs `pinact` and opens a PR with updated SHAs.
 

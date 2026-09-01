@@ -1161,7 +1161,7 @@ private func authBrokerSelftests() throws {
     let decodedSignedResponse = try AuthBrokerWire.takeFrame(from: &signedResponseFrame)
     try expect(
         decodedSignedResponse == .sshSignResponse(signedResponse),
-        "broker v5 must round-trip a typed successful SSH signing response"
+        "broker protocol must round-trip a typed successful SSH signing response"
     )
     for outcome in [
         AuthBrokerSSHSignOutcome.requesterInvalid,
@@ -1177,7 +1177,7 @@ private func authBrokerSelftests() throws {
         let decodedFailureResponse = try AuthBrokerWire.takeFrame(from: &frame)
         try expect(
             decodedFailureResponse == .sshSignResponse(response),
-            "broker v5 must round-trip every closed, secret-free SSH signing failure"
+            "broker protocol must round-trip every closed, secret-free SSH signing failure"
         )
     }
     for contradictory in [
@@ -1557,7 +1557,7 @@ private func authBrokerSelftests() throws {
     let decodedIndeterminateImport = try AuthBrokerWire.takeFrame(from: &indeterminateImportFrame)
     try expect(
         decodedIndeterminateImport == .managedKeychainImportResponse(indeterminateImport),
-        "broker v5 must preserve server-side post-mutation uncertainty"
+        "broker protocol must preserve server-side post-mutation uncertainty"
     )
     let passwordAutoFillRequest = AuthBrokerApprovalRequest(
         requestID: UUID(),
@@ -1607,7 +1607,7 @@ private func authBrokerSelftests() throws {
     let decodedPasswordAutoFillResponse = try AuthBrokerWire.takeFrame(from: &passwordAutoFillResponseFrame)
     try expect(
         decodedPasswordAutoFillResponse == .approvalResponse(passwordAutoFillResponse),
-        "Password AutoFill username attestation must round-trip in broker v5"
+        "Password AutoFill username attestation must round-trip in the broker protocol"
     )
     let validAutoFillOutcomes: [(String, OSStatus, PasswordAutoFillSaveStatus)] = [
         ("saved", errSecSuccess, .saved),

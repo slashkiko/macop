@@ -289,7 +289,7 @@ macop item delete LegacyGitHub
 
 `account`はwell-known `username` field、Keychain secret dataは`password` fieldとして解決する。従来の`token`と明示設定されたcustom fieldはsecret dataへ後方互換で解決する。Passwords AutoFillはusername/passwordの両方を確認し、username欠落時は明示入力、設定accountとの不一致は拒否する。
 
-Passwords AutoFillのusernameはbroker protocol v4の専用capabilityとresponse fieldで返す。read/run/inject/profile/item acquireと生成保存の承認用途はclosed wire enumとしてoperationとの一致を検証し、任意文字列をnative UIへ表示しない。managed mutationはcommitted/failed/indeterminateをwire上で区別し、AutoFill保存結果も不明時に`save_failed`と断定しない。送信後はresponse ID/type、username、save outcome、OSStatusの組合せをclosed contractとして検証し、矛盾・decode失敗・応答喪失は選択または保存済みの可能性を保つtyped indeterminateとしてcredentialを使用しない。native UIは既知の保存状態とCLIへのresponse delivery確認を分けて表示する。旧protocol companionはhandshakeで拒否し、CLI側でconfig accountをusernameとして捏造しない。
+Passwords AutoFillのusernameはbroker protocol v9の専用capabilityとresponse fieldで返す。read/run/inject/profile/item acquireと生成保存の承認用途はclosed wire enumとしてoperationとの一致を検証し、任意文字列をnative UIへ表示しない。managed mutationはcommitted/failed/indeterminateをwire上で区別し、AutoFill保存結果も不明時に`save_failed`と断定しない。送信後はresponse ID/type、username、save outcome、OSStatusの組合せをclosed contractとして検証し、矛盾・decode失敗・応答喪失は選択または保存済みの可能性を保つtyped indeterminateとしてcredentialを使用しない。native UIは既知の保存状態とCLIへのresponse delivery確認を分けて表示する。旧protocol companionはhandshakeで拒否し、CLI側でconfig accountをusernameとして捏造しない。
 
 `generate password`は`SecRandomCopyBytes`とrejection samplingを使う。legacyの`item generate`はselectorのzero-match preflight、追加時persistent reference、exact-one postflightを要求し、競合時は追加したreferenceだけをrollbackする。reference欠落またはrollback未確認はorphanの可能性を含むindeterminate stateとして、broad deleteをせずreconciliationを案内する。`item generate --replace`はexact-one updateとして、生成値をstdoutへ返さずKeychain mutationまたはmanaged authorization境界へ直接渡す。
 
@@ -420,7 +420,7 @@ op vault list --format=json
     "code": "unsupported_command",
     "command": "vault list",
     "message": "macop does not provide a vault or cloud account backend",
-    "documentation": "https://github.com/<owner>/macop#op-compatibility"
+    "documentation": "https://github.com/slashkiko/macop#op-compatibility"
   }
 }
 ```
