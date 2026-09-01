@@ -29,6 +29,14 @@ export SHELL=/bin/zsh
 mkdir -p "$HOME" "$bin_dir"
 chmod 700 "$fixture_root" "$bin_dir"
 
+detected_parallel_limit="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '4\n')"
+parallel_limit="${MACOP_INSTALL_TEST_JOBS:-$detected_parallel_limit}"
+[[ "$parallel_limit" =~ ^[1-9][0-9]*$ ]] \
+  || { printf 'MACOP_INSTALL_TEST_JOBS must be a positive integer\n' >&2; exit 1; }
+if ((parallel_limit > 8)); then
+  parallel_limit=8
+fi
+
 # Recursive removal atomically retires the public leaf and traverses only the
 # opened inode. Darwin cannot unlink an opened directory by descriptor, so the
 # safe terminal state is an empty random tombstone rather than a pathname-based
@@ -75,6 +83,10 @@ assert_generation() {
   assert_generation_at "$bin_dir" "$1"
 }
 
+generation_at() {
+  sed -n 's/^  "build_generation": "\([^"]*\)",$/\1/p' "$1/macop-install-manifest.json"
+}
+
 clone_generation() {
   local label="$1" case_root="$fixture_root/parallel-$1" case_bin
   case_bin="$case_root/bin"
@@ -92,6 +104,19 @@ wait_for_parallel_jobs() {
     fi
   done
   test "$failed" -eq 0
+}
+
+flush_parallel_jobs_if_full() {
+  if ((${#parallel_pids[@]} >= parallel_limit)); then
+    wait_for_parallel_jobs "${parallel_pids[@]}"
+    parallel_pids=()
+  fi
+}
+
+queue_parallel_job() {
+  "$@" &
+  parallel_pids+=("$!")
+  flush_parallel_jobs_if_full
 }
 
 assert_capability_contract() {
@@ -206,6 +231,7 @@ for legacy_protocol in 4 5 7 8; do
     assert_generation_at "$case_bin" old
   ) &
   parallel_pids+=("$!")
+  flush_parallel_jobs_if_full
 done
 wait_for_parallel_jobs "${parallel_pids[@]}"
 
@@ -231,15 +257,13 @@ for point in \
     assert_generation_at "$case_bin" old
   ) &
   parallel_pids+=("$!")
-  if [[ "${#parallel_pids[@]}" -eq 4 ]]; then
-    wait_for_parallel_jobs "${parallel_pids[@]}"
-    parallel_pids=()
-  fi
+  flush_parallel_jobs_if_full
 done
 wait_for_parallel_jobs "${parallel_pids[@]}"
 
 # HUP, INT, and TERM at a publish boundary all take the EXIT rollback path.
-for signal_name in HUP INT TERM; do
+assert_signal_rollback() {
+  local signal_name="$1" case_bin case_status
   case_bin="$(clone_generation "signal-$signal_name")"
   set +e
   MACOP_INSTALL_BUILD_GENERATION=new MACOP_INSTALL_SIGNAL_FAILPOINT=publish-agent-after \
@@ -249,7 +273,18 @@ for signal_name in HUP INT TERM; do
   set -e
   test "$case_status" -ne 0
   assert_generation_at "$case_bin" old
+}
+parallel_pids=()
+for signal_name in HUP TERM; do
+  (assert_signal_rollback "$signal_name") &
+  parallel_pids+=("$!")
+  flush_parallel_jobs_if_full
 done
+# Bash starts asynchronous commands with SIGINT ignored, so the INT fixture
+# must remain a foreground child even while the independently trapped signals
+# run in parallel.
+assert_signal_rollback INT
+wait_for_parallel_jobs "${parallel_pids[@]}"
 
 # An absent destination must be removed, not recreated, if its first install
 # fails after publication.
@@ -340,13 +375,11 @@ start_release_owner() {
 }
 
 assert_release_handoff() {
-  local owner="$1" case_root case_state log before_log after_log contender_log third_log state_id new_lock_id new_lock_pid
-  case_root="$fixture_root/release-handoff-$owner"
-  mkdir -p "$case_root/bin"
-  chmod 700 "$case_root" "$case_root/bin"
+  local owner="$1" case_root case_state case_bin log before_log after_log contender_log third_log state_id new_lock_id new_lock_pid
   saved_bin_dir="$bin_dir"
-  bin_dir="$case_root/bin"
-  install_generation "handoff-$owner-initial"
+  case_bin="$(clone_generation "release-handoff-$owner")"
+  case_root="${case_bin%/bin}"
+  bin_dir="$case_bin"
   case_state="$bin_dir/.macop-install-state"
 
   # The visible lock still contains the owner's PID at retire-before.
@@ -420,19 +453,19 @@ start_owner_record_window() {
 # not a stale-lock recovery opportunity: contender transactions must retain the
 # empty lock as evidence until the creating process records its ownership.
 assert_pidless_lock_window() {
-  local owner="$1" case_root case_state owner_log installer_log uninstaller_log state_id lock_id
-  case_root="$fixture_root/pidless-lock-$owner"
-  mkdir -p "$case_root/bin"
-  chmod 700 "$case_root" "$case_root/bin"
+  local owner="$1" case_root case_state case_bin initial_generation owner_log installer_log uninstaller_log state_id lock_id
   saved_bin_dir="$bin_dir"
-  bin_dir="$case_root/bin"
-  install_generation "pidless-$owner-initial"
+  case_bin="$(clone_generation "pidless-lock-$owner")"
+  case_root="${case_bin%/bin}"
+  bin_dir="$case_bin"
+  initial_generation="$(generation_at "$bin_dir")"
+  test -n "$initial_generation"
   case_state="$bin_dir/.macop-install-state"
 
   owner_log="$fixture_root/pidless-lock-$owner-owner.out"
   start_owner_record_window "$owner" 45 "pidless-$owner-owner" "$owner_log"
   wait_for_release_pause "$owner_log" "pause at $owner-after-lock-mkdir"
-  assert_generation "pidless-$owner-initial"
+  assert_generation "$initial_generation"
   state_id="$(python3 scripts/install-fs.py id "$case_state")"
   lock_id="$(python3 scripts/install-fs.py child-id "$case_state" "$state_id" lock dir)"
   python3 scripts/install-fs.py absent-child "$case_state" "$state_id" lock "$lock_id" pid
@@ -471,22 +504,24 @@ assert_pidless_lock_window() {
 
 parallel_pids=()
 (assert_release_handoff installer) & parallel_pids+=("$!")
+flush_parallel_jobs_if_full
 (assert_release_handoff uninstaller) & parallel_pids+=("$!")
+flush_parallel_jobs_if_full
 (assert_pidless_lock_window installer) & parallel_pids+=("$!")
+flush_parallel_jobs_if_full
 (assert_pidless_lock_window uninstaller) & parallel_pids+=("$!")
+flush_parallel_jobs_if_full
 wait_for_parallel_jobs "${parallel_pids[@]}"
 
 # SIGKILL during the uninstaller's release trap leaves a complete numeric PID
 # record. The next uninstaller must retire that exact dead-owner lock and
 # finish normally without weakening the PID-less fail-closed window above.
 assert_stale_uninstaller_lock_recovery() {
-  local case_root case_state log owner_pid saved_bin_dir
-  case_root="$fixture_root/stale-uninstaller-lock"
-  mkdir -p "$case_root/bin"
-  chmod 700 "$case_root" "$case_root/bin"
+  local case_root case_state case_bin log owner_pid saved_bin_dir
   saved_bin_dir="$bin_dir"
-  bin_dir="$case_root/bin"
-  install_generation stale-uninstaller-initial
+  case_bin="$(clone_generation stale-uninstaller-lock)"
+  case_root="${case_bin%/bin}"
+  bin_dir="$case_bin"
   case_state="$bin_dir/.macop-install-state"
   log="$fixture_root/stale-uninstaller-lock.out"
   MACOP_INSTALL_TEST_MODE=1 \
@@ -513,49 +548,54 @@ assert_stale_uninstaller_lock_recovery() {
   bin_dir="$saved_bin_dir"
 }
 
-assert_stale_uninstaller_lock_recovery
-
 # SIGKILL bypasses traps. A subsequent installer reclaims the stale lock and
 # recovers the durable journal before publishing one complete generation.
-set +e
-MACOP_INSTALL_TEST_MODE=1 MACOP_INSTALL_BUILD_GENERATION=new \
-  MACOP_INSTALL_SIGNAL_FAILPOINT=backup-agent-after \
-  MACOP_INSTALL_SIGNAL=KILL bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$bin_dir" \
-  >"$fixture_root/signal-KILL.out" 2>"$fixture_root/signal-KILL.err"
-status=$?
-set -e
-test "$status" -ne 0
-set +e
-install_generation after-kill
-status=$?
-set -e
-test "$status" -eq 0
-assert_generation after-kill
+assert_crash_and_terminal_recovery() {
+  local case_bin saved_bin_dir status terminal_state terminal_journal
+  saved_bin_dir="$bin_dir"
+  case_bin="$(clone_generation crash-terminal-recovery)"
+  bin_dir="$case_bin"
+  set +e
+  MACOP_INSTALL_TEST_MODE=1 MACOP_INSTALL_BUILD_GENERATION=new \
+    MACOP_INSTALL_SIGNAL_FAILPOINT=backup-agent-after \
+    MACOP_INSTALL_SIGNAL=KILL bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$bin_dir" \
+    >"$fixture_root/signal-KILL.out" 2>"$fixture_root/signal-KILL.err"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  set +e
+  install_generation after-kill
+  status=$?
+  set -e
+  test "$status" -eq 0
+  assert_generation after-kill
 
-# Terminal journals are cleanup work, not recovery ambiguity. A committed
-# journal may coexist with its still-public pending marker if power is lost in
-# the narrow commit-cleanup window; the next installer must finish that commit.
-terminal_state="$bin_dir/.macop-install-state"
-terminal_journal="$terminal_state/journal.committed-fixture"
-mkdir -m 700 "$terminal_journal"
-printf 'committed\n' >"$terminal_journal/COMMITTED"
-chmod 600 "$terminal_journal/COMMITTED"
-printf 'schema=1\nnonce=test\njournal=%s\nstate_device=%s\nstate_inode=%s\n' \
-  "$(cd "$terminal_journal" && pwd -P)" "$(stat -f '%d' "$terminal_state")" "$(stat -f '%i' "$terminal_state")" \
-  >"$terminal_state/pending"
-chmod 600 "$terminal_state/pending"
-install_generation after-committed-recovery
-assert_generation after-committed-recovery
-test ! -e "$terminal_journal"
-test ! -e "$terminal_state/pending"
+  # Terminal journals are cleanup work, not recovery ambiguity. A committed
+  # journal may coexist with its still-public pending marker if power is lost
+  # in the narrow commit-cleanup window; the next installer finishes it.
+  terminal_state="$bin_dir/.macop-install-state"
+  terminal_journal="$terminal_state/journal.committed-fixture"
+  mkdir -m 700 "$terminal_journal"
+  printf 'committed\n' >"$terminal_journal/COMMITTED"
+  chmod 600 "$terminal_journal/COMMITTED"
+  printf 'schema=1\nnonce=test\njournal=%s\nstate_device=%s\nstate_inode=%s\n' \
+    "$(cd "$terminal_journal" && pwd -P)" "$(stat -f '%d' "$terminal_state")" "$(stat -f '%i' "$terminal_state")" \
+    >"$terminal_state/pending"
+  chmod 600 "$terminal_state/pending"
+  install_generation after-committed-recovery
+  assert_generation after-committed-recovery
+  test ! -e "$terminal_journal"
+  test ! -e "$terminal_state/pending"
 
-terminal_journal="$terminal_state/journal.rolled-back-fixture"
-mkdir -m 700 "$terminal_journal"
-printf 'rolled-back\n' >"$terminal_journal/ROLLED_BACK"
-chmod 600 "$terminal_journal/ROLLED_BACK"
-install_generation after-rolled-back-recovery
-assert_generation after-rolled-back-recovery
-test ! -e "$terminal_journal"
+  terminal_journal="$terminal_state/journal.rolled-back-fixture"
+  mkdir -m 700 "$terminal_journal"
+  printf 'rolled-back\n' >"$terminal_journal/ROLLED_BACK"
+  chmod 600 "$terminal_journal/ROLLED_BACK"
+  install_generation after-rolled-back-recovery
+  assert_generation after-rolled-back-recovery
+  test ! -e "$terminal_journal"
+  bin_dir="$saved_bin_dir"
+}
 
 # A pathname swap between phase checks must not authorize a mutation in the
 # replacement tree.  Exercise staging, backup, publish, rollback, and cleanup
@@ -564,13 +604,10 @@ test ! -e "$terminal_journal"
 # it, the next installer performs normal journal recovery.
 exercise_substitution() {
   local phase="$1" target="$2" failpoint="${3:-}" case_root case_bin retained retained_pending sentinel_path log pid ready=false
-  case_root="$fixture_root/substitution-${phase//[:]/-}-${target}"
-  case_bin="$case_root/bin"
-  mkdir -p "$case_bin"
-  chmod 700 "$case_root" "$case_bin"
   saved_bin_dir="$bin_dir"
+  case_bin="$(clone_generation "substitution-${phase//[:]/-}-${target}")"
+  case_root="${case_bin%/bin}"
   bin_dir="$case_bin"
-  install_generation "substitute-${phase}-old"
   log="$fixture_root/substitution-${phase//[:]/-}-${target}.out"
   MACOP_INSTALL_TEST_MODE=1 MACOP_INSTALL_BUILD_GENERATION="substitute-${phase}-new" \
     MACOP_INSTALL_TEST_PAUSE_AT="$phase" MACOP_INSTALL_TEST_PAUSE_SECONDS=4 \
@@ -630,110 +667,123 @@ queue_substitution_case() {
   local name="$1"
   shift
   run_substitution_case "$name" || return 0
-  (exercise_substitution "$@") &
-  parallel_pids+=("$!")
-  if [[ "${#parallel_pids[@]}" -eq 4 ]]; then
-    wait_for_parallel_jobs "${parallel_pids[@]}"
-    parallel_pids=()
-  fi
+  queue_parallel_job exercise_substitution "$@"
 }
-parallel_pids=()
-queue_substitution_case staging staging root
-queue_substitution_case backup-macop backup-macop state
-queue_substitution_case publish-macop publish-macop root
-queue_substitution_case rollback-manifest rollback-manifest state publish-macop-after
-queue_substitution_case cleanup cleanup root
-wait_for_parallel_jobs "${parallel_pids[@]}"
 
 # A crash after one or more rollback restores is intentionally not guessed at:
 # its publish phase no longer identifies which backups remain authoritative.
 # Keep the pending evidence and reject every future installer attempt until a
 # human repairs it, rather than deleting a possibly new destination.
-rollback_partial_bin="$fixture_root/rollback-partial/bin"
-mkdir -p "$rollback_partial_bin"
-chmod 700 "$fixture_root/rollback-partial" "$rollback_partial_bin"
-saved_bin_dir="$bin_dir"
-bin_dir="$rollback_partial_bin"
-install_generation rollback-partial-old
-MACOP_INSTALL_TEST_MODE=1 MACOP_INSTALL_BUILD_GENERATION=rollback-partial-new \
-  MACOP_INSTALL_FAILPOINT=publish-macop-after MACOP_INSTALL_TEST_PAUSE_AT=rollback-macop \
-  MACOP_INSTALL_TEST_PAUSE_SECONDS=4 \
-  bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$bin_dir" \
-    >"$fixture_root/rollback-partial.out" 2>&1 &
-rollback_partial_pid=$!
-rollback_partial_ready=false
-for _ in $(seq 1 600); do
-  if grep -Fq 'macop install test: pause at rollback-macop' "$fixture_root/rollback-partial.out" 2>/dev/null; then
-    rollback_partial_ready=true
-    break
+assert_partial_rollback_recovery() {
+  local rollback_partial_bin saved_bin_dir rollback_partial_pid rollback_partial_ready=false status
+  saved_bin_dir="$bin_dir"
+  rollback_partial_bin="$(clone_generation rollback-partial)"
+  bin_dir="$rollback_partial_bin"
+  MACOP_INSTALL_TEST_MODE=1 MACOP_INSTALL_BUILD_GENERATION=rollback-partial-new \
+    MACOP_INSTALL_FAILPOINT=publish-macop-after MACOP_INSTALL_TEST_PAUSE_AT=rollback-macop \
+    MACOP_INSTALL_TEST_PAUSE_SECONDS=4 \
+    bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$bin_dir" \
+      >"$fixture_root/rollback-partial.out" 2>&1 &
+  rollback_partial_pid=$!
+  for _ in $(seq 1 600); do
+    if grep -Fq 'macop install test: pause at rollback-macop' "$fixture_root/rollback-partial.out" 2>/dev/null; then
+      rollback_partial_ready=true
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "$rollback_partial_ready" != true ]]; then
+    set +e
+    wait "$rollback_partial_pid"
+    status=$?
+    set -e
+    tail -40 "$fixture_root/rollback-partial.out" >&2 || true
+    printf 'rollback-partial fixture did not reach rollback-macop pause (exit %s)\n' "$status" >&2
+    return 1
   fi
-  sleep 0.1
-done
-if [[ "$rollback_partial_ready" != true ]]; then
+  # Kill at the paused restore boundary: this is the ambiguous journal state
+  # the recovery matrix must retain for manual repair, never guess through.
+  kill -KILL "$rollback_partial_pid"
   set +e
   wait "$rollback_partial_pid"
   status=$?
   set -e
-  tail -40 "$fixture_root/rollback-partial.out" >&2 || true
-  printf 'rollback-partial fixture did not reach rollback-macop pause (exit %s)\n' "$status" >&2
-  exit 1
-fi
-# Kill at the paused restore boundary: this is the ambiguous journal state the
-# recovery matrix must retain for manual repair, never guess through.
-kill -KILL "$rollback_partial_pid"
-set +e
-wait "$rollback_partial_pid"
-status=$?
-set -e
-test "$status" -ne 0
-test -f "$bin_dir/.macop-install-state/pending"
-set +e
-install_generation rollback-partial-retry >"$fixture_root/rollback-partial-retry.out" 2>&1
-status=$?
-set -e
-test "$status" -ne 0
-grep -Fq 'interrupted transaction journal is malformed or ambiguous' "$fixture_root/rollback-partial-retry.out"
-test -f "$bin_dir/.macop-install-state/pending"
-bin_dir="$saved_bin_dir"
+  test "$status" -ne 0
+  test -f "$bin_dir/.macop-install-state/pending"
+  set +e
+  install_generation rollback-partial-retry >"$fixture_root/rollback-partial-retry.out" 2>&1
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Fq 'interrupted transaction journal is malformed or ambiguous' "$fixture_root/rollback-partial-retry.out"
+  test -f "$bin_dir/.macop-install-state/pending"
+  bin_dir="$saved_bin_dir"
+}
 
 # A caller-controlled VERIFY_* environment never bypasses a pending marker;
 # only the inherited installer descriptor can run its exact doctor probe. With
 # no live installer lock, the operator is told to recover instead of waiting.
-printf 'pending\n' >"$bin_dir/.macop-install-state/pending"
-printf 'state=%s\nexecutable=%s\nnonce=test\n' "$bin_dir/.macop-install-state" "$bin_dir/macop" \
-  >"$bin_dir/.macop-install-state/guard-capability"
-guard_fd=9
-exec 9<"$bin_dir/.macop-install-state/guard-capability"
-set +e
-MACOP_INSTALL_VERIFY_FD="$guard_fd" "$bin_dir/macop" doctor >"$fixture_root/guard.out" 2>&1
-status=$?
-set -e
-test "$status" -ne 0
-grep -Fq 'installation recovery is required' "$fixture_root/guard.out"
-exec 9<&-
-rm -f -- "$bin_dir/.macop-install-state/guard-capability"
-rm -f -- "$bin_dir/.macop-install-state/pending"
+assert_guard_capability_rejection() {
+  local case_bin saved_bin_dir guard_fd status
+  saved_bin_dir="$bin_dir"
+  case_bin="$(clone_generation guard-capability)"
+  bin_dir="$case_bin"
+  printf 'pending\n' >"$bin_dir/.macop-install-state/pending"
+  printf 'state=%s\nexecutable=%s\nnonce=test\n' "$bin_dir/.macop-install-state" "$bin_dir/macop" \
+    >"$bin_dir/.macop-install-state/guard-capability"
+  guard_fd=9
+  exec 9<"$bin_dir/.macop-install-state/guard-capability"
+  set +e
+  MACOP_INSTALL_VERIFY_FD="$guard_fd" "$bin_dir/macop" doctor >"$fixture_root/guard.out" 2>&1
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Fq 'installation recovery is required' "$fixture_root/guard.out"
+  exec 9<&-
+  rm -f -- "$bin_dir/.macop-install-state/guard-capability"
+  rm -f -- "$bin_dir/.macop-install-state/pending"
+  bin_dir="$saved_bin_dir"
+}
 
 # Recovery never guesses from an incomplete, unknown, or truncated schema.
 # The existing generation is left untouched and the pending evidence remains
 # for manual repair rather than authorizing a destructive rollback.
-saved_bin_dir="$bin_dir"
-bin_dir="$fixture_root/corrupt/bin"
-mkdir -p "$bin_dir"
-chmod 700 "$fixture_root/corrupt" "$bin_dir"
-install_generation corrupt-old
-mkdir "$bin_dir/.macop-install-state/journal.corrupt"
-chmod 700 "$bin_dir/.macop-install-state/journal.corrupt"
-printf 'pending\n' >"$bin_dir/.macop-install-state/journal.corrupt/PENDING"
-printf 'pending\n' >"$bin_dir/.macop-install-state/pending"
-set +e
-install_generation corrupt-new >"$fixture_root/corrupt.out" 2>&1
-status=$?
-set -e
-test "$status" -ne 0
-assert_generation corrupt-old
-test -f "$bin_dir/.macop-install-state/journal.corrupt/PENDING"
-test -f "$bin_dir/.macop-install-state/pending"
-bin_dir="$saved_bin_dir"
+assert_corrupt_journal_rejection() {
+  local case_bin initial_generation saved_bin_dir status
+  saved_bin_dir="$bin_dir"
+  case_bin="$(clone_generation corrupt-journal)"
+  bin_dir="$case_bin"
+  initial_generation="$(generation_at "$bin_dir")"
+  test -n "$initial_generation"
+  mkdir "$bin_dir/.macop-install-state/journal.corrupt"
+  chmod 700 "$bin_dir/.macop-install-state/journal.corrupt"
+  printf 'pending\n' >"$bin_dir/.macop-install-state/journal.corrupt/PENDING"
+  printf 'pending\n' >"$bin_dir/.macop-install-state/pending"
+  set +e
+  install_generation corrupt-new >"$fixture_root/corrupt.out" 2>&1
+  status=$?
+  set -e
+  test "$status" -ne 0
+  assert_generation "$initial_generation"
+  test -f "$bin_dir/.macop-install-state/journal.corrupt/PENDING"
+  test -f "$bin_dir/.macop-install-state/pending"
+  bin_dir="$saved_bin_dir"
+}
+
+# These recovery scenarios operate on disjoint fixture roots. Queue them with
+# the substitution matrix so the process cap applies across the entire tail of
+# the suite rather than serializing independent crash and corruption checks.
+parallel_pids=()
+queue_parallel_job assert_stale_uninstaller_lock_recovery
+queue_parallel_job assert_crash_and_terminal_recovery
+queue_substitution_case staging staging root
+queue_substitution_case backup-macop backup-macop state
+queue_substitution_case publish-macop publish-macop root
+queue_substitution_case rollback-manifest rollback-manifest state publish-macop-after
+queue_substitution_case cleanup cleanup root
+queue_parallel_job assert_partial_rollback_recovery
+queue_parallel_job assert_guard_capability_rejection
+queue_parallel_job assert_corrupt_journal_rejection
+wait_for_parallel_jobs "${parallel_pids[@]}"
 
 printf '%s\n' 'installer transaction failpoint fixture passed'
