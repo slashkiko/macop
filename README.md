@@ -801,3 +801,7 @@ may not modify macop or distribute a modified or derivative version. Normal use
 of documented configuration does not count as modification.
 
 See [LICENSE](LICENSE) for the complete terms.
+
+External contributions and modified versions are not accepted under this
+license. Security reports are still welcome through the private reporting
+channel described in [.github/SECURITY.md](.github/SECURITY.md).

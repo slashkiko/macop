@@ -22,5 +22,4 @@ build and test fixtures only.
   `.swiftlint.yml`; run them rather than reformatting by hand.
 - Shell scripts under `scripts/` are `set -euo pipefail` and fail through a
   `fail()` helper. Match that.
-- Do not put Apple's logo, the bitten-apple silhouette, or copies of Apple's
-  wallpaper artwork into the product or its icon.
+- Do not put third-party logos or artwork into the product or its icon.
