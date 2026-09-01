@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -200 1186 292" width="1186" height="292" role="img" aria-label="macop">
+  <g fill="none" stroke="currentColor" stroke-width="40.0" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 20.0 0 V -118.0 A 62.0 62.0 0 0 1 144.0 -118.0 V 0"/>
+    <path d="M 144.0 -118.0 A 62.0 62.0 0 0 1 268.0 -118.0 V 0"/>
+    <path d="M 338.0 -100.0 a 80.0 80.0 0 1 0 160.0 0 a 80.0 80.0 0 1 0 -160.0 0"/>
+    <path d="M 498.0 -180.0 V 0"/>
+    <path d="M 693.253 -163.041 A 80.0 80.0 0 1 0 693.253 -36.959"/>
+    <path d="M 772.0 -100.0 a 80.0 80.0 0 1 0 160.0 0 a 80.0 80.0 0 1 0 -160.0 0"/>
+    <path d="M 1006.0 -100.0 a 80.0 80.0 0 1 0 160.0 0 a 80.0 80.0 0 1 0 -160.0 0"/>
+    <path d="M 1006.0 -180.0 V 72.0"/>
+  </g>
+</svg>

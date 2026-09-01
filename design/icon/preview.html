@@ -1,0 +1,73 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>macop — logo</title>
+<style>
+  :root{--bg:#EEF0F4;--card:#fff;--ink:#161A24;--mut:#79829A;--line:#E1E5EC}
+  @media (prefers-color-scheme:dark){:root{--bg:#101319;--card:#181C25;--ink:#EEF1F6;--mut:#8B94A8;--line:#262C38}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);padding:40px 28px 72px;
+       font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+  .wrap{max-width:1060px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 4px;letter-spacing:-.01em}
+  p.sub{margin:0 0 32px;color:var(--mut)}
+  section{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:26px 28px;margin-bottom:20px}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--mut);margin:0 0 20px;font-weight:600}
+  .row{display:flex;align-items:flex-end;gap:30px;flex-wrap:wrap}
+  .cell{display:flex;flex-direction:column;align-items:center;gap:9px}
+  .cell small{color:var(--mut);font-variant-numeric:tabular-nums}
+  img{display:block;image-rendering:auto}
+  .plate{border-radius:12px;padding:26px 30px;display:flex;align-items:center;justify-content:center}
+  .light{background:#F6F7FA}.dark{background:#161A24}
+  .sw{display:flex;gap:14px;flex-wrap:wrap}
+  .sw div{width:132px;border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:12px}
+  .sw i{display:block;height:56px}.sw b{display:block;padding:8px 10px 2px;font-weight:600}
+  .sw span{display:block;padding:0 10px 9px;color:var(--mut);font-variant-numeric:tabular-nums}
+</style>
+<div class="wrap">
+<h1>macop</h1>
+<p class="sub">“Enclave” — an Apple-silicon die holding a warded keyway, seen through smoked glass. Secrets bound to the hardware, not to a file.</p>
+
+<section><h2>App icon</h2><div class="row">
+  <div class="cell"><img src="png/macop-icon-512.png" width="256"><small>1024 / 512</small></div>
+  <div class="cell"><img src="png/macop-icon-128.png" width="128"><small>128</small></div>
+  <div class="cell"><img src="png/macop-icon-64.png" width="64"><small>64</small></div>
+  <div class="cell"><img src="png/macop-icon-32.png" width="32"><small>32</small></div>
+  <div class="cell"><img src="png/macop-icon-16.png" width="16"><small>16</small></div>
+</div></section>
+
+<section><h2>Neutral field</h2><div class="row">
+  <div class="cell"><img src="png/themes/spacegrey-256.png" width="108"><small>spacegrey</small></div>
+</div></section>
+
+<section><h2>Lockup</h2>
+  <div class="plate light"><img src="png/macop-lockup-1600.png" width="620"></div>
+  <div style="height:14px"></div>
+  <div class="plate dark"><img src="png/macop-lockup-1600-reversed.png" width="620"></div>
+</section>
+
+<section><h2>Stacked lockup &amp; wordmark</h2><div class="row">
+  <div class="plate light"><img src="png/macop-lockup-stacked-900.png" width="220"></div>
+  <div class="plate light" style="flex:1"><img src="png/macop-wordmark-1200.png" width="420"></div>
+</div></section>
+
+<section><h2>Monochrome mark — menu bar / template</h2><div class="row">
+  <div class="plate light"><div class="row">
+    <div class="cell"><img src="png/macop-mark-mono-dark-512.png" width="96"><small>96</small></div>
+    <div class="cell"><img src="png/macop-mark-mono-dark-512.png" width="44"><small>44</small></div>
+    <div class="cell"><img src="png/macop-mark-mono-dark-512.png" width="22"><small>22</small></div>
+  </div></div>
+  <div class="plate dark"><div class="row">
+    <div class="cell"><img src="png/macop-mark-mono-light-512.png" width="96"><small>&nbsp;</small></div>
+    <div class="cell"><img src="png/macop-mark-mono-light-512.png" width="44"><small>&nbsp;</small></div>
+    <div class="cell"><img src="png/macop-mark-mono-light-512.png" width="22"><small>&nbsp;</small></div>
+  </div></div>
+</div></section>
+
+<section><h2>Palette</h2><div class="sw">
+  <div><i style="background:linear-gradient(#55585F,#1F2024)"></i><b>Sky</b><span>spacegrey</span></div>
+  <div><i style="background:linear-gradient(rgba(11,13,18,.44),rgba(11,13,18,.44)),linear-gradient(#8E3A78,#E0605C)"></i><b>Die glass</b><span>#0B0D12 @ .44–.68</span></div>
+  <div><i style="background:linear-gradient(#FFF,#F4F7FC 16%,#CFD7E4 52%,#A6B0C2 86%,#C7CFDC)"></i><b>Aluminium</b><span>#FFFFFF → #C7CFDC</span></div>
+  <div><i style="background:linear-gradient(#FFB340,#FF9500)"></i><b>System orange</b><span>#FFB340 → #FF9500</span></div>
+  <div><i style="background:#1D1D1F"></i><b>Ink</b><span>#1D1D1F</span></div>
+</div></section>
+</div>

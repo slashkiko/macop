@@ -805,3 +805,6 @@ See [LICENSE](LICENSE) for the complete terms.
 External contributions and modified versions are not accepted under this
 license. Security reports are still welcome through the private reporting
 channel described in [.github/SECURITY.md](.github/SECURITY.md).
+
+macop is an independent project and is not affiliated with or endorsed by
+Apple Inc. Apple and macOS are trademarks of Apple Inc.
