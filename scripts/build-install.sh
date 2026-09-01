@@ -369,9 +369,16 @@ directory_identity() {
 }
 
 assert_retained_directories() {
-  python3 "$install_fs" assert "$bin_dir" "$bin_dir_id" \
-    && python3 "$install_fs" assert "$state_dir" "$state_dir_id" \
-    && { [[ -z "$journal_dir" ]] || python3 "$install_fs" assert "$journal_dir" "$journal_dir_id"; }
+  if [[ -n "$journal_dir" ]]; then
+    python3 "$install_fs" assert-many \
+      "$bin_dir" "$bin_dir_id" \
+      "$state_dir" "$state_dir_id" \
+      "$journal_dir" "$journal_dir_id"
+  else
+    python3 "$install_fs" assert-many \
+      "$bin_dir" "$bin_dir_id" \
+      "$state_dir" "$state_dir_id"
+  fi
 }
 
 # Fixture-only rendezvous for out-of-process pathname substitution tests.  The
@@ -870,14 +877,12 @@ manifest_component() {
   manifest_component "auth_app" "$staged_auth_app" "$staged_auth_app/Contents/MacOS/MacopAuth" "io.github.slashkiko.macop.auth"; printf '\n'
   printf '  }\n}\n'
 } >"$staged_manifest"
-python3 "$install_fs" sync "$bin_dir" "$bin_dir_id" "$(basename "$staged_macop")" file \
-  || fail "cannot durably stage macop."
-python3 "$install_fs" sync "$bin_dir" "$bin_dir_id" "$(basename "$staged_agent")" file \
-  || fail "cannot durably stage macop-agent."
-python3 "$install_fs" sync "$bin_dir" "$bin_dir_id" "$(basename "$staged_auth_app")" dir \
-  || fail "cannot durably stage MacopAuth.app."
-python3 "$install_fs" sync "$bin_dir" "$bin_dir_id" "$(basename "$staged_manifest")" file \
-  || fail "cannot durably stage the generation manifest."
+python3 "$install_fs" sync-many \
+  "$bin_dir" "$bin_dir_id" "$(basename "$staged_macop")" file \
+  "$bin_dir" "$bin_dir_id" "$(basename "$staged_agent")" file \
+  "$bin_dir" "$bin_dir_id" "$(basename "$staged_auth_app")" dir \
+  "$bin_dir" "$bin_dir_id" "$(basename "$staged_manifest")" file \
+  || fail "cannot durably stage the complete generation."
 
 verify_generation() {
   local root="$1"

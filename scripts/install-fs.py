@@ -235,6 +235,11 @@ def main(argv: list[str]) -> None:
         return
     if command == "assert" and len(args) == 2:
         fd = open_dir(args[0], args[1]); os.close(fd); return
+    if command == "assert-many" and len(args) >= 2 and len(args) % 2 == 0:
+        for index in range(0, len(args), 2):
+            fd = open_dir(args[index], args[index + 1])
+            os.close(fd)
+        return
     if command == "mkdir" and len(args) == 4:
         path, expected, name, mode = args; name = leaf(name); fd = open_dir(path, expected)
         try:
@@ -446,6 +451,20 @@ def main(argv: list[str]) -> None:
             durable_sync(fd)
         finally:
             os.close(fd)
+        return
+    if command == "sync-many" and len(args) >= 4 and len(args) % 4 == 0:
+        for index in range(0, len(args), 4):
+            path, expected, name, kind = args[index:index + 4]
+            name = leaf(name)
+            if kind not in {"file", "dir"}:
+                die("sync kind must be file or dir")
+            fd = open_dir(path, expected)
+            try:
+                ensure_safe_existing(fd, name, kind)
+                fsync_tree_at(fd, name)
+                durable_sync(fd)
+            finally:
+                os.close(fd)
         return
     if command == "remove" and len(args) == 4:
         path, expected, name, kind = args; name = leaf(name); fd = open_dir(path, expected)
