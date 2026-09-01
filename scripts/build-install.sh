@@ -13,6 +13,8 @@ with_op_symlink=false
 configure_path=false
 shell_profile="${MACOP_SHELL_PROFILE:-}"
 signing_identity="${MACOP_SIGNING_IDENTITY:-}"
+test_mode="${MACOP_INSTALL_TEST_MODE:-0}"
+prepared_test_dir="${MACOP_INSTALL_TEST_PREPARED_DIR:-}"
 
 usage() {
   cat <<'EOF'
@@ -198,10 +200,27 @@ fi
 
 build_dir="$repo_root/.build/$configuration"
 codesign_identity="${signing_identity:--}"
-MACOP_SIGNING_IDENTITY="$codesign_identity" bash "$repo_root/scripts/build-auth-app.sh" "$configuration"
-source_macop="$build_dir/macop"
-source_agent="$build_dir/macop-agent"
-source_auth_app="$build_dir/MacopAuth.app"
+reuse_prepared_signatures=false
+if [[ -n "$prepared_test_dir" ]]; then
+  [[ "$test_mode" == "1" && "$skip_build" == true ]] \
+    || fail "MACOP_INSTALL_TEST_PREPARED_DIR requires test mode and --skip-build."
+  [[ "$prepared_test_dir" == /* && ! -L "$prepared_test_dir" && -d "$prepared_test_dir" ]] \
+    || fail "MACOP_INSTALL_TEST_PREPARED_DIR must be an absolute non-symlink directory."
+  canonical_prepared_test_dir="$(cd -- "$prepared_test_dir" 2>/dev/null && pwd -P)" \
+    || fail "cannot canonicalize MACOP_INSTALL_TEST_PREPARED_DIR."
+  [[ "$canonical_prepared_test_dir" == /private/tmp/macop-install-test-*/* \
+      && "$(stat -f '%u:%Lp' "$prepared_test_dir")" == "$(id -u):700" ]] \
+    || fail "MACOP_INSTALL_TEST_PREPARED_DIR must be owner-only beneath a real installer test root."
+  source_macop="$prepared_test_dir/macop"
+  source_agent="$prepared_test_dir/macop-agent"
+  source_auth_app="$prepared_test_dir/MacopAuth.app"
+  reuse_prepared_signatures=true
+else
+  MACOP_SIGNING_IDENTITY="$codesign_identity" bash "$repo_root/scripts/build-auth-app.sh" "$configuration"
+  source_macop="$build_dir/macop"
+  source_agent="$build_dir/macop-agent"
+  source_auth_app="$build_dir/MacopAuth.app"
+fi
 [[ -x "$source_macop" ]] || fail "missing build artifact: $source_macop"
 [[ -x "$source_agent" ]] || fail "missing build artifact: $source_agent"
 [[ -d "$source_auth_app" ]] || fail "missing app bundle: $source_auth_app"
@@ -293,7 +312,6 @@ fi
 # atomic on APFS; its PID record lets a later installer recover only locks held
 # by a process that is definitely gone.  Test mode is deliberately constrained
 # to a temporary root so failpoints can never target ~/.local/bin or /Applications.
-test_mode="${MACOP_INSTALL_TEST_MODE:-0}"
 if [[ "$test_mode" == "1" ]]; then
   # Tests must use the real system temporary volume. Never trust a caller's
   # TMPDIR/HOME as an authority for installer capability or destination scope.
@@ -303,8 +321,8 @@ if [[ "$test_mode" == "1" ]]; then
     || fail "MACOP_INSTALL_TEST_MODE requires --bin-dir beneath /private/tmp/macop-install-test-*."
   [[ ! -L "$bin_dir" && "$(stat -f '%u:%Lp' "$bin_dir")" == "$(id -u):700" ]] \
     || fail "MACOP_INSTALL_TEST_MODE requires an owner-only non-symlink destination."
-elif [[ -n "${MACOP_INSTALL_FAILPOINT:-}${MACOP_INSTALL_TEST_HANDSHAKE:-}" ]]; then
-  fail "installer failpoints and test handshake overrides require MACOP_INSTALL_TEST_MODE=1."
+elif [[ -n "${MACOP_INSTALL_FAILPOINT:-}${MACOP_INSTALL_TEST_HANDSHAKE:-}${MACOP_INSTALL_TEST_SKIP_FSYNC:-}${MACOP_INSTALL_TEST_PREPARED_DIR:-}" ]]; then
+  fail "installer failpoints and test-only overrides require MACOP_INSTALL_TEST_MODE=1."
 fi
 
 if [[ "$test_mode" != "1" ]]; then
@@ -769,8 +787,10 @@ phase_guard staging
 install -m 755 "$source_macop" "$staged_macop"
 install -m 755 "$source_agent" "$staged_agent"
 cp -R "$source_auth_app/Contents" "$staged_auth_app/Contents"
-codesign --force --options runtime --sign "$codesign_identity" --identifier macop "$staged_macop"
-codesign --force --options runtime --sign "$codesign_identity" --identifier macop-agent "$staged_agent"
+if [[ "$reuse_prepared_signatures" == false ]]; then
+  codesign --force --options runtime --sign "$codesign_identity" --identifier macop "$staged_macop"
+  codesign --force --options runtime --sign "$codesign_identity" --identifier macop-agent "$staged_agent"
+fi
 codesign --verify --strict "$staged_macop"
 codesign --verify --strict "$staged_agent"
 codesign --verify --deep --strict "$staged_auth_app"

@@ -7,6 +7,10 @@ fixture_root="$(mktemp -d /private/tmp/macop-install-test-transaction.XXXXXX)"
 agent_fixture_pid=""
 cleanup() {
   [[ -z "$agent_fixture_pid" ]] || kill -KILL "$agent_fixture_pid" 2>/dev/null || true
+  if [[ "${MACOP_INSTALL_TEST_KEEP_FIXTURE:-0}" == "1" ]]; then
+    printf 'preserved installer transaction fixture: %s\n' "$fixture_root" >&2
+    return
+  fi
   rm -rf -- "$fixture_root"
 }
 trap cleanup EXIT
@@ -48,23 +52,46 @@ install_generation() {
     bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$bin_dir"
 }
 
-assert_generation() {
-  local expected="$1" manifest="$bin_dir/macop-install-manifest.json"
+assert_generation_at() {
+  local root="$1" expected="$2" manifest="$1/macop-install-manifest.json"
   test -f "$manifest"
   grep -Fqx "  \"build_generation\": \"$expected\"," "$manifest"
   grep -Fqx '  "broker_protocol_version": 9,' "$manifest"
   local name path expected_hash actual_hash
   for name in macop agent auth_app; do
     case "$name" in
-      macop) path="$bin_dir/macop" ;;
-      agent) path="$bin_dir/macop-agent" ;;
-      auth_app) path="$bin_dir/MacopAuth.app/Contents/MacOS/MacopAuth" ;;
+      macop) path="$root/macop" ;;
+      agent) path="$root/macop-agent" ;;
+      auth_app) path="$root/MacopAuth.app/Contents/MacOS/MacopAuth" ;;
     esac
     test -f "$path"
     expected_hash="$(sed -n "s/.*\"$name\": {\"sha256\":\"\([0-9a-f]*\)\".*/\1/p" "$manifest")"
     actual_hash="$(shasum -a 256 "$path" | awk '{print $1}')"
     test "$actual_hash" = "$expected_hash"
   done
+}
+
+assert_generation() {
+  assert_generation_at "$bin_dir" "$1"
+}
+
+clone_generation() {
+  local label="$1" case_root="$fixture_root/parallel-$1" case_bin
+  case_bin="$case_root/bin"
+  mkdir -p "$case_bin"
+  chmod 700 "$case_root" "$case_bin"
+  cp -R "$bin_dir/." "$case_bin/"
+  printf '%s\n' "$case_bin"
+}
+
+wait_for_parallel_jobs() {
+  local failed=0 pid
+  for pid in "$@"; do
+    if ! wait "$pid"; then
+      failed=1
+    fi
+  done
+  test "$failed" -eq 0
 }
 
 assert_capability_contract() {
@@ -103,6 +130,32 @@ assert_capability_contract() {
 install_generation old
 assert_generation old
 
+# Reuse the exact signed artifacts produced by the complete installation above.
+# Each later installer still copies and verifies them, generates its own
+# manifest, and exercises the real transaction state machine under a unique
+# generation label; only redundant bundle construction and re-signing are
+# removed from the failpoint matrix.
+prepared_test_dir="$fixture_root/prepared"
+mkdir -m 700 "$prepared_test_dir"
+install -m 755 "$bin_dir/macop" "$prepared_test_dir/macop"
+install -m 755 "$bin_dir/macop-agent" "$prepared_test_dir/macop-agent"
+cp -R "$bin_dir/MacopAuth.app" "$prepared_test_dir/MacopAuth.app"
+codesign --verify --strict "$prepared_test_dir/macop"
+codesign --verify --strict "$prepared_test_dir/macop-agent"
+codesign --verify --deep --strict "$prepared_test_dir/MacopAuth.app"
+export MACOP_INSTALL_TEST_PREPARED_DIR="$prepared_test_dir"
+
+# One complete generation above exercises the real durable-sync path. The
+# remaining cases verify transaction ordering, identity binding, rollback, and
+# recovery across dozens of injected failures; repeating physical fsync for
+# every identical staged artifact adds no new logical interleaving coverage.
+if MACOP_INSTALL_TEST_SKIP_FSYNC=1 python3 scripts/install-fs.py id "$fixture_root" >/dev/null 2>&1; then
+  echo 'install-fs accepted the fast fixture mode without installer test mode' >&2
+  exit 1
+fi
+export MACOP_INSTALL_TEST_MODE=1
+export MACOP_INSTALL_TEST_SKIP_FSYNC=1
+
 # Refusing an update while the installed one-shot agent is active must unwind
 # the already-created transaction markers. Otherwise every entry point remains
 # blocked even though no component was ever published.
@@ -137,48 +190,65 @@ agent_fixture_pid=""
 # Legacy v4/v5/v7/v8 manifests are update inputs, never a publish target: a v9
 # install replaces the complete old generation rather than accepting a mixed
 # wire contract.
+parallel_pids=()
 for legacy_protocol in 4 5 7 8; do
-  sed "s/\"broker_protocol_version\": 9/\"broker_protocol_version\": $legacy_protocol/" \
-    "$bin_dir/macop-install-manifest.json" >"$fixture_root/legacy-manifest.json"
-  mv -- "$fixture_root/legacy-manifest.json" "$bin_dir/macop-install-manifest.json"
-  install_generation "upgraded-v$legacy_protocol"
-  assert_generation "upgraded-v$legacy_protocol"
-  grep -Fqx '  "broker_protocol_version": 9,' "$bin_dir/macop-install-manifest.json"
-  install_generation old
-  assert_generation old
+  (
+    case_bin="$(clone_generation "legacy-v$legacy_protocol")"
+    sed "s/\"broker_protocol_version\": 9/\"broker_protocol_version\": $legacy_protocol/" \
+      "$case_bin/macop-install-manifest.json" >"$fixture_root/legacy-v$legacy_protocol-manifest.json"
+    mv -- "$fixture_root/legacy-v$legacy_protocol-manifest.json" "$case_bin/macop-install-manifest.json"
+    MACOP_INSTALL_BUILD_GENERATION="upgraded-v$legacy_protocol" \
+      bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$case_bin"
+    assert_generation_at "$case_bin" "upgraded-v$legacy_protocol"
+    grep -Fqx '  "broker_protocol_version": 9,' "$case_bin/macop-install-manifest.json"
+    MACOP_INSTALL_BUILD_GENERATION=old \
+      bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$case_bin"
+    assert_generation_at "$case_bin" old
+  ) &
+  parallel_pids+=("$!")
 done
+wait_for_parallel_jobs "${parallel_pids[@]}"
 
 # Every mutation boundary must restore the old generation.  This includes the
 # absent/present distinction because the first failed run is performed against
 # a fully present generation; a separate fresh-root case covers absence below.
+parallel_pids=()
 for point in \
   backup-macop-before backup-macop-after publish-macop-before publish-macop-after \
   backup-agent-before backup-agent-after publish-agent-before publish-agent-after \
   backup-auth_app-before backup-auth_app-after publish-auth_app-before publish-auth_app-after \
   backup-manifest-before backup-manifest-after publish-manifest-before publish-manifest-after \
   manifest-after handshake-after; do
-  set +e
-  MACOP_INSTALL_TEST_MODE=1 MACOP_INSTALL_BUILD_GENERATION=new \
-    MACOP_INSTALL_FAILPOINT="$point" \
-    bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$bin_dir" \
-      >"$fixture_root/$point.out" 2>"$fixture_root/$point.err"
-  status=$?
-  set -e
-  test "$status" -ne 0
-  assert_generation old
+  (
+    case_bin="$(clone_generation "failpoint-$point")"
+    set +e
+    MACOP_INSTALL_BUILD_GENERATION=new MACOP_INSTALL_FAILPOINT="$point" \
+      bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$case_bin" \
+        >"$fixture_root/$point.out" 2>"$fixture_root/$point.err"
+    case_status=$?
+    set -e
+    test "$case_status" -ne 0
+    assert_generation_at "$case_bin" old
+  ) &
+  parallel_pids+=("$!")
+  if [[ "${#parallel_pids[@]}" -eq 4 ]]; then
+    wait_for_parallel_jobs "${parallel_pids[@]}"
+    parallel_pids=()
+  fi
 done
+wait_for_parallel_jobs "${parallel_pids[@]}"
 
 # HUP, INT, and TERM at a publish boundary all take the EXIT rollback path.
 for signal_name in HUP INT TERM; do
+  case_bin="$(clone_generation "signal-$signal_name")"
   set +e
-  MACOP_INSTALL_TEST_MODE=1 MACOP_INSTALL_BUILD_GENERATION=new \
-  MACOP_INSTALL_SIGNAL_FAILPOINT=publish-agent-after \
-    MACOP_INSTALL_SIGNAL="$signal_name" bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$bin_dir" \
+  MACOP_INSTALL_BUILD_GENERATION=new MACOP_INSTALL_SIGNAL_FAILPOINT=publish-agent-after \
+    MACOP_INSTALL_SIGNAL="$signal_name" bash scripts/build-install.sh --configuration debug --skip-build --bin-dir "$case_bin" \
     >"$fixture_root/signal-$signal_name.out" 2>"$fixture_root/signal-$signal_name.err"
-  status=$?
+  case_status=$?
   set -e
-  test "$status" -ne 0
-  assert_generation old
+  test "$case_status" -ne 0
+  assert_generation_at "$case_bin" old
 done
 
 # An absent destination must be removed, not recreated, if its first install
@@ -399,10 +469,12 @@ assert_pidless_lock_window() {
   bin_dir="$saved_bin_dir"
 }
 
-assert_release_handoff installer
-assert_release_handoff uninstaller
-assert_pidless_lock_window installer
-assert_pidless_lock_window uninstaller
+parallel_pids=()
+(assert_release_handoff installer) & parallel_pids+=("$!")
+(assert_release_handoff uninstaller) & parallel_pids+=("$!")
+(assert_pidless_lock_window installer) & parallel_pids+=("$!")
+(assert_pidless_lock_window uninstaller) & parallel_pids+=("$!")
+wait_for_parallel_jobs "${parallel_pids[@]}"
 
 # SIGKILL during the uninstaller's release trap leaves a complete numeric PID
 # record. The next uninstaller must retire that exact dead-owner lock and
@@ -554,11 +626,24 @@ exercise_substitution() {
 }
 
 run_substitution_case() { [[ -z "${MACOP_INSTALL_TEST_ONLY_SUBSTITUTION:-}" || "$1" == "$MACOP_INSTALL_TEST_ONLY_SUBSTITUTION" ]]; }
-run_substitution_case staging && exercise_substitution staging root
-run_substitution_case backup-macop && exercise_substitution backup-macop state
-run_substitution_case publish-macop && exercise_substitution publish-macop root
-run_substitution_case rollback-manifest && exercise_substitution rollback-manifest state publish-macop-after
-run_substitution_case cleanup && exercise_substitution cleanup root
+queue_substitution_case() {
+  local name="$1"
+  shift
+  run_substitution_case "$name" || return 0
+  (exercise_substitution "$@") &
+  parallel_pids+=("$!")
+  if [[ "${#parallel_pids[@]}" -eq 4 ]]; then
+    wait_for_parallel_jobs "${parallel_pids[@]}"
+    parallel_pids=()
+  fi
+}
+parallel_pids=()
+queue_substitution_case staging staging root
+queue_substitution_case backup-macop backup-macop state
+queue_substitution_case publish-macop publish-macop root
+queue_substitution_case rollback-manifest rollback-manifest state publish-macop-after
+queue_substitution_case cleanup cleanup root
+wait_for_parallel_jobs "${parallel_pids[@]}"
 
 # A crash after one or more rollback restores is intentionally not guessed at:
 # its publish phase no longer identifies which backups remain authoritative.

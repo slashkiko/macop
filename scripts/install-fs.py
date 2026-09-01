@@ -18,6 +18,15 @@ import stat
 import sys
 
 
+_skip_durable_sync = False
+_fsync = os.fsync
+
+
+def durable_sync(fd: int) -> None:
+    if not _skip_durable_sync:
+        _fsync(fd)
+
+
 def die(message: str) -> "None":
     raise SystemExit(f"install-fs: {message}")
 
@@ -106,7 +115,7 @@ def write_record(dfd: int, name: str, value: str) -> None:
             if written <= 0:
                 die("record write made no progress")
             payload = payload[written:]
-        os.fsync(child)
+        durable_sync(child)
         complete = True
     finally:
         os.close(child)
@@ -120,7 +129,7 @@ def write_record(dfd: int, name: str, value: str) -> None:
         os.unlink(temporary, dir_fd=dfd)
         die(f"unsafe record destination: {name}")
     os.rename(temporary, name, src_dir_fd=dfd, dst_dir_fd=dfd)
-    os.fsync(dfd)
+    durable_sync(dfd)
 
 
 def assert_child_identity(dfd: int, name: str, expected: str) -> None:
@@ -144,7 +153,7 @@ def remove_tree_at(dfd: int, name: str) -> None:
             moved = ensure_safe_existing(dfd, retired, "dir")
             if identity(moved) != identity(opened):
                 die(f"retired directory identity changed: {name}")
-            os.fsync(dfd)
+            durable_sync(dfd)
             break
         else:
             die("could not allocate unique removal leaf")
@@ -155,7 +164,7 @@ def remove_tree_at(dfd: int, name: str) -> None:
             else:
                 # A symlink is never followed; deleting it is safe.
                 os.unlink(child_name, dir_fd=child)
-        os.fsync(child)
+        durable_sync(child)
     finally:
         os.close(child)
     # Darwin has no fd-relative equivalent of unlinkat(AT_EMPTY_PATH) for an
@@ -164,7 +173,7 @@ def remove_tree_at(dfd: int, name: str) -> None:
     # replacement rather than the inode traversed above. Keep the emptied,
     # randomly named tombstone: the public leaf was already removed atomically,
     # and no pathname-only delete is allowed to weaken that identity binding.
-    os.fsync(dfd)
+    durable_sync(dfd)
 
 
 def fsync_tree_at(dfd: int, name: str) -> None:
@@ -179,7 +188,7 @@ def fsync_tree_at(dfd: int, name: str) -> None:
             after = os.fstat(child)
             if identity(before) != identity(after) or not stat.S_ISREG(after.st_mode):
                 die(f"file identity changed while syncing: {name}")
-            os.fsync(child)
+            durable_sync(child)
         finally:
             os.close(child)
         return
@@ -195,7 +204,7 @@ def fsync_tree_at(dfd: int, name: str) -> None:
                 die(f"directory identity changed while syncing: {name}")
             for child_name in os.listdir(child):
                 fsync_tree_at(child, child_name)
-            os.fsync(child)
+            durable_sync(child)
         finally:
             os.close(child)
         return
@@ -203,9 +212,17 @@ def fsync_tree_at(dfd: int, name: str) -> None:
 
 
 def main(argv: list[str]) -> None:
+    global _skip_durable_sync
     if not argv:
         die("missing command")
     command, *args = argv
+    if os.environ.get("MACOP_INSTALL_TEST_SKIP_FSYNC") == "1":
+        if os.environ.get("MACOP_INSTALL_TEST_MODE") != "1" or not args:
+            die("skipping durable sync requires installer test mode")
+        canonical_test_root = os.path.realpath(args[0])
+        if not canonical_test_root.startswith("/private/tmp/macop-install-test-"):
+            die("skipping durable sync requires a real installer test root")
+        _skip_durable_sync = True
     if command == "id" and len(args) == 1:
         fd = os.open(args[0], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
         try:
@@ -222,7 +239,7 @@ def main(argv: list[str]) -> None:
         path, expected, name, mode = args; name = leaf(name); fd = open_dir(path, expected)
         try:
             if lstat_at(fd, name) is not None: die(f"leaf already exists: {name}")
-            os.mkdir(name, int(mode, 8), dir_fd=fd); os.fsync(fd)
+            os.mkdir(name, int(mode, 8), dir_fd=fd); durable_sync(fd)
         finally: os.close(fd)
         return
     if command == "mktemp" and len(args) == 4:
@@ -237,7 +254,7 @@ def main(argv: list[str]) -> None:
                         child = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=fd)
                         os.close(child)
                     else: os.mkdir(name, 0o700, dir_fd=fd)
-                    os.fsync(fd); print(name); return
+                    durable_sync(fd); print(name); return
                 except FileExistsError: pass
             die("could not allocate unique temporary leaf")
         finally: os.close(fd)
@@ -362,7 +379,7 @@ def main(argv: list[str]) -> None:
                     os.unlink(name, dir_fd=child)
                 else:
                     remove_tree_at(child, name)
-                os.fsync(child)
+                durable_sync(child)
             finally:
                 os.close(child)
         finally:
@@ -385,7 +402,7 @@ def main(argv: list[str]) -> None:
                     # visible lock before the handoff is atomic.
                     assert_child_identity(fd, child_name, child_expected)
                     os.rename(child_name, retired, src_dir_fd=fd, dst_dir_fd=fd)
-                    os.fsync(fd)
+                    durable_sync(fd)
                     print(retired)
                     return
                 die("could not allocate unique retired child leaf")
@@ -403,7 +420,7 @@ def main(argv: list[str]) -> None:
                 # unexpected leaf appears, preserve it and fail closed.
                 assert_child_identity(fd, child_name, child_expected)
                 os.rmdir(child_name, dir_fd=fd)
-                os.fsync(fd)
+                durable_sync(fd)
             finally:
                 os.close(child)
         finally:
@@ -415,7 +432,7 @@ def main(argv: list[str]) -> None:
         try:
             ensure_safe_existing(sfd, src_name)
             if lstat_at(dfd, dst_name) is not None: die(f"rename destination already exists: {dst_name}")
-            os.rename(src_name, dst_name, src_dir_fd=sfd, dst_dir_fd=dfd); os.fsync(sfd); os.fsync(dfd)
+            os.rename(src_name, dst_name, src_dir_fd=sfd, dst_dir_fd=dfd); durable_sync(sfd); durable_sync(dfd)
         finally: os.close(dfd); os.close(sfd)
         return
     if command == "sync" and len(args) == 4:
@@ -426,7 +443,7 @@ def main(argv: list[str]) -> None:
         try:
             ensure_safe_existing(fd, name, kind)
             fsync_tree_at(fd, name)
-            os.fsync(fd)
+            durable_sync(fd)
         finally:
             os.close(fd)
         return
@@ -437,7 +454,7 @@ def main(argv: list[str]) -> None:
             if kind == "file": os.unlink(name, dir_fd=fd)
             elif kind == "dir": remove_tree_at(fd, name)
             else: die("remove kind must be file or dir")
-            os.fsync(fd)
+            durable_sync(fd)
         finally: os.close(fd)
         return
     die("invalid command arguments")
