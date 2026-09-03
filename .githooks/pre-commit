@@ -17,7 +17,7 @@ while IFS= read -r file; do
   [[ -z "$file" ]] && continue
   run_secret_scan=true
 
-  if [[ "$file" =~ ^(Sources/|Tests/|Package\.swift$|\.swiftformat$|\.swiftlint\.yml$|\.mise\.toml$|Makefile$) ]]; then
+  if [[ "$file" =~ ^(Sources/|Resources/|Tests/|scripts/|Package\.swift$|\.swiftformat$|\.swiftlint\.yml$|\.mise\.toml$|Makefile$) ]]; then
     run_swift_checks=true
   fi
 
