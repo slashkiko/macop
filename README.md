@@ -33,23 +33,35 @@ chooser. macop cannot enumerate or silently query the Passwords database.
 
 ## Install from source
 
-Clone the repository, then build, sign, verify, and install all components:
+Create an Apple Development certificate in Xcode, clone the repository, and run
+the one-time setup:
 
 ```bash
 git clone https://github.com/slashkiko/macop.git
 cd macop
-
-MACOP_PROVISIONING_PROFILE="$HOME/Library/Application Support/macop/MacopAuth.provisionprofile" \
-  scripts/build-install.sh \
-  --signing-identity 'Apple Development: Example (IDENTIFIER)'
+scripts/personal-install.sh setup
 ```
 
-A production installation requires a certificate-backed signing identity and a
-matching provisioning profile. Ad-hoc artifacts are test fixtures and cannot
+Setup shows the available Apple Development certificates. Choose one by number;
+the helper saves its fingerprint, creates a matching development profile, signs
+every component, verifies the generation, configures PATH, and installs it.
+Later, `scripts/personal-install.sh update` fresh-clones the official `main` into
+a temporary directory and rebuilds with the saved certificate. GitHub Actions is
+the source CI gate, so the personal updater does not rerun `make ci` locally.
+
+This personal source-build path does not use a Developer ID distribution
+certificate. It requires Xcode to issue an Apple Development identity and a
+profile that authorizes the required Keychain groups; setup fails closed if the
+selected team cannot do so. Ad-hoc artifacts are test fixtures and cannot
 satisfy the live broker or verified SSH-session boundary.
 
 See [Installation and removal](docs/installation.md) for profile creation,
-updates, PATH configuration, the optional `op` symlink, and uninstalling.
+one-command signed updates, certificate rotation, PATH configuration, the
+optional `op` symlink, and uninstalling.
+
+The [visual personal-signing guide](docs/personal-signing-guide.html) separates
+the steps that require human judgment from the checks and updates performed by
+the shell helper.
 
 ## Start here
 

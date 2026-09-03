@@ -36,6 +36,7 @@ make lint
 make test
 make test-agent-helper
 make test-invocation
+make test-personal-install
 make test-no-persistence
 make build
 make ci-swift
@@ -52,9 +53,11 @@ make help
 ```
 
 `make ci` runs all local checks (`ci-workflows` + `ci-swift` + `test-pty` +
-`ci-secrets`). `ci-swift` includes the signed-agent helper, alias/symlink, and
-fake-Keychain no-persistence fixtures; the deterministic PTY relay runs both in
-the macOS workflow and in the broader local `ci` target.
+`ci-secrets`). `ci-swift` includes the signed-agent helper, personal-signing
+wrapper validation (including fresh-clone update success and failure fixtures),
+alias/symlink, and fake-Keychain no-persistence fixtures;
+the deterministic PTY relay runs both in the macOS workflow and in the broader
+local `ci` target.
 `make pre-commit` runs only the relevant check groups for staged files:
 
 - `.github/workflows/**`, `.pinact.yml`, or `Makefile`: `ci-workflows`

@@ -95,7 +95,7 @@ fi
 [[ "$(stat -f '%u' "$output_directory")" == "$(id -u)" ]] \
   || fail "output directory must be owned by the current user."
 
-temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/macop-profile.XXXXXX")"
+temporary_root="$(mktemp -d /private/tmp/macop-profile.XXXXXX)"
 staged_output="$(mktemp "$output_directory/.MacopAuth.provisionprofile.XXXXXX")"
 cleanup() {
   [[ ! -e "$temporary_root" ]] || rm -rf "$temporary_root"

@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>macop 個人署名インストールガイド</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-subtle: #f8fafc;
+      --text: #18212b;
+      --muted: #5c6875;
+      --line: #d8dee6;
+      --human: #b44b18;
+      --human-bg: #fff3eb;
+      --auto: #1769aa;
+      --auto-bg: #edf6ff;
+      --check: #25724d;
+      --check-bg: #edf8f2;
+      --warning: #8b6400;
+      --warning-bg: #fff8df;
+      --code-bg: #111923;
+      --code-text: #edf4fb;
+      --shadow: 0 12px 32px rgb(22 34 48 / 8%);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f141a;
+        --surface: #171e26;
+        --surface-subtle: #1b242e;
+        --text: #e7edf3;
+        --muted: #a7b3bf;
+        --line: #33404d;
+        --human: #ff9a61;
+        --human-bg: #332118;
+        --auto: #72b8f2;
+        --auto-bg: #172a3a;
+        --check: #65c795;
+        --check-bg: #183126;
+        --warning: #edca63;
+        --warning-bg: #312a17;
+        --code-bg: #0a0f14;
+        --code-text: #e8f0f8;
+        --shadow: 0 12px 32px rgb(0 0 0 / 24%);
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 16px;
+      line-height: 1.7;
+    }
+
+    a { color: var(--auto); }
+
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    code {
+      overflow-wrap: anywhere;
+    }
+
+    .page {
+      width: min(1080px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 56px 0 80px;
+    }
+
+    header {
+      padding: 34px;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--auto);
+      font-size: 13px;
+      font-weight: 750;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { line-height: 1.28; }
+    h1 { margin: 0; font-size: clamp(30px, 5vw, 48px); letter-spacing: -.035em; }
+    h2 { margin: 58px 0 18px; font-size: clamp(24px, 3vw, 32px); }
+    h3 { margin: 0 0 8px; font-size: 19px; }
+
+    .lead {
+      max-width: 760px;
+      margin: 16px 0 0;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 11px;
+      border: 1px solid currentColor;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .tag::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      content: "";
+    }
+
+    .human-color { color: var(--human); }
+    .auto-color { color: var(--auto); }
+    .check-color { color: var(--check); }
+
+    .notice {
+      margin-top: 22px;
+      padding: 16px 18px;
+      border-left: 4px solid var(--warning);
+      border-radius: 8px;
+      background: var(--warning-bg);
+      color: var(--text);
+    }
+
+    .notice strong { color: var(--warning); }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 20px;
+    }
+
+    .summary-card,
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+    }
+
+    .summary-card { padding: 20px; }
+    .summary-card p { margin: 6px 0 0; color: var(--muted); }
+    .summary-number { color: var(--muted); font-size: 13px; font-weight: 750; }
+
+    .flow {
+      display: grid;
+      gap: 12px;
+      margin: 18px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 128px minmax(0, 1fr);
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+    }
+
+    .actor {
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 22px 12px;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: .04em;
+    }
+
+    .step.human .actor { color: var(--human); background: var(--human-bg); }
+    .step.auto .actor { color: var(--auto); background: var(--auto-bg); }
+    .step.check .actor { color: var(--check); background: var(--check-bg); }
+
+    .step-body { min-width: 0; padding: 20px 22px; }
+    .step-body p { margin: 7px 0 0; color: var(--muted); }
+    .step-body ul { margin: 8px 0 0; padding-left: 20px; }
+
+    pre {
+      margin: 14px 0 0;
+      padding: 16px;
+      overflow-x: auto;
+      border-radius: 10px;
+      background: var(--code-bg);
+      color: var(--code-text);
+      font-size: 13px;
+      line-height: 1.55;
+      white-space: pre;
+    }
+
+    .panel { padding: 24px; }
+    .panel p:first-child { margin-top: 0; }
+
+    .split {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .list-clean { margin: 0; padding-left: 20px; }
+
+    table {
+      width: 100%;
+      overflow: hidden;
+      border-collapse: separate;
+      border: 1px solid var(--line);
+      border-spacing: 0;
+      border-radius: 14px;
+      background: var(--surface);
+    }
+
+    th, td {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th { background: var(--surface-subtle); font-size: 14px; }
+    tr:last-child td { border-bottom: 0; }
+
+    .status-safe { color: var(--check); font-weight: 750; }
+
+    footer {
+      margin-top: 58px;
+      padding-top: 22px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    footer ul { margin: 8px 0 0; padding-left: 20px; }
+
+    @media (max-width: 760px) {
+      .page { width: min(100% - 20px, 1080px); padding-top: 20px; }
+      header { padding: 24px 20px; }
+      .summary-grid, .split { grid-template-columns: 1fr; }
+      .step { grid-template-columns: 1fr; }
+      .actor { justify-content: flex-start; padding: 9px 16px; }
+      .step-body { padding: 17px 16px; }
+      table { display: block; overflow-x: auto; white-space: nowrap; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <p class="eyebrow">macop / personal source install</p>
+      <h1>個人署名インストールガイド</h1>
+      <p class="lead">
+        人間が判断するのは、使用するApple Development証明書だけです。source取得、profile更新、
+        ビルド、署名、検証、置換は<code>personal-install.sh</code>が実行します。
+      </p>
+      <div class="legend" aria-label="役割の凡例">
+        <span class="tag human-color">人間が選択・承認</span>
+        <span class="tag auto-color">シェルが自動実行</span>
+        <span class="tag check-color">自動検証・安全停止</span>
+      </div>
+      <div class="notice">
+        <strong>信頼境界:</strong>
+        updaterはGitHub上の<code>slashkiko/macop</code>の<code>main</code>を信頼します。
+        commit署名やActions結果を利用者側では再確認せず、<code>make ci</code>も再実行しません。
+        GitHubまたは管理者アカウントが侵害された場合、悪意あるsourceも利用者自身の証明書で署名され得ます。
+      </div>
+    </header>
+
+    <section aria-labelledby="overview">
+      <h2 id="overview">全体像</h2>
+      <div class="summary-grid">
+        <article class="summary-card">
+          <span class="summary-number human-color">01 / HUMAN</span>
+          <h3>証明書を選ぶ</h3>
+          <p>初回と証明書更新時だけ、一覧から使用するApple Development証明書を選びます。</p>
+        </article>
+        <article class="summary-card">
+          <span class="summary-number auto-color">02 / SOURCE</span>
+          <h3>公式mainをfresh clone</h3>
+          <p>更新ごとに一時directoryへ公式mainをcloneし、元のcheckoutは変更しません。</p>
+        </article>
+        <article class="summary-card">
+          <span class="summary-number check-color">03 / INSTALL</span>
+          <h3>署名を検証して置換</h3>
+          <p>profile、Team ID、entitlement、broker generationを確認し、失敗時は旧版を残します。</p>
+        </article>
+      </div>
+      <div class="panel">
+        <pre><code>GitHub: slashkiko/macop main ──fresh clone──▶ 一時source
+                                                  │
+人間: Apple Development証明書を選択 ──保存──▶ profile作成
+                                                  │
+                                                  ▼
+                                   build → 署名 → 検証 → atomic install</code></pre>
+      </div>
+    </section>
+
+    <section aria-labelledby="first-run">
+      <h2 id="first-run">初回セットアップ</h2>
+      <ol class="flow">
+        <li class="step human">
+          <div class="actor">人間 / Xcode</div>
+          <div class="step-body">
+            <h3>1. Apple Development証明書を用意する</h3>
+            <p>
+              XcodeのSettings → AccountsへApple IDを追加し、使用するteamで証明書を作成します。
+              これはApple側で必要な初回操作で、秘密鍵はmacOS Keychainに保持されます。
+            </p>
+          </div>
+        </li>
+        <li class="step human">
+          <div class="actor">人間 / Terminal</div>
+          <div class="step-body">
+            <h3>2. setupを起動し、証明書を番号で選ぶ</h3>
+            <pre><code>git clone https://github.com/slashkiko/macop.git
+cd macop
+scripts/personal-install.sh setup</code></pre>
+            <p>表示された一覧から証明書を1つ選びます。SHA-1のコピーやPATH optionの指定は不要です。</p>
+          </div>
+        </li>
+        <li class="step auto">
+          <div class="actor">シェル</div>
+          <div class="step-body">
+            <h3>3. profile生成からインストールまで実行する</h3>
+            <ul>
+              <li>選択した証明書を40文字SHA-1へ固定</li>
+              <li>Xcode automatic signingでdevelopment profileを作成または更新</li>
+              <li>profileのTeam ID、bundle ID、Keychain access groups、有効期限を検証</li>
+              <li>全componentをrelease buildし、同じ証明書で署名</li>
+              <li>署名、hardened runtime、broker generationをread-back</li>
+              <li>PATHを設定し、transactional installerで公開</li>
+            </ul>
+          </div>
+        </li>
+        <li class="step check">
+          <div class="actor">自動検証</div>
+          <div class="step-body">
+            <h3>4. 成功後だけfingerprintを保存する</h3>
+            <p>
+              <code>~/Library/Application Support/macop/personal-signing-identity</code>へSHA-1だけをmode
+              <code>0600</code>で保存します。秘密鍵、Apple ID、Team IDは保存しません。
+            </p>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="updates">
+      <h2 id="updates">通常の更新</h2>
+      <ol class="flow">
+        <li class="step human">
+          <div class="actor">人間 / Terminal</div>
+          <div class="step-body">
+            <h3>1. 更新コマンドを1回実行する</h3>
+            <pre><code>scripts/personal-install.sh update</code></pre>
+            <p>証明書、branch、revisionを選び直す必要はありません。</p>
+          </div>
+        </li>
+        <li class="step auto">
+          <div class="actor">シェル / Git</div>
+          <div class="step-body">
+            <h3>2. 保存状態を確認し、公式mainをfresh cloneする</h3>
+            <p>
+              保存済みSHA-1と保存fileのowner・mode・link数を確認した後、公式URLの<code>main</code>だけを
+              一時directoryへcloneします。現在のcheckoutのbranch、差分、履歴は変更しません。
+            </p>
+          </div>
+        </li>
+        <li class="step auto">
+          <div class="actor">シェル / Xcode</div>
+          <div class="step-body">
+            <h3>3. cloneしたsourceを署名して更新する</h3>
+            <p>
+              GitHub側のCIを品質ゲートとして信頼するため、利用者側の<code>make ci</code>は省略します。
+              一時clone内のscriptがprofile更新、build、署名、preflight、置換を実行します。
+            </p>
+          </div>
+        </li>
+        <li class="step check">
+          <div class="actor">自動検証</div>
+          <div class="step-body">
+            <h3>4. 完全なgenerationだけを採用し、一時cloneを消す</h3>
+            <p>検証に失敗すれば旧generationを維持またはrollbackします。成否にかかわらず一時cloneは削除します。</p>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="rotation">
+      <h2 id="rotation">証明書が更新・失効した場合</h2>
+      <div class="panel">
+        <p>新しい証明書へ暗黙には切り替えません。setupを再実行し、一覧から新しい証明書を選びます。</p>
+        <pre><code>scripts/personal-install.sh setup --replace-identity</code></pre>
+        <p>非対話でfingerprintを指定する場合は、rotation flagも同時に渡します。</p>
+        <pre><code>scripts/personal-install.sh setup \
+  --signing-identity NEW_40_CHARACTER_SHA1 \
+  --replace-identity</code></pre>
+        <p>
+          既存インストールと新しい署名のTeam IDが違えばinstallerが拒否します。保存済みSHA-1は、
+          新しい署名でのインストールが成功した後にだけ置換されます。
+        </p>
+      </div>
+    </section>
+
+    <section aria-labelledby="responsibility">
+      <h2 id="responsibility">担当者ごとの責任</h2>
+      <div class="split">
+        <article class="panel">
+          <h3 class="human-color">人間側</h3>
+          <ul class="list-clean">
+            <li>XcodeへApple IDを登録して証明書を用意する</li>
+            <li>初回とrotation時に、使用する証明書を選ぶ</li>
+            <li>update commandを起動する</li>
+            <li>macOSが表示するKeychain・Xcodeのsystem promptを承認する</li>
+          </ul>
+          <p>このうち、macop固有の判断は証明書の選択だけです。</p>
+        </article>
+        <article class="panel">
+          <h3 class="auto-color">GitHubとシェル側</h3>
+          <ul class="list-clean">
+            <li>GitHub: mainを配信し、repositoryのCIを実行する</li>
+            <li>シェル: 公式mainのfresh cloneと一時directoryの後始末</li>
+            <li>シェル: fingerprint、profile、Team ID、entitlementの検証</li>
+            <li>シェル: release build、同一署名、broker probe</li>
+            <li>シェル: atomicなgeneration置換と失敗時のrollback</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="checks">
+      <h2 id="checks">残す検証と、その理由</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>確認内容</th>
+            <th>必要性</th>
+            <th>残す理由</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>保存fileが通常file、本人所有、mode 0600、hard link 1</td>
+            <td>防御的</td>
+            <td>symlinkや共有可能なfileを状態として使わず、証明書fingerprintの意図しない差し替えを検出するため。</td>
+          </tr>
+          <tr>
+            <td>保存したSHA-1とKeychain上のApple Development証明書が一致</td>
+            <td>必須</td>
+            <td>同名の別証明書やad-hoc署名へ暗黙に切り替わると、更新後にbrokerとKeychain accessが壊れるため。</td>
+          </tr>
+          <tr>
+            <td>profileのTeam ID、bundle ID、Keychain groups、有効期限</td>
+            <td>必須</td>
+            <td>署名できても、profileが別team・別app・期限切れなら必要なKeychain capabilityを利用できないため。</td>
+          </tr>
+          <tr>
+            <td>全componentの署名、Team ID、entitlement、hardened runtime</td>
+            <td>必須</td>
+            <td>CLI、agent、appが異なる署名世代になると相互認証に失敗し、broker境界を維持できないため。</td>
+          </tr>
+          <tr>
+            <td>manifest、broker preflight、transactional置換</td>
+            <td>必須</td>
+            <td>build成功だけでは実際に起動・接続できるとは限らず、途中失敗で新旧componentが混在するのを防ぐため。</td>
+          </tr>
+          <tr>
+            <td>clone先の期待fileと一時directoryの後始末</td>
+            <td>防御的</td>
+            <td>root-ownedでstickyな<code>/private/tmp</code>配下へ固定し、不完全なcloneを早く検出して途中物を残し続けないため。</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="notice">
+        <strong>省いた確認:</strong>
+        commit署名、利用者側でのActions status確認、<code>make ci</code>は更新scriptでは行いません。
+        これらはsourceの信頼判断であり、上の検証は「取得したsourceを、このMacで壊れない一世代として署名・置換できるか」を確認します。
+      </div>
+    </section>
+
+    <section aria-labelledby="failures">
+      <h2 id="failures">失敗したとき</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>状況</th>
+            <th>自動処理</th>
+            <th>既存インストール</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>公式mainをcloneできない</td>
+            <td>build前に停止し、一時directoryを削除</td>
+            <td class="status-safe">変更しない</td>
+          </tr>
+          <tr>
+            <td>証明書がKeychainにない／失効</td>
+            <td>profile生成前に停止</td>
+            <td class="status-safe">変更しない</td>
+          </tr>
+          <tr>
+            <td>profileを発行・更新できない</td>
+            <td>署名・publicationへ進まず停止</td>
+            <td class="status-safe">変更しない</td>
+          </tr>
+          <tr>
+            <td>Team IDやentitlementが一致しない</td>
+            <td>検証で拒否</td>
+            <td class="status-safe">変更しない</td>
+          </tr>
+          <tr>
+            <td>置換中にbuild・probe・filesystem操作が失敗</td>
+            <td>transaction journalからrollback</td>
+            <td class="status-safe">旧generationへ戻す</td>
+          </tr>
+          <tr>
+            <td>証明書rotationに失敗</td>
+            <td>新fingerprintを保存しない</td>
+            <td class="status-safe">旧署名のまま維持</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="notes">
+      <h2 id="notes">この方式が確認するもの／しないもの</h2>
+      <div class="panel">
+        <ul class="list-clean">
+          <li><strong>確認する:</strong> clone成功、保存状態、Apple証明書、profile、Team ID、entitlement、component整合性。</li>
+          <li><strong>確認しない:</strong> 利用者側のcommit署名、GitHub Actionsの成功status、ローカル<code>make ci</code>。</li>
+          <li><strong>Appleコード署名</strong>はbinaryと署名者を結び付けますが、sourceが善意であることは保証しません。</li>
+          <li>GitHubまたは管理者の認証情報まで侵害された場合、この方式だけでは正規更新と区別できません。</li>
+          <li>Personal Teamのprofileには有効期限があり、更新時にXcode accountやnetwork接続が必要になる場合があります。</li>
+          <li>生成物は自分の署名環境向けであり、他人へ配布する正式リリースbinaryではありません。</li>
+        </ul>
+      </div>
+    </section>
+
+    <footer>
+      <strong>関連資料</strong>
+      <ul>
+        <li><a href="installation.md">Installation and removal</a></li>
+        <li><a href="security-model.md">Security model</a></li>
+        <li><a href="../scripts/personal-install.sh">personal-install.sh</a></li>
+        <li><a href="https://developer.apple.com/documentation/xcode/creating-distribution-signed-code-for-the-mac">Apple: Creating distribution-signed code for macOS</a></li>
+      </ul>
+    </footer>
+  </main>
+</body>
+</html>

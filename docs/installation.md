@@ -4,7 +4,75 @@ Build, sign, install, update, expose as `op`, and remove macop. Run every comman
 
 [Back to the project overview](../README.md)
 
-## Install from source
+For a role-by-role walkthrough, open the
+[visual personal-signing guide](personal-signing-guide.html). It separates the
+certificate choice from source retrieval, profile, signing, verification, and
+update steps performed by the shell helper.
+
+## Personal source installation
+
+The supported no-Developer-ID path is a source build signed for the current
+user's Mac with an Apple Development identity. The only signing choice the user
+makes is which certificate to use; later installs reuse its exact fingerprint.
+This is not a redistributable pre-signed binary.
+
+First add the user's Apple ID in Xcode and create an Apple Development
+certificate for the selected development team. Clone the repository and start
+the one-time setup:
+
+```bash
+git clone https://github.com/slashkiko/macop.git
+cd macop
+scripts/personal-install.sh setup
+```
+
+The script displays the available Apple Development certificates and asks for
+one number. It configures `~/.local/bin` in PATH by default; pass
+`--no-configure-path` only when that is not wanted. For non-interactive use,
+`--signing-identity` accepts an exact 40-character SHA-1. When replacing an
+already saved identity non-interactively, combine it with `--replace-identity`:
+
+```bash
+scripts/personal-install.sh setup \
+  --signing-identity NEW_40_CHARACTER_SHA1 \
+  --replace-identity
+```
+
+The setup stores only the certificate fingerprint in
+`~/Library/Application Support/macop/personal-signing-identity` with mode
+`0600`. The private key remains in the macOS Keychain. It creates or renews the
+matching profile through Xcode automatic signing, then delegates signing,
+verification, and publication to the transactional installer.
+
+For each later source update, run one command from the original checkout:
+
+```bash
+scripts/personal-install.sh update
+```
+
+`update` does not modify that checkout. It fresh-clones
+`https://github.com/slashkiko/macop.git` at `main` into a temporary directory,
+runs the cloned updater, and removes the temporary clone. GitHub Actions is
+trusted as the source CI gate; the updater does not rerun `make ci` locally. A
+clone, profile, or signing failure occurs before publication, and an installation
+failure is rolled back by `build-install.sh`.
+
+If Xcode rotates or replaces the development certificate, run setup again and
+choose the replacement from the menu. The existing installer still requires the
+installed and replacement generations to have the same Team ID, and the saved
+fingerprint changes only after a successful installation:
+
+```bash
+scripts/personal-install.sh setup --replace-identity
+```
+
+Personal Team profiles expire and may need Xcode account access or network
+access to renew. `update` renews the profile before each build and stops without
+replacing the installed generation if renewal fails. Xcode must be able to issue
+a profile that authorizes macop's Keychain groups; setup reports an error rather
+than weakening those entitlements when the selected team cannot do so.
+
+## Manual signing and installation
 
 Build, sign, verify, and install the CLI, agent, and `MacopAuth.app` companion
 in a user-owned bin directory:
