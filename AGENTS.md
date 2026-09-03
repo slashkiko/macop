@@ -2,9 +2,11 @@
 
 Apple-native `op` compatibility CLI for macOS. Swift package; the CLI, a one-shot
 agent, and the `MacopAuth.app` companion are built and installed together as one
-signed generation. `README.md` is the authoritative description of behaviour,
-installation and the security model — read it before changing anything that
-touches signing, the broker, the Keychain access group, or the installer.
+signed generation. `README.md` is the product overview and documentation index.
+Detailed current behaviour is authoritative in `docs/installation.md`,
+`docs/keychain.md`, `docs/secure-enclave-ssh.md`, and `docs/security-model.md`.
+Read the relevant guide before changing signing, the broker, the Keychain access
+group, SSH process binding, or the installer.
 
 ## Build and check
 
